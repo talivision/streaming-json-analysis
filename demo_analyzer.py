@@ -34,6 +34,7 @@ Requires: pip install textual
 
 import asyncio
 import json
+import math
 import os
 import time
 import argparse
@@ -41,6 +42,7 @@ import argparse
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
 from textual.widgets import Header, Footer, RichLog, Static, Input
 from textual import on, work
 
@@ -55,6 +57,97 @@ from engine import TypeRegistry, BaselineModel, CorrelationEngine
 
 # Default path where the source writes its stream
 DEFAULT_STREAM_DIR = "/tmp/json_demo"
+
+
+class InspectionModal(ModalScreen):
+    """
+    A modal screen to inspect detailed correlation results.
+    Overlays the main stream view so results don't get lost in the scroll.
+    """
+    
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close"),
+        Binding("i", "dismiss", "Close"),
+    ]
+
+    CSS = """
+    InspectionModal {
+        align: center middle;
+    }
+    .modal-container {
+        width: 85%;
+        height: 85%;
+        border: solid $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    .header {
+        width: 100%;
+        text-align: center;
+        background: $accent;
+        color: $text;
+        text-style: bold;
+        padding: 1;
+        margin-bottom: 1;
+    }
+    """
+
+    def __init__(self, correlation: CorrelationEngine, registry: TypeRegistry):
+        super().__init__()
+        self.correlation = correlation
+        self.registry = registry
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="modal-container"):
+            yield Static("DETAILED INSPECTION REPORT (Press Esc to close)", classes="header")
+            yield RichLog(id="report", markup=True, highlight=True)
+
+    def on_mount(self):
+        self.generate_report()
+
+    def generate_report(self):
+        log = self.query_one("#report", RichLog)
+        labels = self.correlation.action_labels()
+
+        if not labels:
+            log.write("No actions marked yet.")
+            return
+
+        for label in labels:
+            results = self.correlation.correlations(label)
+            # Filter for meaningful correlations (confidence > 0.2)
+            significant = [r for r in results if r["confidence"] > 0.2]
+            
+            header = Text(f"\nAction: \"{label}\" ({len(significant)} significant candidates)")
+            header.stylize("bold underline")
+            log.write(header)
+
+            if not significant:
+                log.write(Text("  No significant correlations found.\n"))
+                continue
+
+            for r in significant:
+                type_id = r["type_id"]
+                obj_type = self.registry.get(type_id)
+                type_name = obj_type.display_name if obj_type else type_id[:8]
+                example = obj_type.example if obj_type else {}
+
+                # Format the block
+                log.write(Text(f"\n  ► Type: {type_name}", style="bold yellow"))
+                log.write(Text(
+                    f"    Confidence: {r['confidence']:.2f}  ({r['assessment']})\n"
+                    f"    Stats: {r['appearances']}/{r['trials']} trials, "
+                    f"latency ~{r['avg_latency_ms']:.0f}ms\n"
+                    f"    Baseline rate: {r['baseline_rate']:.2f}/sec"
+                ))
+                
+                log.write(Text("    Structure Example:", style="italic"))
+                formatted_json = json.dumps(example, indent=4)
+                # Indent the JSON for readability
+                indented_json = "\n".join("      " + line for line in formatted_json.splitlines())
+                log.write(Text(indented_json, style="cyan"))
+            
+            log.write(Text("\n" + "-"*40 + "\n"))
 
 
 class AnalyzerApp(App):
@@ -104,10 +197,10 @@ class AnalyzerApp(App):
     """
 
     BINDINGS = [
-        Binding("m", "mark_action", "Mark (instant)", show=True),
+        Binding("m", "toggle_action", "Toggle Action", show=True),
         Binding("l", "set_label", "Label", show=True),
-        Binding("b", "lock_baseline", "Lock Baseline", show=True),
         Binding("c", "correlate", "Correlate", show=True),
+        Binding("i", "inspect_correlations", "Inspect Results", show=True),
         Binding("escape", "cancel_input", "Cancel", show=False),
     ]
 
@@ -123,8 +216,6 @@ class AnalyzerApp(App):
         self.correlation = CorrelationEngine(self.baseline)
 
         # The current action label. Set with 'l', used by 'm'.
-        # Default is "action" — the analyst changes it when they want
-        # to start marking a different kind of action.
         self.current_label = "action"
 
         # UI state
@@ -142,7 +233,7 @@ class AnalyzerApp(App):
                 yield RichLog(id="stream", max_lines=500, highlight=True, markup=True)
                 yield Input(
                     id="label-input",
-                    placeholder="New label for marks (e.g. 'login')...",
+                    placeholder="New label for action periods (e.g. 'login')...",
                 )
             with Vertical(id="sidebar"):
                 yield Static("Waiting for stream...", id="status-panel")
@@ -151,9 +242,10 @@ class AnalyzerApp(App):
                     "No correlations yet\n\n"
                     "Workflow:\n"
                     " 1. Wait for baseline\n"
-                    " 2. Press [b] to lock it\n"
-                    " 3. Do action, press [m]\n"
-                    " 4. Repeat, then [c]",
+                    " 2. Press [m] to START action\n"
+                    " 3. Press [m] to END action\n"
+                    " 4. Repeat (updates live)\n"
+                    " 5. Press [i] to inspect",
                     id="correlations-panel",
                 )
         yield Footer()
@@ -201,6 +293,34 @@ class AnalyzerApp(App):
                     # No new data — poll again shortly
                     time.sleep(0.05)
 
+    def get_frequency_color(self, count: int, max_count: int) -> str:
+        """
+        Calculate a color on a sliding scale from Bright Green (rare) to Grey (common).
+        Uses a logarithmic scale because counts follow a power law.
+        """
+        if count <= 1:
+            return "#00FF00"  # Neon Green (New/Unique)
+        
+        # Logarithmic normalization
+        # log(1) = 0, log(max) = 1.0
+        try:
+            val = math.log(count) / math.log(max_count + 1)
+        except ValueError:
+            val = 0.0
+            
+        val = min(max(val, 0.0), 1.0)
+
+        # Interpolate between Green (#00FF00) and Grey (#555555)
+        # R: 0 -> 85 (0x55)
+        # G: 255 -> 85 (0x55)
+        # B: 0 -> 85 (0x55)
+        
+        r = int(0 + val * 85)
+        g = int(255 - val * 170)
+        b = int(0 + val * 85)
+        
+        return f"#{r:02x}{g:02x}{b:02x}"
+
     # --- Object Processing ---
 
     def process_object(self, obj: dict):
@@ -246,14 +366,17 @@ class AnalyzerApp(App):
         if len(obj_summary) > 80:
             obj_summary = obj_summary[:77] + "..."
 
-        if is_new:
-            line = Text(f"{ts_display} ★ NEW [{type_name}] {obj_summary}")
-            line.stylize("bold yellow")
-        elif obj_type and obj_type.count > 100:
-            line = Text(f"{ts_display} [{type_name}] {obj_summary}")
-            line.stylize("dim")
-        else:
-            line = Text(f"{ts_display} [{type_name}] {obj_summary}")
+        # Color coding by frequency (sliding scale)
+        # Find the max count currently in the registry for normalization
+        max_count = max((t.count for t in self.registry.types.values()), default=1)
+        count = obj_type.count if obj_type else 1
+        
+        color = self.get_frequency_color(count, max_count)
+        style = f"bold {color}" if is_new or count < 5 else color
+        marker = "★" if is_new else " "
+
+        line = Text(f"{ts_display} {marker} [{type_name}] {obj_summary}")
+        line.stylize(style)
 
         stream.write(line)
 
@@ -261,6 +384,7 @@ class AnalyzerApp(App):
         if self.object_count % 20 == 0:
             self.update_status_panel()
             self.update_types_panel()
+            self.update_correlations_panel()
 
     # --- Sidebar Panels ---
 
@@ -273,35 +397,38 @@ class AnalyzerApp(App):
             return
 
         # Baseline status
-        if self.baseline.is_recording:
-            elapsed = time.time() - self.baseline._start_time
-            baseline_str = f"Recording ({elapsed:.0f}s) — press 'b' to lock"
-        elif self.baseline.is_ready:
+        if self.baseline.is_paused:
+            baseline_str = "PAUSED (Action in progress)"
+        else:
             baseline_str = (
-                f"Locked ({self.baseline.duration:.0f}s, "
+                f"Recording ({self.baseline.duration:.0f}s, "
                 f"{self.baseline.total_rate():.0f}/sec)"
             )
-        else:
-            baseline_str = "Not started"
 
-        # Summarize marks
+        # Summarize periods
         labels = self.correlation.action_labels()
         if labels:
             action_parts = []
             for lbl in labels:
-                count = self.correlation.action_count(lbl)
+                count = self.correlation.period_count(lbl)
                 action_parts.append(f"{lbl} x{count}")
             marks_str = ", ".join(action_parts)
         else:
             marks_str = "none (press 'm')"
+
+        # Current action status
+        if self.correlation.is_in_action:
+            action_status = f"ACTION: {self.correlation.active_period.label.upper()}"
+        else:
+            action_status = "IDLE (Baseline recording)"
 
         text = (
             f"STATUS\n"
             f"Objects: {self.object_count:,}  "
             f"Rate: {self.current_rate:.0f}/sec\n"
             f"Baseline: {baseline_str}\n"
-            f"Marks: {marks_str}\n"
-            f"Current label: \"{self.current_label}\""
+            f"Periods: {marks_str}\n"
+            f"State: {action_status}"
         )
         panel.update(text)
 
@@ -335,19 +462,19 @@ class AnalyzerApp(App):
                 "No correlations yet\n\n"
                 "Mark some actions first:\n"
                 "  [l] set label\n"
-                "  [m] mark instant\n"
-                "  [c] correlate"
+                "  [m] START action\n"
+                "  [m] END action\n"
+                "  [i] inspect"
             )
             return
 
         lines = ["CORRELATIONS\n"]
 
         if not self.baseline.is_ready:
-            lines.append("(no baseline — lock with 'b'")
-            lines.append(" for better scoring)\n")
+            lines.append("(baseline building... need >10s)\n")
 
         for label in labels:
-            n = self.correlation.action_count(label)
+            n = self.correlation.period_count(label)
             results = self.correlation.correlations(label)
             lines.append(f'"{label}" ({n} trials):')
 
@@ -377,38 +504,44 @@ class AnalyzerApp(App):
 
     # --- Action Handlers ---
 
-    def action_mark_action(self):
+    def action_toggle_action(self):
         """
-        INSTANT mark — records the timestamp the moment the key is pressed.
-
-        Uses the current label (set with 'l'). No dialog, no delay.
-        This is critical because the analyst needs the mark timestamp
-        to be as close as possible to when they actually acted.
+        Toggle action period (start or stop).
+        INSTANT response — timestamp is recorded immediately.
         """
-        now = time.time()
-        mark = self.correlation.mark_action(self.current_label, now)
-
-        # Show the mark in the stream
+        period, started = self.correlation.toggle(self.current_label)
+        
         stream = self.query_one("#stream", RichLog)
-        ts_str = time.strftime("%H:%M:%S", time.localtime(now))
-        ms = int((now % 1) * 1000)
-        text = Text(
-            f"{'─' * 12} MARK #{mark.id}: "
-            f"\"{self.current_label}\" @ {ts_str}.{ms:03d} "
-            f"{'─' * 12}"
-        )
-        text.stylize("bold green")
-        stream.write(text)
+        ts_str = time.strftime("%H:%M:%S", time.localtime(period.start))
+        ms = int((period.start % 1) * 1000)
 
+        if started:
+            text = Text(
+                f"{'─' * 12} ACTION START #{period.id}: "
+                f"\"{period.label}\" @ {ts_str}.{ms:03d} "
+                f"{'─' * 12}"
+            )
+            text.stylize("bold green")
+        else:
+            end_ts = period.end or time.time()
+            end_str = time.strftime("%H:%M:%S", time.localtime(end_ts))
+            end_ms = int((end_ts % 1) * 1000)
+            duration = end_ts - period.start
+            text = Text(
+                f"{'─' * 12} ACTION END #{period.id}: "
+                f"\"{period.label}\" @ {end_str}.{end_ms:03d} "
+                f"({duration:.1f}s) "
+                f"{'─' * 12}"
+            )
+            text.stylize("bold red")
+
+        stream.write(text)
         self.update_status_panel()
 
     def action_set_label(self):
         """
         Show the label input. Whatever the analyst types becomes the
-        label used for future 'm' marks.
-
-        This is separate from marking because labeling requires typing,
-        which takes time. The mark itself must be instant.
+        label used for future action periods.
         """
         inp = self.query_one("#label-input", Input)
         inp.display = True
@@ -424,6 +557,9 @@ class AnalyzerApp(App):
 
         if label:
             self.current_label = label
+            # Also update the active period label if one is open
+            if self.correlation.is_in_action:
+                self.correlation.active_period.label = label
 
             stream = self.query_one("#stream", RichLog)
             text = Text(f"{'─' * 12} Label set to: \"{label}\" {'─' * 12}")
@@ -432,36 +568,15 @@ class AnalyzerApp(App):
 
         self.update_status_panel()
 
-    def action_lock_baseline(self):
-        """
-        Lock the baseline. Everything observed up to this point becomes
-        the reference for "normal." After locking, the analyst starts
-        performing actions and marking them.
-        """
-        if not self.baseline.is_ready:
-            self.baseline.lock()
-
-            stream = self.query_one("#stream", RichLog)
-            text = Text(
-                f"{'─' * 12} BASELINE LOCKED "
-                f"({self.baseline.duration:.1f}s, "
-                f"{self.baseline.total_rate():.0f}/sec, "
-                f"{len(self.registry.types)} types) "
-                f"{'─' * 12}"
-            )
-            text.stylize("bold blue")
-            stream.write(text)
-        else:
-            stream = self.query_one("#stream", RichLog)
-            text = Text(f"{'─' * 12} Baseline already locked {'─' * 12}")
-            text.stylize("blue")
-            stream.write(text)
-
-        self.update_status_panel()
-
     def action_correlate(self):
         """Compute and display correlation results."""
         self.update_correlations_panel()
+
+    def action_inspect_correlations(self):
+        """
+        Open a modal screen with detailed correlation results.
+        """
+        self.push_screen(InspectionModal(self.correlation, self.registry))
 
     def action_cancel_input(self):
         """Hide the label input (Escape key)."""
