@@ -44,16 +44,16 @@ from typing import Any, Optional
 #   Same shape (and same semantic hints, if present) → same fingerprint.
 
 
-def structural_fingerprint(obj: dict) -> str:
+def structural_fingerprint(obj: dict, semantic_signature: Optional[set[str]] = None) -> str:
     """
     Compute a short hash representing the structural shape of a JSON object.
 
     Returns a 12-character hex string. The hash is primarily structural
-    (keys, nesting, value types), with a compact semantic add-on for known
-    discriminator fields (e.g., event/type/status/variant).
+    (keys, nesting, value types), with an optional semantic add-on for
+    learned discriminator fields.
     """
     shape = extract_shape(obj)
-    semantic = sorted(extract_semantic_signature(obj))
+    semantic = sorted(semantic_signature or set())
     # sort_keys gives deterministic serialization.
     payload = {"shape": shape, "semantic": semantic}
     payload_str = json.dumps(payload, sort_keys=True)
@@ -144,55 +144,6 @@ def shape_similarity(shape_a: Any, shape_b: Any) -> float:
     return 1.0 if shape_a == shape_b else 0.0
 
 
-SEMANTIC_VALUE_KEYS = {
-    "action",
-    "auth_method",
-    "channel",
-    "currency",
-    "event",
-    "level",
-    "method",
-    "metric_name",
-    "name",
-    "priority",
-    "status",
-    "template",
-    "type",
-    "variant",
-}
-
-
-def extract_semantic_signature(obj: Any, path: str = "") -> set[str]:
-    """
-    Extract low-cardinality, enum-like value hints for merge decisions.
-
-    We intentionally do not include high-entropy IDs/timestamps; the goal is
-    to distinguish logical event families that share structure but differ by
-    stable discriminator fields like `event`/`type`/`status`.
-    """
-    out: set[str] = set()
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            child_path = f"{path}.{key}" if path else key
-            out |= extract_semantic_signature(value, child_path)
-            if key not in SEMANTIC_VALUE_KEYS:
-                continue
-            if isinstance(value, str):
-                # Keep short-ish categorical strings; skip likely IDs.
-                if len(value) <= 40 and sum(ch.isdigit() for ch in value) <= 6:
-                    out.add(f"{child_path}={value}")
-            elif isinstance(value, bool):
-                out.add(f"{child_path}={value}")
-            elif isinstance(value, (int, float)):
-                # Numeric semantic flags are useful when they are bounded.
-                if abs(float(value)) < 10000:
-                    out.add(f"{child_path}={value}")
-    elif isinstance(obj, list):
-        for item in obj[:3]:
-            out |= extract_semantic_signature(item, f"{path}[]")
-    return out
-
-
 def semantic_similarity(a: set[str], b: set[str]) -> Optional[float]:
     """
     Similarity for semantic signatures. Returns None when both are empty.
@@ -253,12 +204,112 @@ class TypeRegistry:
         self,
         similarity_threshold: float = 0.85,
         semantic_overlap_threshold: float = 0.50,
+        semantic_min_support: int = 8,
+        semantic_max_cardinality: int = 24,
+        semantic_max_unique_ratio: float = 0.80,
+        semantic_max_string_len: int = 48,
+        semantic_value_min_count: int = 2,
     ):
         self.types: dict[str, ObjectType] = {}
         self.similarity_threshold = similarity_threshold
         self.semantic_overlap_threshold = semantic_overlap_threshold
+        self.semantic_min_support = max(1, semantic_min_support)
+        self.semantic_max_cardinality = max(1, semantic_max_cardinality)
+        self.semantic_max_unique_ratio = min(max(0.0, semantic_max_unique_ratio), 1.0)
+        self.semantic_max_string_len = max(8, semantic_max_string_len)
+        self.semantic_value_min_count = max(1, semantic_value_min_count)
         # Maps variant fingerprints → canonical type_id (for merged types)
         self._canonical: dict[str, str] = {}
+        # Adaptive discriminator stats: path -> {"total": int, "value_counts": {value: count}}
+        self._semantic_stats: dict[str, dict[str, Any]] = {}
+
+    def _collect_semantic_candidates(self, obj: Any, path: str = "") -> dict[str, str]:
+        """
+        Collect scalar candidates for adaptive discriminator learning.
+
+        We intentionally favor categorical strings/booleans over raw numbers.
+        """
+        out: dict[str, str] = {}
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                child_path = f"{path}.{key}" if path else key
+                out.update(self._collect_semantic_candidates(value, child_path))
+        elif isinstance(obj, list):
+            for item in obj[:3]:
+                out.update(self._collect_semantic_candidates(item, f"{path}[]"))
+        elif isinstance(obj, str):
+            cleaned = obj.strip()
+            if cleaned and len(cleaned) <= self.semantic_max_string_len:
+                out[path] = f"s:{cleaned}"
+        elif isinstance(obj, bool):
+            out[path] = f"b:{obj}"
+        return out
+
+    def _update_semantic_stats(self, candidates: dict[str, str]):
+        for path, value in candidates.items():
+            stats = self._semantic_stats.get(path)
+            if stats is None:
+                stats = {"total": 0, "value_counts": defaultdict(int)}
+                self._semantic_stats[path] = stats
+            stats["total"] += 1
+            stats["value_counts"][value] += 1
+
+    def _is_discriminator_path(self, path: str) -> bool:
+        stats = self._semantic_stats.get(path)
+        if not stats:
+            return False
+        total = int(stats["total"])
+        value_counts = stats["value_counts"]
+        distinct = len(value_counts)
+        if total < self.semantic_min_support:
+            return False
+        if distinct > self.semantic_max_cardinality:
+            return False
+        if distinct < 2:
+            return False
+        recurring_values = sum(
+            1 for count in value_counts.values() if count >= self.semantic_value_min_count
+        )
+        if recurring_values < 2:
+            return False
+        unique_ratio = distinct / total if total else 1.0
+        if unique_ratio > self.semantic_max_unique_ratio:
+            return False
+        return True
+
+    def _adaptive_semantic_signature(self, candidates: dict[str, str]) -> set[str]:
+        """
+        Build semantic signature only from paths that look discriminator-like.
+        """
+        signature: set[str] = set()
+        for path, value in candidates.items():
+            if self._is_discriminator_path(path):
+                signature.add(f"{path}={value}")
+        return signature
+
+    def semantic_diagnostics(self, limit: int = 12) -> list[dict[str, Any]]:
+        """
+        Return discriminator-learning diagnostics for inspect/debug views.
+        """
+        rows: list[dict[str, Any]] = []
+        for path, stats in self._semantic_stats.items():
+            total = int(stats["total"])
+            value_counts = stats["value_counts"]
+            distinct = len(value_counts)
+            unique_ratio = (distinct / total) if total else 1.0
+            top = sorted(value_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]
+            rows.append(
+                {
+                    "path": path,
+                    "total": total,
+                    "distinct": distinct,
+                    "unique_ratio": unique_ratio,
+                    "promoted": self._is_discriminator_path(path),
+                    "top_values": top,
+                }
+            )
+        rows.sort(key=lambda r: (not r["promoted"], -r["total"], r["path"]))
+        return rows[:limit]
 
     def register(self, obj: dict, timestamp: float) -> tuple[str, bool]:
         """
@@ -268,7 +319,13 @@ class TypeRegistry:
             (type_id, is_new) — is_new is True if this is a brand-new type
             never seen before. Useful for highlighting novel objects.
         """
-        fp = structural_fingerprint(obj)
+        obj_shape = extract_shape(obj)
+        semantic_candidates = self._collect_semantic_candidates(obj)
+        self._update_semantic_stats(semantic_candidates)
+        obj_signature = self._adaptive_semantic_signature(semantic_candidates)
+
+        payload = {"shape": obj_shape, "semantic": sorted(obj_signature)}
+        fp = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]
         canonical_id = self._canonical.get(fp, fp)
 
         is_new = canonical_id not in self.types
@@ -276,8 +333,6 @@ class TypeRegistry:
         if is_new:
             # Before creating a new type, check if it's similar enough
             # to an existing type to merge (fuzzy clustering).
-            obj_shape = extract_shape(obj)
-            obj_signature = extract_semantic_signature(obj)
             for existing_id, existing_type in self.types.items():
                 structural = shape_similarity(obj_shape, existing_type.shape)
                 semantic = semantic_similarity(obj_signature, existing_type.semantic_signature)
@@ -309,7 +364,7 @@ class TypeRegistry:
 
         self.types[canonical_id].count += 1
         # Keep semantic signature up to date for evolving variants.
-        self.types[canonical_id].semantic_signature |= extract_semantic_signature(obj)
+        self.types[canonical_id].semantic_signature |= obj_signature
         return canonical_id, is_new
 
     def get(self, type_id: str) -> Optional[ObjectType]:
@@ -496,6 +551,17 @@ class ActionPeriod:
         return end - self.start
 
 
+@dataclass
+class Observation:
+    """An observed type occurrence associated with an action period."""
+    type_id: str
+    latency_from_start: float
+    latency_from_phase_start: float
+    phase: str  # "during" or "post"
+    timestamp: float
+    raw_obj: Optional[dict] = None
+
+
 class CorrelationEngine:
     """
     Matches analyst-defined action periods to object types.
@@ -509,14 +575,15 @@ class CorrelationEngine:
         baseline: The baseline model (paused/resumed automatically).
     """
 
-    def __init__(self, baseline: BaselineModel):
+    def __init__(self, baseline: BaselineModel, post_window_sec: float = 0.0):
         self.baseline = baseline
         self._periods: list[ActionPeriod] = []
         self._next_id: int = 1
+        self.post_window_sec = max(0.0, post_window_sec)
 
         # Observations per period:
-        # period_id → [(type_id, latency, timestamp, raw_obj), ...]
-        self._period_observations: dict[int, list[tuple[str, float, float, Optional[dict]]]] = defaultdict(list)
+        # period_id → [Observation, ...]
+        self._period_observations: dict[int, list[Observation]] = defaultdict(list)
 
     @property
     def active_period(self) -> Optional[ActionPeriod]:
@@ -557,6 +624,22 @@ class CorrelationEngine:
             self.baseline.pause()
             return period, True
 
+    def add_period(self, label: str, start: float, end: float) -> ActionPeriod:
+        """
+        Add a closed action period directly (useful for replay/sidecar marks).
+        """
+        period = ActionPeriod(
+            id=self._next_id,
+            label=label,
+            start=start,
+            end=end,
+        )
+        self._next_id += 1
+        self._periods.append(period)
+        # Keep periods sorted for deterministic replay behavior.
+        self._periods.sort(key=lambda p: p.start)
+        return period
+
     def observe(self, type_id: str, timestamp: float, raw_obj: Optional[dict] = None):
         """
         Record an observed object. If an action period is active,
@@ -570,7 +653,84 @@ class CorrelationEngine:
         if current is not None:
             latency = timestamp - current.start
             if latency >= 0:
-                self._period_observations[current.id].append((type_id, latency, timestamp, raw_obj))
+                self._period_observations[current.id].append(
+                    Observation(
+                        type_id=type_id,
+                        latency_from_start=latency,
+                        latency_from_phase_start=latency,
+                        phase="during",
+                        timestamp=timestamp,
+                        raw_obj=raw_obj,
+                    )
+                )
+            return
+
+        # No active period: optionally capture delayed post-window emissions.
+        if self.post_window_sec <= 0:
+            return
+
+        for period in reversed(self._periods):
+            if period.is_open or period.end is None:
+                continue
+            if timestamp < period.start:
+                break
+            if period.end <= timestamp <= (period.end + self.post_window_sec):
+                self._period_observations[period.id].append(
+                    Observation(
+                        type_id=type_id,
+                        latency_from_start=timestamp - period.start,
+                        latency_from_phase_start=timestamp - period.end,
+                        phase="post",
+                        timestamp=timestamp,
+                        raw_obj=raw_obj,
+                    )
+                )
+
+    def observe_at(self, type_id: str, timestamp: float, raw_obj: Optional[dict] = None):
+        """
+        Timestamp-driven observation for replay mode.
+        Uses explicit period timestamps instead of active live toggle state.
+        """
+        for period in self._periods:
+            if period.is_open:
+                continue
+            if period.end is None:
+                continue
+            if period.start <= timestamp <= period.end:
+                self._period_observations[period.id].append(
+                    Observation(
+                        type_id=type_id,
+                        latency_from_start=timestamp - period.start,
+                        latency_from_phase_start=timestamp - period.start,
+                        phase="during",
+                        timestamp=timestamp,
+                        raw_obj=raw_obj,
+                    )
+                )
+            elif self.post_window_sec > 0 and period.end < timestamp <= (period.end + self.post_window_sec):
+                self._period_observations[period.id].append(
+                    Observation(
+                        type_id=type_id,
+                        latency_from_start=timestamp - period.start,
+                        latency_from_phase_start=timestamp - period.end,
+                        phase="post",
+                        timestamp=timestamp,
+                        raw_obj=raw_obj,
+                    )
+                )
+
+    def is_in_period(self, timestamp: float) -> bool:
+        """
+        Is this timestamp inside any action period?
+        """
+        for period in self._periods:
+            if period.is_open:
+                continue
+            if period.end is None:
+                continue
+            if period.start <= timestamp <= period.end:
+                return True
+        return False
 
     def period_count(self, label: str) -> int:
         """How many completed action periods have this label?"""
@@ -583,6 +743,15 @@ class CorrelationEngine:
         """All distinct action labels, in order of first appearance."""
         return list(dict.fromkeys(p.label for p in self._periods))
 
+    def closed_periods(self, label: Optional[str] = None) -> list[ActionPeriod]:
+        """
+        Closed action periods, optionally filtered by label.
+        """
+        periods = [p for p in self._periods if not p.is_open]
+        if label is not None:
+            periods = [p for p in periods if p.label == label]
+        return periods
+
     def relabel(self, period_id: int, new_label: str):
         """Change the label on a period. Affects future correlation results."""
         for period in self._periods:
@@ -590,7 +759,7 @@ class CorrelationEngine:
                 period.label = new_label
                 return
 
-    def correlations(self, action_label: str) -> list[dict]:
+    def correlations(self, action_label: str, phase: str = "all") -> list[dict]:
         """
         Compute correlation results for a specific action label.
 
@@ -625,9 +794,16 @@ class CorrelationEngine:
         type_period_presence: dict[str, set[int]] = defaultdict(set)
 
         for period in closed:
-            for type_id, latency, _, _ in self._period_observations.get(period.id, []):
-                type_latencies[type_id].append(latency)
-                type_period_presence[type_id].add(period.id)
+            for obs in self._period_observations.get(period.id, []):
+                if phase != "all" and obs.phase != phase:
+                    continue
+                latency = (
+                    obs.latency_from_phase_start
+                    if phase == "post"
+                    else obs.latency_from_start
+                )
+                type_latencies[obs.type_id].append(latency)
+                type_period_presence[obs.type_id].add(period.id)
 
         results = []
 
@@ -694,11 +870,18 @@ class CorrelationEngine:
         results.sort(key=lambda r: r["confidence"], reverse=True)
         return results
 
+    def delayed_correlations(self, action_label: str) -> list[dict]:
+        """
+        Correlations computed only from post-window observations.
+        """
+        return self.correlations(action_label, phase="post")
+
     def raw_observations(
         self,
         action_label: str,
         type_id: str,
         limit: int = 20,
+        phase: str = "all",
     ) -> tuple[list[dict], int]:
         """
         Get raw observed objects for a candidate type during closed periods.
@@ -718,15 +901,19 @@ class CorrelationEngine:
         matches: list[dict] = []
 
         for pid in closed_ids:
-            for obs_type, latency, ts, raw_obj in self._period_observations.get(pid, []):
-                if obs_type != type_id or raw_obj is None:
+            for obs in self._period_observations.get(pid, []):
+                if obs.type_id != type_id or obs.raw_obj is None:
+                    continue
+                if phase != "all" and obs.phase != phase:
                     continue
                 matches.append(
                     {
                         "period_id": pid,
-                        "timestamp": ts,
-                        "latency_ms": latency * 1000.0,
-                        "obj": raw_obj,
+                        "timestamp": obs.timestamp,
+                        "latency_ms": obs.latency_from_start * 1000.0,
+                        "phase_latency_ms": obs.latency_from_phase_start * 1000.0,
+                        "phase": obs.phase,
+                        "obj": obs.raw_obj,
                     }
                 )
 
