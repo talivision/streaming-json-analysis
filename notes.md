@@ -1,21 +1,30 @@
 # JSON Stream Analysis: Techniques & Status
 
 ## Techniques Applied
-*   **Structural Fingerprinting:** We group objects by "shape" (keys, nesting, value types) rather than values. This creates a resilient type system without manual schemas.
-*   **Baseline Subtraction (Signal-to-Noise):** "Normal" traffic is learned continuously. When you act, we look for what's *new* or *statistically elevated* above this background.
-*   **Continuous Baseline:** The baseline pauses during action windows to avoid contamination, allowing it to adapt to drift without "learning" your triggers.
-*   **Confidence Scoring:** `Confidence = Consistency * Specificity`.
+*   **Complex Event Processing (CEP) - Windowed Correlation:** Marked action periods are correlated with output events in time windows.  
+    Example uses: fraud pipelines, SIEM alert correlation, telecom event processing.
+*   **Unsupervised Schema Inference / Event Typing:** Objects are grouped by structure and low-cardinality semantic discriminators (`event`, `type`, `status`, `variant`) to discover event families without manual schemas.  
+    Example uses: log analytics, schema discovery in data lakes, protocol reverse engineering.
+*   **Streaming Anomaly Detection via Background Modeling:** A continuous baseline models normal output traffic; action-period observations are contrasted against baseline lift.  
+    Example uses: observability platforms, intrusion detection, telemetry monitoring.
+*   **Heuristic Causal Attribution (Observational):** `Confidence = Consistency * Specificity`.
     *   *Consistency:* Does it happen every time? (e.g., 9/10 trials).
     *   *Specificity:* Is it rare otherwise? (High lift over baseline).
-*   **Visual Anomaly Detection:** Sliding-scale color coding (Neon Green → Grey) provides instant visual feedback on object rarity/novelty, similar to heatmap dashboards.
+    Example uses: product analytics attribution, incident triage, experiment diagnostics.
+*   **Concept Drift Handling (Online):** Baseline pauses during action periods (anti-contamination) and resumes outside them (adaptation).  
+    Example uses: live risk scoring, adaptive monitoring systems.
+*   **Visual Anomaly Cueing:** Sliding-scale color coding (Neon Green → Grey) gives instant rarity/novelty feedback.
 
 ## How They Work Here
-*   **Live Stream Analysis:** Correlations update live (every ~20 objects), giving immediate feedback.
-*   **Action Windows:** Time-boxing focuses analysis on relevant periods, reducing false positives.
-*   **Aggregated Inspection:** The "Inspect" (`i`) modal aggregates data across *all* trials to find robust patterns, avoiding the noise of single-event analysis.
+*   **Objective:** We are looking for observable indicators of user inputs by analyzing outputs, so we can make stronger inferences from black-box behavior.
+*   **Live Stream Analysis:** Correlations update live, so repeated trials quickly strengthen or weaken candidate indicators.
+*   **Marked Action Periods:** `m` toggles action periods on/off; in-period objects become candidates while out-of-period objects feed baseline.
+*   **Inspection Workflow:** Inspect first at candidate type level, then drill into raw objects for the selected candidate.
 
 ## Missed / Next Steps
 *   **Protobuf Support:** Discussed but not implemented; current system assumes JSON.
-*   **Advanced Clustering:** We use strict shape hashing. Fuzzy clustering (e.g., Levenshtein on keys) could handle minor schema evolution better.
+*   **Delayed Emission Modeling:** Objects emitted after action windows can be missed. Add configurable post-action windows plus matched control windows/significance checks.
+*   **Threshold Sensitivity:** Similarity and confidence thresholds materially change merges/rankings; expose and tune these explicitly.
+*   **Drift Tradeoff:** Continuous baseline stays fresh, but slow changes can absorb once-distinct indicators; periodic controlled recalibration is needed.
 *   **Automated Action Detection:** Currently manual (`m` key). Could be automated via API hooks or log tailing.
-*   **Post-Action Analysis:** The system is optimized for live streams; analyzing pre-captured logs would require a different "replay" mode.
+*   **Replay / Batch Mode:** Current UX is optimized for live streams; pre-captured log replay needs a dedicated flow.

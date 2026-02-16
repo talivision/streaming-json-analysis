@@ -38,6 +38,7 @@ import math
 import os
 import time
 import argparse
+from typing import Optional
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -68,6 +69,8 @@ class InspectionModal(ModalScreen):
     BINDINGS = [
         Binding("escape", "dismiss", "Close"),
         Binding("i", "dismiss", "Close"),
+        Binding("enter", "open_raw_view", "Open Raw", priority=True),
+        Binding("b", "back_to_list", "Back", priority=True),
     ]
 
     CSS = """
@@ -92,62 +95,187 @@ class InspectionModal(ModalScreen):
     }
     """
 
-    def __init__(self, correlation: CorrelationEngine, registry: TypeRegistry):
+    def __init__(
+        self,
+        correlation: CorrelationEngine,
+        registry: TypeRegistry,
+        confidence_cutoff: float,
+    ):
         super().__init__()
         self.correlation = correlation
         self.registry = registry
+        self.confidence_cutoff = confidence_cutoff
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-container"):
-            yield Static("DETAILED INSPECTION REPORT (Press Esc to close)", classes="header")
+            yield Static(
+                "INSPECTION",
+                classes="header",
+                id="inspect-header",
+            )
             yield RichLog(id="report", markup=True, highlight=True)
 
     def on_mount(self):
-        self.generate_report()
+        self._mode = "select"  # "select" or "raw"
+        self._selected_index = 0
+        self._candidates: list[dict] = []
+        report = self.query_one("#report", RichLog)
+        report.can_focus = False
+        self._build_candidates()
+        self.render_select_view()
 
-    def generate_report(self):
+    def on_key(self, event):
+        # Selection mode: arrows choose candidate only (no scrolling).
+        if self._mode == "select":
+            if event.key == "up":
+                event.stop()
+                self.action_cursor_up()
+            elif event.key == "down":
+                event.stop()
+                self.action_cursor_down()
+
+    def _build_candidates(self):
+        self._candidates = []
+        for label in self.correlation.action_labels():
+            for result in self.correlation.correlations(label):
+                if result["confidence"] <= self.confidence_cutoff:
+                    continue
+                self._candidates.append({"label": label, "result": result})
+        self._candidates.sort(key=lambda c: c["result"]["confidence"], reverse=True)
+
+    def _selected_candidate(self) -> Optional[dict]:
+        if not self._candidates:
+            return None
+        self._selected_index = max(0, min(self._selected_index, len(self._candidates) - 1))
+        return self._candidates[self._selected_index]
+
+    def render_select_view(self):
+        header = self.query_one("#inspect-header", Static)
+        header.update("INSPECTION: Select with ↑/↓, Enter opens raw objects, Esc closes")
         log = self.query_one("#report", RichLog)
-        labels = self.correlation.action_labels()
+        log.can_focus = False
+        log.clear()
 
-        if not labels:
+        if not self._candidates:
             log.write("No actions marked yet.")
             return
 
-        for label in labels:
-            results = self.correlation.correlations(label)
-            # Filter for meaningful correlations (confidence > 0.2)
-            significant = [r for r in results if r["confidence"] > 0.2]
-            
-            header = Text(f"\nAction: \"{label}\" ({len(significant)} significant candidates)")
-            header.stylize("bold underline")
-            log.write(header)
+        log.write(
+            Text(
+                f"Candidates: {len(self._candidates)} "
+                f"(confidence > {self.confidence_cutoff:.2f})\n",
+                style="bold",
+            )
+        )
 
-            if not significant:
-                log.write(Text("  No significant correlations found.\n"))
-                continue
+        for i, candidate in enumerate(self._candidates):
+            label = candidate["label"]
+            result = candidate["result"]
+            obj_type = self.registry.get(result["type_id"])
+            type_name = obj_type.display_name if obj_type else result["type_id"][:8]
+            prefix = "►" if i == self._selected_index else " "
+            line = Text(
+                f"{prefix} [{label}] {type_name}  conf={result['confidence']:.2f}  "
+                f"{result['appearances']}/{result['trials']}  ~{result['avg_latency_ms']:.0f}ms"
+            )
+            if i == self._selected_index:
+                line.stylize("bold yellow")
+            log.write(line)
 
-            for r in significant:
-                type_id = r["type_id"]
-                obj_type = self.registry.get(type_id)
-                type_name = obj_type.display_name if obj_type else type_id[:8]
-                example = obj_type.example if obj_type else {}
+        selected = self._selected_candidate()
+        if selected is None:
+            return
+        label = selected["label"]
+        result = selected["result"]
+        type_id = result["type_id"]
+        obj_type = self.registry.get(type_id)
+        type_name = obj_type.display_name if obj_type else type_id[:8]
 
-                # Format the block
-                log.write(Text(f"\n  ► Type: {type_name}", style="bold yellow"))
-                log.write(Text(
-                    f"    Confidence: {r['confidence']:.2f}  ({r['assessment']})\n"
-                    f"    Stats: {r['appearances']}/{r['trials']} trials, "
-                    f"latency ~{r['avg_latency_ms']:.0f}ms\n"
-                    f"    Baseline rate: {r['baseline_rate']:.2f}/sec"
-                ))
-                
-                log.write(Text("    Structure Example:", style="italic"))
-                formatted_json = json.dumps(example, indent=4)
-                # Indent the JSON for readability
-                indented_json = "\n".join("      " + line for line in formatted_json.splitlines())
-                log.write(Text(indented_json, style="cyan"))
-            
-            log.write(Text("\n" + "-"*40 + "\n"))
+        log.write(Text("\n" + "-" * 60, style="dim"))
+        log.write(Text(f"Selected: [{label}] {type_name}", style="bold underline"))
+        log.write(
+            Text(
+                f"Confidence: {result['confidence']:.2f} ({result['assessment']})\n"
+                f"Stats: {result['appearances']}/{result['trials']} trials, "
+                f"latency ~{result['avg_latency_ms']:.0f}ms, "
+                f"baseline {result['baseline_rate']:.2f}/sec"
+            )
+        )
+
+        if obj_type and obj_type.semantic_signature:
+            hints = ", ".join(sorted(obj_type.semantic_signature)[:6])
+            if len(obj_type.semantic_signature) > 6:
+                hints += f", +{len(obj_type.semantic_signature) - 6} more"
+            log.write(Text(f"Semantic hints: {hints}"))
+        example = obj_type.example if obj_type else {}
+        log.write(Text("\nExample object:", style="bold cyan"))
+        formatted = json.dumps(example, indent=2)
+        indented = "\n".join("  " + ln for ln in formatted.splitlines())
+        log.write(Text(indented, style="cyan"))
+
+    def action_cursor_up(self):
+        if self._mode != "select" or not self._candidates:
+            return
+        self._selected_index = (self._selected_index - 1) % len(self._candidates)
+        self.render_select_view()
+
+    def action_cursor_down(self):
+        if self._mode != "select" or not self._candidates:
+            return
+        self._selected_index = (self._selected_index + 1) % len(self._candidates)
+        self.render_select_view()
+
+    def action_open_raw_view(self):
+        if self._mode != "select":
+            return
+        selected = self._selected_candidate()
+        if selected is None:
+            return
+
+        self._mode = "raw"
+        header = self.query_one("#inspect-header", Static)
+        header.update("INSPECTION: Raw objects (scroll normally; press 'b' to go back)")
+        log = self.query_one("#report", RichLog)
+        log.can_focus = True
+        log.clear()
+
+        label = selected["label"]
+        result = selected["result"]
+        type_id = result["type_id"]
+        obj_type = self.registry.get(type_id)
+        type_name = obj_type.display_name if obj_type else type_id[:8]
+
+        raw_rows, raw_total = self.correlation.raw_observations(
+            action_label=label,
+            type_id=type_id,
+            limit=0,  # show all; user can scroll
+        )
+
+        log.write(Text(f"[{label}] {type_name}", style="bold yellow"))
+        log.write(Text(f"Raw objects: {raw_total}\n", style="bold"))
+        if not raw_rows:
+            log.write(Text("(no raw objects captured for this candidate)"))
+            return
+
+        for row in raw_rows:
+            ts = time.strftime("%H:%M:%S", time.localtime(row["timestamp"]))
+            ms = int((row["timestamp"] % 1) * 1000)
+            log.write(
+                Text(
+                    f"period #{row['period_id']} @ {ts}.{ms:03d} "
+                    f"(+{row['latency_ms']:.0f}ms)"
+                )
+            )
+            formatted = json.dumps(row["obj"], indent=2)
+            indented = "\n".join("  " + ln for ln in formatted.splitlines())
+            log.write(Text(indented, style="cyan"))
+            log.write("")
+
+    def action_back_to_list(self):
+        if self._mode != "raw":
+            return
+        self._mode = "select"
+        self.render_select_view()
 
 
 class AnalyzerApp(App):
@@ -204,16 +332,26 @@ class AnalyzerApp(App):
         Binding("escape", "cancel_input", "Cancel", show=False),
     ]
 
-    def __init__(self, stream_dir: str = DEFAULT_STREAM_DIR):
+    def __init__(
+        self,
+        stream_dir: str = DEFAULT_STREAM_DIR,
+        similarity_threshold: float = 0.85,
+        semantic_overlap_threshold: float = 0.50,
+        inspect_confidence_cutoff: float = 0.20,
+    ):
         super().__init__()
         self.stream_dir = stream_dir
         self.stream_path = os.path.join(stream_dir, "stream.jsonl")
 
         # Core analysis components (see engine.py for details)
-        self.registry = TypeRegistry()
+        self.registry = TypeRegistry(
+            similarity_threshold=similarity_threshold,
+            semantic_overlap_threshold=semantic_overlap_threshold,
+        )
         # Baseline auto-starts — records from the moment the analyzer launches
         self.baseline = BaselineModel()
         self.correlation = CorrelationEngine(self.baseline)
+        self.inspect_confidence_cutoff = inspect_confidence_cutoff
 
         # The current action label. Set with 'l', used by 'm'.
         self.current_label = "action"
@@ -250,6 +388,17 @@ class AnalyzerApp(App):
                 )
         yield Footer()
 
+    @staticmethod
+    def _signature_preview(signature: set[str], max_items: int = 2) -> str:
+        """Compact, deterministic preview of semantic value hints."""
+        if not signature:
+            return "-"
+        items = sorted(signature)
+        preview = items[:max_items]
+        if len(items) > max_items:
+            preview.append(f"+{len(items) - max_items} more")
+        return ", ".join(preview)
+
     # --- Lifecycle ---
 
     def on_mount(self):
@@ -267,31 +416,50 @@ class AnalyzerApp(App):
         equivalent of a TCP stream reader — simple, no dependencies,
         and works with any JSONL-producing source.
         """
-        # Wait for the file to appear
-        while not os.path.exists(self.stream_path):
-            self.call_from_thread(
-                self.update_status_panel,
-                f"Waiting for {self.stream_path}...\n"
-                f"Start demo_source.py first.",
-            )
-            time.sleep(0.5)
+        while True:
+            # Wait for the file to appear (or reappear after source restart).
+            while not os.path.exists(self.stream_path):
+                self.call_from_thread(
+                    self.update_status_panel,
+                    f"Waiting for {self.stream_path}...\n"
+                    f"Start demo_source.py first.",
+                )
+                time.sleep(0.5)
 
-        self.call_from_thread(self.update_status_panel, "Connected — baseline recording")
+            self.call_from_thread(self.update_status_panel, "Connected — baseline recording")
 
-        with open(self.stream_path, "r") as f:
-            while True:
-                line = f.readline()
-                if line:
-                    line = line.strip()
-                    if line:
-                        try:
-                            obj = json.loads(line)
-                            self.call_from_thread(self.process_object, obj)
-                        except json.JSONDecodeError:
+            try:
+                with open(self.stream_path, "r") as f:
+                    current_inode = os.fstat(f.fileno()).st_ino
+
+                    while True:
+                        line = f.readline()
+                        if line:
+                            line = line.strip()
+                            if line:
+                                try:
+                                    obj = json.loads(line)
+                                    self.call_from_thread(self.process_object, obj)
+                                except json.JSONDecodeError:
+                                    continue
                             continue
-                else:
-                    # No new data — poll again shortly
-                    time.sleep(0.05)
+
+                        # No new data — check if file was replaced/deleted.
+                        if not os.path.exists(self.stream_path):
+                            break
+                        try:
+                            path_inode = os.stat(self.stream_path).st_ino
+                        except FileNotFoundError:
+                            break
+                        if path_inode != current_inode:
+                            # Source rotated/recreated the stream file.
+                            break
+
+                        # Still the same file; keep polling.
+                        time.sleep(0.05)
+            except FileNotFoundError:
+                # Race: file disappeared between exists() and open().
+                time.sleep(0.1)
 
     def get_frequency_color(self, count: int, max_count: int) -> str:
         """
@@ -349,7 +517,7 @@ class AnalyzerApp(App):
         self.baseline.record(type_id)
 
         # --- Feed to correlation engine ---
-        self.correlation.observe(type_id, now)
+        self.correlation.observe(type_id, now, raw_obj=obj)
 
         # --- Display in stream ---
         if obj_type and obj_type.ignored:
@@ -361,6 +529,10 @@ class AnalyzerApp(App):
         ts_display = f"{ts_str}.{ms:03d}"
 
         type_name = obj_type.display_name if obj_type else type_id[:8]
+        sig_preview = (
+            self._signature_preview(obj_type.semantic_signature, max_items=1)
+            if obj_type else "-"
+        )
 
         obj_summary = json.dumps(obj, separators=(",", ":"))
         if len(obj_summary) > 80:
@@ -375,7 +547,8 @@ class AnalyzerApp(App):
         style = f"bold {color}" if is_new or count < 5 else color
         marker = "★" if is_new else " "
 
-        line = Text(f"{ts_display} {marker} [{type_name}] {obj_summary}")
+        sig_suffix = f"  sig:{sig_preview}" if is_new and sig_preview != "-" else ""
+        line = Text(f"{ts_display} {marker} [{type_name}] {obj_summary}{sig_suffix}")
         line.stylize(style)
 
         stream.write(line)
@@ -449,6 +622,7 @@ class AnalyzerApp(App):
             if self.baseline.is_ready and not self.baseline.is_known_type(t.type_id):
                 novel = " [NEW]"
             lines.append(f"  {t.display_name}: {t.count:,}{marker}{novel}")
+            lines.append(f"    sig: {self._signature_preview(t.semantic_signature)}")
 
         panel.update("\n".join(lines))
 
@@ -576,7 +750,13 @@ class AnalyzerApp(App):
         """
         Open a modal screen with detailed correlation results.
         """
-        self.push_screen(InspectionModal(self.correlation, self.registry))
+        self.push_screen(
+            InspectionModal(
+                self.correlation,
+                self.registry,
+                confidence_cutoff=self.inspect_confidence_cutoff,
+            )
+        )
 
     def action_cancel_input(self):
         """Hide the label input (Escape key)."""
@@ -597,9 +777,32 @@ def main():
         default=DEFAULT_STREAM_DIR,
         help=f"Stream directory (default: {DEFAULT_STREAM_DIR})",
     )
+    parser.add_argument(
+        "--similarity-threshold",
+        type=float,
+        default=0.85,
+        help="Structural similarity threshold for fuzzy type merges (default: 0.85)",
+    )
+    parser.add_argument(
+        "--semantic-overlap-threshold",
+        type=float,
+        default=0.50,
+        help="Minimum semantic signature overlap required for merges (default: 0.50)",
+    )
+    parser.add_argument(
+        "--inspect-confidence-cutoff",
+        type=float,
+        default=0.20,
+        help="Minimum confidence shown in Inspect candidate list (default: 0.20)",
+    )
     args = parser.parse_args()
 
-    app = AnalyzerApp(stream_dir=args.path)
+    app = AnalyzerApp(
+        stream_dir=args.path,
+        similarity_threshold=args.similarity_threshold,
+        semantic_overlap_threshold=args.semantic_overlap_threshold,
+        inspect_confidence_cutoff=args.inspect_confidence_cutoff,
+    )
     app.run()
 
 

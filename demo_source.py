@@ -21,6 +21,10 @@ Usage:
   Terminal 3:  python trigger.py login       (simulate an action)
                python trigger.py purchase
                python trigger.py search
+               python trigger.py experiment_control
+               python trigger.py experiment_treatment
+               python trigger.py source_like_heartbeat
+               python trigger.py source_like_metric
 
 The "secret" action→object mappings are defined in ACTION_RESPONSES below.
 In a real scenario, this would be whatever opaque system the analyst observes.
@@ -151,11 +155,49 @@ def make_query_log():
     }
 
 
+def make_experiment_exposure(variant: str):
+    """
+    Intentionally same structure across variants.
+    The value-aware clustering logic should keep these as distinct types.
+    """
+    return {
+        "event": "experiment_exposure",
+        "experiment": "checkout_flow_v3",
+        "variant": variant,  # only value differs between control/treatment
+        "cohort": random.choice(["new_user", "returning_user"]),
+    }
+
+
+def make_triggered_heartbeat():
+    """
+    Same shape as make_heartbeat(), but semantic value differs.
+    Useful for testing value-aware separation on identical structure.
+    """
+    return {
+        "type": "hb_triggered",
+        "seq": random.randint(1, 999999),
+        "ts": time.time(),
+    }
+
+
+def make_triggered_metric():
+    """
+    Same shape as make_metric(), with a trigger-specific metric_name.
+    """
+    return {
+        "metric_name": "trigger_load",
+        "value": round(random.uniform(0, 100), 2),
+        "host": random.choice(["web-1", "web-2", "web-3", "db-1"]),
+    }
+
+
 # Action name → list of (factory, min_delay_ms, max_delay_ms)
 #
 # "login" produces 2 objects:  session_created (fast) + auth_log (slower)
 # "purchase" produces 3 objects: order + inventory + notification (cascading)
 # "search" produces 1 object:  query_log (very fast)
+# "experiment_*" produce same-shape objects that differ mostly by values.
+# "source_like_*" produce objects with the same shape as background source objects.
 ACTION_RESPONSES = {
     "login": [
         (make_session_created,  80, 200),
@@ -168,6 +210,21 @@ ACTION_RESPONSES = {
     ],
     "search": [
         (make_query_log,        30, 80),
+    ],
+    "experiment_control": [
+        (lambda: make_experiment_exposure("control"), 50, 120),
+    ],
+    "experiment_treatment": [
+        (lambda: make_experiment_exposure("treatment"), 50, 120),
+    ],
+    "source_like_heartbeat": [
+        (make_triggered_heartbeat, 20, 40),
+        (make_triggered_heartbeat, 30, 60),
+        (make_triggered_heartbeat, 50, 80),
+    ],
+    "source_like_metric": [
+        (make_triggered_metric, 40, 90),
+        (make_triggered_metric, 60, 120),
     ],
 }
 
@@ -299,6 +356,12 @@ async def main():
     print("Send triggers with:")
     for action in ACTION_RESPONSES:
         print(f"  python trigger.py {action}")
+    print()
+    print("Value-aware demo:")
+    print("  Run experiment_control and experiment_treatment a few times.")
+    print("  They share shape, but should appear as separate types via semantic values.")
+    print("  Run source_like_heartbeat/source_like_metric to emit trigger objects")
+    print("  that match background object SHAPES.")
     print()
     print("Start the analyzer in another terminal:")
     print("  python demo_analyzer.py")

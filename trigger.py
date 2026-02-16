@@ -10,6 +10,10 @@ Usage:
     python trigger.py login
     python trigger.py purchase
     python trigger.py search
+    python trigger.py experiment_control
+    python trigger.py experiment_treatment
+    python trigger.py source_like_heartbeat
+    python trigger.py source_like_metric
 
 The trigger is sent via UDP to the data source. The source then emits
 response objects into the stream after a short delay. The analyst
@@ -25,7 +29,11 @@ TRIGGER_PORT = 8766
 
 if len(sys.argv) < 2:
     print("Usage: python trigger.py <action>")
-    print("Available actions: login, purchase, search")
+    print(
+        "Available actions: login, purchase, search, "
+        "experiment_control, experiment_treatment, "
+        "source_like_heartbeat, source_like_metric"
+    )
     sys.exit(1)
 
 action = sys.argv[1]
