@@ -24,10 +24,10 @@
 
 ## Missed / Next Steps
 *   **Protobuf Support:** Discussed but not implemented; current system assumes JSON.
-*   **Delayed Emission Modeling:** Objects emitted after action windows can be missed. Add configurable post-action windows plus matched control windows/significance checks.
+*   **Delayed Emission Modeling:** Post-action windows are implemented (`post_window_sec`). Next steps: matched control windows and significance checks to reduce false positives from coincidental delayed events.
 *   **Threshold Sensitivity:** Similarity and confidence thresholds materially change merges/rankings; expose and tune these explicitly.
 *   **Discriminator Thresholds Are Heuristic Defaults:** Current values (`min_support=8`, `max_cardinality=24`, `max_unique_ratio=0.80`, `value_min_count=2`) are practical guardrails, not universal constants.
 *   **Auto-Tuning Discriminator Thresholds:** Add offline/online calibration that optimizes indicator quality on replayed/marked data (e.g., maximize consistency-lift stability while penalizing type fragmentation), then persist profile-specific defaults.
 *   **Drift Tradeoff:** Continuous baseline stays fresh, but slow changes can absorb once-distinct indicators; periodic controlled recalibration is needed.
 *   **Automated Action Detection:** Currently manual (`m` key). Could be automated via API hooks or log tailing.
-*   **Replay / Batch Mode:** Current UX is optimized for live streams; pre-captured log replay needs a dedicated flow.
+*   **Replay / Batch Mode:** Basic replay is implemented (`--replay-file`, `--marks-file`, `observe_at`, `is_in_period`). Next steps: batch analysis without TUI, summary report output, and multi-file replay.
