@@ -1,4 +1,6 @@
-use crate::domain::{AnalyzerModel, DataFilters, EventRecord, FilterField};
+use crate::domain::{
+    value_at_path, value_token, AnalyzerModel, DataFilters, EventRecord, FilterField,
+};
 use crate::io::StreamReader;
 use crate::tui::{draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
@@ -21,6 +23,7 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LIVE_WINDOW_DEFAULT: usize = 120;
+const DEFAULT_STREAM_PATH: &str = "/tmp/json_demo/stream.jsonl";
 const LIVE_RECOMPUTE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const UI_FRAME_SLEEP: Duration = Duration::from_millis(16);
@@ -92,7 +95,7 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        let mut stream_path = PathBuf::from("/tmp/json_demo/stream.jsonl");
+        let mut stream_path = PathBuf::from(DEFAULT_STREAM_PATH);
         let mut offline = false;
         for arg in std::env::args().skip(1) {
             if arg == "--offline" {
@@ -662,7 +665,8 @@ impl App {
                 }
             }
         }
-        let total = self.visible_live_events().len();
+        // Compute total once; pass to _n helpers to avoid repeated O(n) filter scans.
+        let total = self.model.filtered_events(&self.event_filters).len();
         if total == 0 {
             self.live_event_index = 0;
             self.live_view_start = 0;
@@ -690,8 +694,6 @@ impl App {
                     self.enter_live_key_focus();
                 } else {
                     self.live_key_focus = false;
-                }
-                if !has_keys {
                     self.status = "Selected event has no keys".to_string();
                 }
                 return;
@@ -702,14 +704,14 @@ impl App {
         if matches!(intent, NavIntent::Home) {
             self.live_edge_until_center = false;
             self.live_view_start = 0;
-            self.clamp_live_indices();
+            self.clamp_live_indices_n(total);
             return;
         }
         if matches!(intent, NavIntent::End) {
             self.live_edge_until_center = false;
             let window = self.live_window_rows.max(1);
             self.live_view_start = total.saturating_sub(window);
-            self.clamp_live_indices();
+            self.clamp_live_indices_n(total);
             return;
         }
 
@@ -719,8 +721,8 @@ impl App {
             self.live_edge_until_center = true;
         }
 
-        self.clamp_live_indices();
-        self.reposition_live_selection();
+        self.clamp_live_indices_n(total);
+        self.reposition_live_selection_n(total);
         self.clamp_live_key_selection();
     }
 
@@ -813,9 +815,9 @@ impl App {
         let page_step = 30usize;
         self.data_index = match intent {
             NavIntent::LineUp => self.data_index.saturating_sub(1),
-            NavIntent::LineDown => self.data_index.saturating_add(1),
+            NavIntent::LineDown => (self.data_index + 1).min(total.saturating_sub(1)),
             NavIntent::PageUp => self.data_index.saturating_sub(page_step),
-            NavIntent::PageDown => self.data_index.saturating_add(page_step),
+            NavIntent::PageDown => (self.data_index + page_step).min(total.saturating_sub(1)),
             NavIntent::Home => 0,
             NavIntent::End => total.saturating_sub(1),
             NavIntent::Left | NavIntent::Right => self.data_index,
@@ -832,10 +834,8 @@ impl App {
         let Some(event) = self.live_selected_event() else {
             return Vec::new();
         };
-        let mut key_paths = event.keys.clone();
-        key_paths.sort();
-        key_paths.dedup();
-        key_paths
+        // keys are already sorted and deduped by collect_all_paths
+        event.keys.clone()
     }
 
     fn clamp_live_key_selection(&mut self) {
@@ -1105,8 +1105,7 @@ impl App {
         }
     }
 
-    fn clamp_live_indices(&mut self) {
-        let total = self.visible_live_events().len();
+    fn clamp_live_indices_n(&mut self, total: usize) {
         if total == 0 {
             self.live_event_index = 0;
             self.live_view_start = 0;
@@ -1120,8 +1119,12 @@ impl App {
         }
     }
 
-    fn pin_live_to_latest(&mut self) {
-        let total = self.visible_live_events().len();
+    fn clamp_live_indices(&mut self) {
+        let total = self.model.filtered_events(&self.event_filters).len();
+        self.clamp_live_indices_n(total);
+    }
+
+    fn pin_live_to_latest_n(&mut self, total: usize) {
         if total == 0 {
             self.live_event_index = 0;
             self.live_view_start = 0;
@@ -1135,6 +1138,11 @@ impl App {
         self.clamp_live_key_selection();
     }
 
+    fn pin_live_to_latest(&mut self) {
+        let total = self.model.filtered_events(&self.event_filters).len();
+        self.pin_live_to_latest_n(total);
+    }
+
     fn refresh_live_position(&mut self) {
         if self.live_follow {
             self.live_edge_until_center = false;
@@ -1146,8 +1154,7 @@ impl App {
         }
     }
 
-    fn ensure_live_selection_visible(&mut self) {
-        let total = self.visible_live_events().len();
+    fn ensure_live_selection_visible_n(&mut self, total: usize) {
         if total == 0 {
             self.live_event_index = 0;
             self.live_view_start = 0;
@@ -1167,8 +1174,12 @@ impl App {
         }
     }
 
-    fn center_live_selection_in_view(&mut self) {
-        let total = self.visible_live_events().len();
+    fn ensure_live_selection_visible(&mut self) {
+        let total = self.model.filtered_events(&self.event_filters).len();
+        self.ensure_live_selection_visible_n(total);
+    }
+
+    fn center_live_selection_in_view_n(&mut self, total: usize) {
         if total == 0 {
             self.live_event_index = 0;
             self.live_view_start = 0;
@@ -1181,22 +1192,16 @@ impl App {
         self.live_view_start = desired_start.min(max_start);
     }
 
-    fn reposition_live_selection(&mut self) {
+    fn reposition_live_selection_n(&mut self, total: usize) {
         if self.live_edge_until_center {
-            self.ensure_live_selection_visible();
-
-            let total = self.visible_live_events().len();
+            self.ensure_live_selection_visible_n(total);
             if total == 0 {
-                self.live_event_index = 0;
-                self.live_view_start = 0;
                 return;
             }
-
             let window = self.live_window_rows.max(1);
             let half = window / 2;
             let max_start = total.saturating_sub(window);
             let target_start = self.live_event_index.saturating_sub(half).min(max_start);
-
             // During the transition out of follow mode, do not auto-scroll toward center.
             // Let user movement naturally move the selected row to center, then lock it there.
             if self.live_view_start == target_start && target_start > 0 && target_start < max_start
@@ -1204,8 +1209,13 @@ impl App {
                 self.live_edge_until_center = false;
             }
         } else {
-            self.center_live_selection_in_view();
+            self.center_live_selection_in_view_n(total);
         }
+    }
+
+    fn reposition_live_selection(&mut self) {
+        let total = self.model.filtered_events(&self.event_filters).len();
+        self.reposition_live_selection_n(total);
     }
 
     fn visible_period_events(&self) -> Vec<&EventRecord> {
@@ -1220,7 +1230,7 @@ impl App {
         }
     }
 
-    fn visible_types(&self) -> Vec<String> {
+    pub fn visible_types(&self) -> Vec<String> {
         let query = self.types_filter.to_lowercase();
         self.model
             .types
@@ -1287,35 +1297,6 @@ impl App {
     }
 }
 
-fn value_at_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
-    let mut cur = v;
-    for part in path.split('.') {
-        if part.ends_with("[]") {
-            let key = &part[..part.len().saturating_sub(2)];
-            cur = cur.get(key)?;
-            if let Value::Array(arr) = cur {
-                cur = arr.first()?;
-            } else {
-                return None;
-            }
-        } else {
-            cur = cur.get(part)?;
-        }
-    }
-    Some(cur)
-}
-
-fn value_token(v: &Value) -> String {
-    match v {
-        Value::Null => "null".to_string(),
-        Value::Bool(b) => format!("b:{}", b),
-        Value::Number(n) => format!("n:{}", n),
-        Value::String(s) => format!("s:{}", s),
-        Value::Array(_) => "array".to_string(),
-        Value::Object(_) => "object".to_string(),
-    }
-}
-
 fn parse_event_timestamp_millis(obj: &Value) -> Result<Option<f64>> {
     let Some(raw) = obj.get("_timestamp") else {
         return Ok(None);
@@ -1374,8 +1355,9 @@ fn normalize_navigation_code(key: KeyEvent) -> KeyCode {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_navigation_code;
+    use super::{normalize_navigation_code, parse_event_timestamp_millis, App};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::json;
 
     #[test]
     fn leaves_home_and_end_unchanged() {
@@ -1407,5 +1389,51 @@ mod tests {
             normalize_navigation_code(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER)),
             KeyCode::PageDown
         );
+    }
+
+    #[test]
+    fn parses_timestamp_millis_and_enforces_13_digit_range() {
+        assert_eq!(
+            parse_event_timestamp_millis(&json!({"_timestamp": 1_739_952_000_123i64}))
+                .expect("valid i64 timestamp"),
+            Some(1_739_952_000.123)
+        );
+        assert_eq!(
+            parse_event_timestamp_millis(&json!({"_timestamp": 1_739_952_000_123u64}))
+                .expect("valid u64 timestamp"),
+            Some(1_739_952_000.123)
+        );
+        assert_eq!(
+            parse_event_timestamp_millis(&json!({"_timestamp": 1_739_952_000_123.0f64}))
+                .expect("valid integer float timestamp"),
+            Some(1_739_952_000.123)
+        );
+
+        assert!(parse_event_timestamp_millis(&json!({"_timestamp": 999_999_999_999i64})).is_err());
+        assert!(parse_event_timestamp_millis(&json!({"_timestamp": 1.5f64})).is_err());
+        assert!(parse_event_timestamp_millis(&json!({"_timestamp": "1739952000123"})).is_err());
+    }
+
+    #[test]
+    fn resolve_event_ts_requires_timestamp_in_live_mode_but_not_offline() {
+        let mut app = App::new();
+        app.offline = false;
+        let err = app
+            .resolve_event_ts(&json!({"event":"login"}), 2000.0, 0)
+            .expect_err("live mode should reject missing _timestamp");
+        assert!(err
+            .to_string()
+            .contains("live mode requires root `_timestamp` as epoch milliseconds"));
+
+        app.offline = true;
+        app.offline_fallback_ts = 1000.0;
+        let first = app
+            .resolve_event_ts(&json!({"event":"offline"}), 5.0, 0)
+            .expect("offline fallback timestamp");
+        let second = app
+            .resolve_event_ts(&json!({"event":"offline"}), 5.0, 1)
+            .expect("offline fallback timestamp increments");
+        assert_eq!(first, 1000.001);
+        assert_eq!(second, 1000.002);
     }
 }

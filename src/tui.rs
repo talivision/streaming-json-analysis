@@ -34,12 +34,15 @@ pub fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(frame.area());
 
+    // Compute once per frame; passed to every row renderer to avoid O(types) per row.
+    let max_type_count = app.model.types.values().map(|t| t.count).max().unwrap_or(1) as f64;
+
     draw_tabs(frame, root[0], app.mode);
     match app.mode {
-        UiMode::Live => draw_live(frame, root[1], app),
-        UiMode::Periods => draw_periods(frame, root[1], app),
+        UiMode::Live => draw_live(frame, root[1], app, max_type_count),
+        UiMode::Periods => draw_periods(frame, root[1], app, max_type_count),
         UiMode::Types => draw_types(frame, root[1], app),
-        UiMode::Data => draw_data(frame, root[1], app),
+        UiMode::Data => draw_data(frame, root[1], app, max_type_count),
     }
     draw_status(frame, root[2], app);
     draw_help(frame, root[3], app);
@@ -75,7 +78,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, mode: UiMode) {
     frame.render_widget(tabs, area);
 }
 
-fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f64) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
@@ -98,6 +101,7 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             e,
             selected,
             stream_inner_width,
+            max_type_count,
         )));
     }
 
@@ -118,16 +122,15 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ))];
-        let (show_uniq, show_rate) = displayed_anomaly_scores(app, sel);
-        let value_norm = value_anomaly_norm(show_uniq);
-        let rate_norm = rate_anomaly_norm(show_rate);
-        let value_color = value_anomaly_color(value_norm);
-        let rate_color = rate_anomaly_color(rate_norm);
+        let show_uniq = sel.live_uniq_score;
+        let show_rate = sel.live_rate_score;
+        let value_color = value_anomaly_color(anomaly_norm(show_uniq));
+        let rate_color = rate_anomaly_color(anomaly_norm(show_rate));
         if sel.in_action_period {
             lines.push(Line::from(vec![
                 Span::styled("value anomaly ", Style::default().fg(Color::Gray)),
                 Span::styled(
-                    format!("{:.2}", show_uniq),
+                    format_score(show_uniq),
                     Style::default()
                         .fg(value_color)
                         .add_modifier(Modifier::BOLD),
@@ -135,7 +138,7 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 Span::raw("  "),
                 Span::styled("rate anomaly ", Style::default().fg(Color::Gray)),
                 Span::styled(
-                    format!("{:.2}", show_rate),
+                    format_score(show_rate),
                     Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
                 ),
             ]));
@@ -165,7 +168,7 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(preview, cols[1]);
 }
 
-fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f64) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
@@ -192,6 +195,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let mut rows = Vec::new();
     let events_inner_width = cols[1].width.saturating_sub(2) as usize;
+    let max_period_rows = (cols[1].height as usize).saturating_sub(2);
     if let Some(period) = periods.get(app.periods_index) {
         let start = period.start;
         let end = period.end.unwrap_or(period.start);
@@ -199,7 +203,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .model
             .filtered_events_in_range(&app.event_filters, Some((start, end)))
             .iter()
-            .take(120)
+            .take(max_period_rows)
             .enumerate()
         {
             let selected = idx == app.period_event_index;
@@ -208,6 +212,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 e,
                 selected,
                 events_inner_width,
+                max_type_count,
             )));
         }
     }
@@ -259,24 +264,11 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
-    let visible = app
-        .model
-        .types
+    let visible_ids = app.visible_types();
+    let visible: Vec<(&str, &_)> = visible_ids
         .iter()
-        .filter_map(|(type_id, tp)| {
-            if app.types_filter.is_empty() {
-                return Some((type_id.clone(), tp));
-            }
-            let q = app.types_filter.to_lowercase();
-            let default = format!("type-{}", &type_id[..8]).to_lowercase();
-            let custom = tp.name.clone().unwrap_or_default().to_lowercase();
-            if type_id.to_lowercase().contains(&q) || default.contains(&q) || custom.contains(&q) {
-                Some((type_id.clone(), tp))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<(String, &_)>>();
+        .filter_map(|id| app.model.types.get(id.as_str()).map(|tp| (id.as_str(), tp)))
+        .collect();
 
     let mut type_items = Vec::new();
     for (idx, (type_id, tp)) in visible.iter().enumerate() {
@@ -287,11 +279,14 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         if tp.known_unrelated {
             style = style.fg(Color::DarkGray);
         }
-        let name = app.model.type_display_name(type_id.as_str());
+        let name = app.model.type_display_name(type_id);
         type_items.push(ListItem::new(Line::from(vec![Span::styled(
             format!(
-                "{}  count={}  r={:.2} u={:.2}",
-                name, tp.count, tp.latest_rate, tp.latest_uniq
+                "{}  count={}  r={} u={}",
+                name,
+                tp.count,
+                format_score(tp.latest_rate),
+                format_score(tp.latest_uniq)
             ),
             style,
         )])));
@@ -308,7 +303,7 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines = Vec::new();
     if let Some((type_id, tp)) = visible.get(app.type_index) {
         lines.push(Line::from(Span::styled(
-            app.model.type_display_name(type_id.as_str()),
+            app.model.type_display_name(type_id),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -361,10 +356,12 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f64) {
     let rows = app.model.filtered_events(&app.event_filters);
     let start = app.data_index.min(rows.len().saturating_sub(1));
-    let slice = rows.into_iter().skip(start).take(120);
+    // 2 border rows + 2 header lines; remaining rows are for events
+    let max_event_rows = (area.height as usize).saturating_sub(4);
+    let slice = rows.into_iter().skip(start).take(max_event_rows);
 
     let mut lines = Vec::new();
     let type_filter_display = app
@@ -384,8 +381,15 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let data_inner_width = area.width.saturating_sub(2) as usize;
     for (idx, e) in slice.enumerate() {
-        let selected = idx == app.data_index;
-        lines.push(render_event_line(app, e, selected, data_inner_width));
+        // start = data_index, so the first visible row (idx == 0) is the selected event
+        let selected = idx == 0;
+        lines.push(render_event_line(
+            app,
+            e,
+            selected,
+            data_inner_width,
+            max_type_count,
+        ));
     }
 
     frame.render_widget(
@@ -916,10 +920,17 @@ fn render_event_line(
     e: &EventRecord,
     selected: bool,
     row_width: usize,
+    max_type_count: f64,
 ) -> Line<'static> {
     let obj = serde_json::to_string(&e.obj).unwrap_or_default();
     let name = app.model.type_display_name(&e.type_id);
-    let mut style = event_style(app, e);
+    let type_count = app
+        .model
+        .types
+        .get(&e.type_id)
+        .map(|t| t.count)
+        .unwrap_or(1) as f64;
+    let mut style = event_style(e, type_count, max_type_count);
     if selected {
         style = style.add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
     }
@@ -937,11 +948,14 @@ fn render_event_line(
         Style::default().fg(Color::Cyan)
     };
     let show_metrics = e.in_action_period;
-    let (show_uniq, show_rate) = displayed_anomaly_scores(app, e);
+    let show_uniq = e.live_uniq_score;
+    let show_rate = e.live_rate_score;
     let (rate_text, value_text, tail_len) = if show_metrics {
-        let rate_live_text = format!("{:>5.2}", e.live_rate_score);
-        let value_live_text = format!("{:>5.2}", e.live_uniq_score);
-        let tail_len = 2 + 2 + rate_live_text.chars().count() + 3 + value_live_text.chars().count();
+        let rate_live_text = format!("{:>5}", format_score(e.live_rate_score));
+        let value_live_text = format!("{:>5}", format_score(e.live_uniq_score));
+        // Tail is: "  " + "R:" + rate + "  " + "V:" + value
+        let tail_len =
+            2 + 2 + rate_live_text.chars().count() + 2 + 2 + value_live_text.chars().count();
         (Some(rate_live_text), Some(value_live_text), tail_len)
     } else {
         (None, None, 0)
@@ -959,12 +973,12 @@ fn render_event_line(
     let spacer = " ".repeat(spacer_len);
 
     let rate_color = if show_metrics {
-        rate_anomaly_color(rate_anomaly_norm(show_rate))
+        rate_anomaly_color(anomaly_norm(show_rate))
     } else {
         Color::DarkGray
     };
     let value_color = if show_metrics {
-        value_anomaly_color(value_anomaly_norm(show_uniq))
+        value_anomaly_color(anomaly_norm(show_uniq))
     } else {
         Color::DarkGray
     };
@@ -989,26 +1003,17 @@ fn render_event_line(
     Line::from(spans)
 }
 
-fn event_style(app: &App, e: &EventRecord) -> Style {
-    let max_count = app.model.types.values().map(|t| t.count).max().unwrap_or(1) as f64;
-    let count = app
-        .model
-        .types
-        .get(&e.type_id)
-        .map(|t| t.count)
-        .unwrap_or(1) as f64;
-
-    let commonness = (count / max_count.max(1.0)).sqrt().clamp(0.0, 1.0);
+fn event_style(e: &EventRecord, type_count: f64, max_type_count: f64) -> Style {
+    let commonness = (type_count / max_type_count.max(1.0))
+        .sqrt()
+        .clamp(0.0, 1.0);
     let rarity = 1.0 - commonness;
     let base = lerp_rgb((112, 112, 112), (0, 220, 70), rarity);
-    let (show_uniq, show_rate) = displayed_anomaly_scores(app, e);
-    let rate_norm = show_rate.clamp(0.0, 1.0);
-    let anomaly = (0.5 * show_uniq + 0.5 * rate_norm).clamp(0.0, 1.0);
-    let orange_strength = anomaly * 0.9;
-    let mixed = lerp_rgb(base, (255, 140, 0), orange_strength);
+    let value_anomaly = e.live_uniq_score.clamp(0.0, 1.0);
+    let mixed = lerp_rgb(base, (255, 140, 0), value_anomaly * 0.9);
 
     let mut style = Style::default().fg(Color::Rgb(mixed.0, mixed.1, mixed.2));
-    if count <= 2.0 {
+    if type_count <= 2.0 {
         style = style.add_modifier(Modifier::BOLD);
     }
     style
@@ -1030,12 +1035,12 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn value_anomaly_norm(value_score: f64) -> f64 {
-    value_score.clamp(0.0, 1.0)
+fn anomaly_norm(score: f64) -> f64 {
+    score.clamp(0.0, 1.0)
 }
 
-fn rate_anomaly_norm(rate_score: f64) -> f64 {
-    rate_score.clamp(0.0, 1.0)
+fn format_score(score: f64) -> String {
+    format!("{:.2}", score)
 }
 
 fn value_anomaly_color(norm: f64) -> Color {
@@ -1066,8 +1071,4 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
-}
-
-fn displayed_anomaly_scores(_app: &App, e: &EventRecord) -> (f64, f64) {
-    (e.live_uniq_score, e.live_rate_score)
 }
