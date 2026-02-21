@@ -2,7 +2,7 @@ use crate::domain::{AnalyzerModel, DataFilters, EventRecord, FilterField};
 use crate::io::StreamReader;
 use crate::tui::{draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::CrosstermBackend;
@@ -217,7 +217,7 @@ impl App {
                         if key.kind != KeyEventKind::Press {
                             continue;
                         }
-                        if self.handle_key(key.code) {
+                        if self.handle_key(key) {
                             break;
                         }
                     }
@@ -248,7 +248,15 @@ impl App {
         ))
     }
 
-    fn handle_key(&mut self, code: KeyCode) -> bool {
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            return true;
+        }
+
+        let code = key.code;
+
         if self.input_mode != InputMode::None {
             return self.handle_input(code);
         }

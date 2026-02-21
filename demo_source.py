@@ -271,6 +271,9 @@ class KeyboardController:
             ch = await asyncio.to_thread(sys.stdin.read, 1)
             if not ch:
                 continue
+            if ch == "\x03":  # Ctrl+C in cbreak mode
+                self.stop_event.set()
+                break
             key = ch.lower()
             if key == "q":
                 self.stop_event.set()
