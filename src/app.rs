@@ -1,0 +1,955 @@
+use crate::domain::{AnalyzerModel, DataFilters, EventRecord, FilterField};
+use crate::io::StreamReader;
+use crate::tui::{draw_ui, InputMode, UiMode};
+use anyhow::{anyhow, bail, Result};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::prelude::CrosstermBackend;
+use ratatui::Terminal;
+use serde_json::Value;
+use std::io::stdout;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+const LIVE_WINDOW_DEFAULT: usize = 120;
+const LIVE_RECOMPUTE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+pub struct ObjectInspector {
+    pub event: EventRecord,
+    pub key_paths: Vec<String>,
+    pub key_index: usize,
+}
+
+pub struct LiveRenderData<'a> {
+    pub rows: Vec<&'a EventRecord>,
+    pub selected_visible: Option<usize>,
+    pub selected: Option<&'a EventRecord>,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnomalyViewMode {
+    Snapshot,
+    Both,
+    Recomputed,
+}
+
+impl AnomalyViewMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Snapshot => Self::Both,
+            Self::Both => Self::Recomputed,
+            Self::Recomputed => Self::Snapshot,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Snapshot => "snapshot",
+            Self::Both => "snapshot+live",
+            Self::Recomputed => "live",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LiveAnchor {
+    ts: f64,
+    type_id: String,
+}
+
+pub struct App {
+    pub model: AnalyzerModel,
+    pub mode: UiMode,
+    pub input_mode: InputMode,
+    pub input_buffer: String,
+    pub event_filters: DataFilters,
+    pub types_filter: String,
+    pub type_index: usize,
+    pub path_index: usize,
+    pub corr_index: usize,
+    pub data_index: usize,
+    pub periods_index: usize,
+    pub period_event_index: usize,
+    pub live_event_index: usize, // absolute index in full live rows
+    pub live_view_start: usize,
+    pub live_window_rows: usize,
+    pub live_follow: bool,
+    pub live_edge_until_center: bool,
+    pub show_help_overlay: bool,
+    pub anomaly_view: AnomalyViewMode,
+    pub offline: bool,
+    pub status: String,
+    pub inspector: Option<ObjectInspector>,
+    stashed_event_filters: Option<DataFilters>,
+    reader: StreamReader,
+    offline_loaded: bool,
+    offline_fallback_ts: f64,
+}
+
+impl App {
+    pub fn new() -> Self {
+        let mut stream_path = PathBuf::from("/tmp/json_demo/stream.jsonl");
+        let mut offline = false;
+        for arg in std::env::args().skip(1) {
+            if arg == "--offline" {
+                offline = true;
+            } else if !arg.starts_with('-') {
+                stream_path = PathBuf::from(arg);
+            }
+        }
+
+        Self {
+            model: AnalyzerModel::new(),
+            mode: UiMode::Live,
+            input_mode: InputMode::None,
+            input_buffer: String::new(),
+            event_filters: DataFilters::default(),
+            types_filter: String::new(),
+            type_index: 0,
+            path_index: 0,
+            corr_index: 0,
+            data_index: 0,
+            periods_index: 0,
+            period_event_index: 0,
+            live_event_index: 0,
+            live_view_start: 0,
+            live_window_rows: LIVE_WINDOW_DEFAULT,
+            live_follow: true,
+            live_edge_until_center: false,
+            show_help_overlay: false,
+            anomaly_view: AnomalyViewMode::Both,
+            offline,
+            status: if offline {
+                format!("Offline mode: analyzing {} (no live tail)", stream_path.display())
+            } else {
+                format!("Watching {}", stream_path.display())
+            },
+            inspector: None,
+            stashed_event_filters: None,
+            reader: StreamReader::new(stream_path),
+            offline_loaded: false,
+            offline_fallback_ts: unix_ts(),
+        }
+    }
+
+    pub fn run(&mut self) -> Result<()> {
+        enable_raw_mode()?;
+        let mut out = stdout();
+        execute!(out, EnterAlternateScreen)?;
+
+        let backend = CrosstermBackend::new(out);
+        let mut terminal = Terminal::new(backend)?;
+
+        let mut last_poll = Instant::now();
+        let mut last_live_recompute = Instant::now();
+        let tick = Duration::from_millis(110);
+
+        let loop_result = (|| -> Result<()> {
+            loop {
+                terminal.draw(|f| draw_ui(f, self))?;
+
+                let mut ingested_any = false;
+                if (!self.offline || !self.offline_loaded) && last_poll.elapsed() >= Duration::from_millis(120)
+                {
+                    match self.reader.poll() {
+                        Ok(events) => {
+                            let selected_anchor = if self.mode == UiMode::Live && !self.live_follow {
+                                self.live_anchor_at(self.live_event_index)
+                            } else {
+                                None
+                            };
+                            let view_anchor = if self.mode == UiMode::Live && !self.live_follow {
+                                self.live_anchor_at(self.live_view_start)
+                            } else {
+                                None
+                            };
+                            let n = events.len();
+                            let batch_now = unix_ts();
+                            for (idx, e) in events.into_iter().enumerate() {
+                                let ts = self.resolve_event_ts(&e, batch_now, idx)?;
+                                self.model.ingest(e, ts);
+                            }
+                            if n > 0 {
+                                ingested_any = true;
+                                self.status = format!("Ingested {} events", n);
+                                if self.mode == UiMode::Live && self.live_follow {
+                                    self.live_edge_until_center = false;
+                                    self.pin_live_to_latest();
+                                } else if self.mode == UiMode::Live {
+                                    if let Some(anchor) = selected_anchor.as_ref() {
+                                        if let Some(idx) = self.find_live_index(anchor) {
+                                            self.live_event_index = idx;
+                                        }
+                                    }
+                                    if let Some(anchor) = view_anchor.as_ref() {
+                                        if let Some(idx) = self.find_live_index(anchor) {
+                                            self.live_view_start = idx;
+                                        }
+                                    }
+                                    self.clamp_live_indices();
+                                    self.ensure_live_selection_visible();
+                                }
+                            } else if self.offline && !self.offline_loaded {
+                                self.status = "Offline mode: no events found".to_string();
+                            }
+                            if self.offline {
+                                self.offline_loaded = true;
+                            }
+                        }
+                        Err(err) => {
+                            self.status = format!("Stream read error: {err}");
+                        }
+                    }
+                    last_poll = Instant::now();
+                }
+
+                let force_refresh = last_live_recompute.elapsed() >= LIVE_RECOMPUTE_MIN_INTERVAL;
+                if ingested_any || force_refresh {
+                    self.model.refresh_live_anomaly_scores();
+                    last_live_recompute = Instant::now();
+                }
+
+                if event::poll(tick)? {
+                    if let Event::Key(key) = event::read()? {
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        if self.handle_key(key.code) {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        disable_raw_mode()?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        terminal.show_cursor()?;
+        loop_result
+    }
+
+    fn resolve_event_ts(&mut self, obj: &Value, batch_now: f64, idx: usize) -> Result<f64> {
+        match parse_event_timestamp_millis(obj)? {
+            Some(ts) => return Ok(ts),
+            None => {}
+        }
+        if self.offline {
+            let seed = batch_now + (idx as f64 * 0.001);
+            let next = (self.offline_fallback_ts + 0.001).max(seed);
+            self.offline_fallback_ts = next;
+            return Ok(next);
+        }
+        Err(anyhow!(
+            "Unsupported input: live mode requires root `_timestamp` as epoch milliseconds (e.g. 1739952000123). Missing `_timestamp` is unsupported. Use `--offline` for offline analysis without live timestamps."
+        ))
+    }
+
+    fn handle_key(&mut self, code: KeyCode) -> bool {
+        if self.input_mode != InputMode::None {
+            return self.handle_input(code);
+        }
+
+        if self.inspector.is_some() {
+            return self.handle_inspector(code);
+        }
+
+        match code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('h') | KeyCode::Char('?') => {
+                self.show_help_overlay = !self.show_help_overlay;
+            }
+            KeyCode::Char('1') => self.mode = UiMode::Live,
+            KeyCode::Char('2') => self.mode = UiMode::Periods,
+            KeyCode::Char('3') => self.mode = UiMode::Types,
+            KeyCode::Char('4') => self.mode = UiMode::Data,
+            KeyCode::Char('m') => {
+                if self.model.toggle_period() {
+                    self.status = if let Some(p) = self.model.active_period() {
+                        format!("Action started: {} #{}", p.label, p.id)
+                    } else {
+                        "Action ended".to_string()
+                    };
+                } else {
+                    self.status =
+                        "Cannot toggle action period before first event timestamp is ingested".to_string();
+                }
+            }
+            KeyCode::Char('a') => {
+                self.anomaly_view = self.anomaly_view.next();
+                self.status = format!("Anomaly view: {}", self.anomaly_view.label());
+            }
+            KeyCode::Char('f') if self.mode == UiMode::Live => {
+                self.live_follow = !self.live_follow;
+                if self.live_follow {
+                    self.live_edge_until_center = false;
+                    self.pin_live_to_latest();
+                } else {
+                    // Keep selected row away from the top when leaving follow mode.
+                    self.live_view_start = self.live_event_index.saturating_sub(10);
+                    self.clamp_live_indices();
+                    self.live_edge_until_center = true;
+                    self.ensure_live_selection_visible();
+                }
+                self.status = if self.live_follow {
+                    "Live follow: ON".to_string()
+                } else {
+                    "Live follow: OFF".to_string()
+                };
+            }
+            KeyCode::Char('n') => {
+                self.input_mode = InputMode::Label;
+                self.input_buffer = self.model.current_label.clone();
+            }
+            KeyCode::Char('k') if self.mode != UiMode::Types => self.start_event_filter_input(FilterField::Key),
+            KeyCode::Char('t') if self.mode != UiMode::Types => self.start_event_filter_input(FilterField::Type),
+            KeyCode::Char('t') if self.mode == UiMode::Types => self.apply_selected_type_filter(),
+            KeyCode::Char('/') if self.mode != UiMode::Types => self.start_event_filter_input(FilterField::Fuzzy),
+            KeyCode::Char('e') if self.mode != UiMode::Types => self.start_event_filter_input(FilterField::Exact),
+            KeyCode::Char('y') if self.mode != UiMode::Types => self.toggle_event_filters_enabled(),
+            KeyCode::Char('/') if self.mode == UiMode::Types => {
+                self.input_mode = InputMode::TypesFilter;
+                self.input_buffer = self.types_filter.clone();
+            }
+            KeyCode::Char('r') if self.mode == UiMode::Types => {
+                let visible = self.visible_types();
+                if let Some(type_id) = visible.get(self.type_index) {
+                    let tp = self.model.types.get(type_id);
+                    self.input_mode = InputMode::RenameType;
+                    self.input_buffer = tp.and_then(|t| t.name.clone()).unwrap_or_default();
+                }
+            }
+            KeyCode::Char('c') if self.mode != UiMode::Types => {
+                self.stashed_event_filters = None;
+                self.event_filters = DataFilters::default();
+                self.refresh_live_position();
+                self.status = "Event filters cleared".to_string();
+            }
+            KeyCode::Up => self.move_up(),
+            KeyCode::Down => self.move_down(),
+            KeyCode::PageUp => self.page_up(),
+            KeyCode::PageDown => self.page_down(),
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
+            KeyCode::Enter => self.open_selected_event(),
+            KeyCode::Char(' ') => self.toggle_current_path(),
+            KeyCode::Char('u') => self.toggle_known_unrelated(),
+            KeyCode::Char('x') => self.toggle_known_unrelated_pair(),
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_inspector(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Esc => self.inspector = None,
+            KeyCode::Up => {
+                if let Some(ins) = self.inspector.as_mut() {
+                    if ins.key_index > 0 {
+                        ins.key_index -= 1;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if let Some(ins) = self.inspector.as_mut() {
+                    if ins.key_index + 1 < ins.key_paths.len() {
+                        ins.key_index += 1;
+                    }
+                }
+            }
+            KeyCode::Char('k') => {
+                if let Some(ins) = self.inspector.as_ref() {
+                    if let Some(path) = ins.key_paths.get(ins.key_index) {
+                        self.event_filters.key_filter = path.clone();
+                        self.mode = UiMode::Data;
+                        self.data_index = 0;
+                        self.status = format!("Applied key filter: {}", path);
+                    }
+                }
+            }
+            KeyCode::Char('t') => {
+                if let Some(ins) = self.inspector.as_ref() {
+                    if let Some(idx) = self.model.find_type_index(&ins.event.type_id) {
+                        self.mode = UiMode::Types;
+                        self.type_index = idx;
+                        self.path_index = 0;
+                        self.status = format!("Jumped to type {}", self.model.type_display_name(&ins.event.type_id));
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_input(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::None;
+                self.input_buffer.clear();
+            }
+            KeyCode::Enter => {
+                match self.input_mode {
+                    InputMode::Label => {
+                        if !self.input_buffer.trim().is_empty() {
+                            self.model.current_label = self.input_buffer.trim().to_string();
+                            self.status = format!("Current label: {}", self.model.current_label);
+                        }
+                    }
+                    InputMode::EventFilter(field) => {
+                        let text = self.input_buffer.trim().to_string();
+                        self.stashed_event_filters = None;
+                        match field {
+                            FilterField::Key => self.event_filters.key_filter = text,
+                            FilterField::Type => self.event_filters.type_filter = text,
+                            FilterField::Fuzzy => self.event_filters.fuzzy_filter = text,
+                            FilterField::Exact => self.event_filters.exact_filter = text,
+                        }
+                        self.data_index = 0;
+                        self.live_event_index = 0;
+                        self.period_event_index = 0;
+                        self.refresh_live_position();
+                    }
+                    InputMode::TypesFilter => {
+                        self.types_filter = self.input_buffer.trim().to_string();
+                        self.type_index = 0;
+                    }
+                    InputMode::RenameType => {
+                        let visible = self.visible_types();
+                        if let Some(type_id) = visible.get(self.type_index) {
+                            let type_id = type_id.clone();
+                            self.model.rename_type(&type_id, self.input_buffer.clone());
+                        }
+                    }
+                    InputMode::None => {}
+                }
+                self.input_mode = InputMode::None;
+                self.input_buffer.clear();
+            }
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+            }
+            KeyCode::Char(c) => self.input_buffer.push(c),
+            _ => {}
+        }
+        false
+    }
+
+    fn start_event_filter_input(&mut self, field: FilterField) {
+        self.input_mode = InputMode::EventFilter(field);
+        self.input_buffer = match field {
+            FilterField::Key => self.event_filters.key_filter.clone(),
+            FilterField::Type => self.event_filters.type_filter.clone(),
+            FilterField::Fuzzy => self.event_filters.fuzzy_filter.clone(),
+            FilterField::Exact => self.event_filters.exact_filter.clone(),
+        };
+    }
+
+    pub fn filters_suspended(&self) -> bool {
+        self.stashed_event_filters.is_some()
+    }
+
+    fn has_active_event_filters(&self) -> bool {
+        !self.event_filters.key_filter.is_empty()
+            || !self.event_filters.type_filter.is_empty()
+            || !self.event_filters.fuzzy_filter.is_empty()
+            || !self.event_filters.exact_filter.is_empty()
+    }
+
+    fn toggle_event_filters_enabled(&mut self) {
+        if let Some(saved) = self.stashed_event_filters.take() {
+            self.event_filters = saved;
+            self.refresh_live_position();
+            self.status = "Event filters restored".to_string();
+            return;
+        }
+
+        if !self.has_active_event_filters() {
+            self.status = "No active event filters to suspend".to_string();
+            return;
+        }
+
+        self.stashed_event_filters = Some(self.event_filters.clone());
+        self.event_filters = DataFilters::default();
+        self.refresh_live_position();
+        self.status = "Event filters suspended (press y to restore)".to_string();
+    }
+
+    fn move_up(&mut self) {
+        match self.mode {
+            UiMode::Live => {
+                let was_follow = self.live_follow;
+                let n = self.visible_live_events().len();
+                if n == 0 {
+                    return;
+                }
+                if self.live_event_index > 0 {
+                    self.live_event_index -= 1;
+                }
+                if self.live_event_index < self.live_view_start {
+                    self.live_view_start = self.live_event_index;
+                }
+                self.live_follow = false;
+                if was_follow {
+                    self.live_view_start = self.live_event_index.saturating_sub(10);
+                    self.live_edge_until_center = true;
+                }
+                self.reposition_live_selection();
+            }
+            UiMode::Periods => {
+                if self.periods_index > 0 {
+                    self.periods_index -= 1;
+                    self.period_event_index = 0;
+                } else if self.period_event_index > 0 {
+                    self.period_event_index -= 1;
+                }
+            }
+            UiMode::Types => {
+                if self.type_index > 0 {
+                    self.type_index -= 1;
+                    self.path_index = 0;
+                }
+            }
+            UiMode::Data => {
+                if self.data_index > 0 {
+                    self.data_index -= 1;
+                }
+            }
+        }
+    }
+
+    fn move_down(&mut self) {
+        match self.mode {
+            UiMode::Live => {
+                let was_follow = self.live_follow;
+                let total = self.visible_live_events().len();
+                if total == 0 {
+                    return;
+                }
+                if self.live_event_index + 1 < total {
+                    self.live_event_index += 1;
+                }
+                if self.live_event_index >= self.live_view_start + self.live_window_rows.max(1) {
+                    let window = self.live_window_rows.max(1);
+                    self.live_view_start = self.live_event_index + 1 - window;
+                }
+                self.live_follow = false;
+                if was_follow {
+                    self.live_view_start = self.live_event_index.saturating_sub(10);
+                    self.live_edge_until_center = true;
+                }
+                self.reposition_live_selection();
+            }
+            UiMode::Periods => {
+                let periods = self.model.closed_periods();
+                if self.periods_index + 1 < periods.len() {
+                    self.periods_index += 1;
+                    self.period_event_index = 0;
+                }
+            }
+            UiMode::Types => {
+                let n = self.visible_types().len();
+                if self.type_index + 1 < n {
+                    self.type_index += 1;
+                    self.path_index = 0;
+                }
+            }
+            UiMode::Data => {
+                self.data_index += 1;
+            }
+        }
+    }
+
+    fn move_left(&mut self) {
+        match self.mode {
+            UiMode::Types => {
+                if self.path_index > 0 {
+                    self.path_index -= 1;
+                }
+            }
+            UiMode::Periods => {
+                if self.period_event_index > 0 {
+                    self.period_event_index -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_right(&mut self) {
+        match self.mode {
+            UiMode::Types => {
+                let visible = self.visible_types();
+                if let Some(type_id) = visible.get(self.type_index) {
+                    if let Some(tp) = self.model.types.get(type_id) {
+                        if self.path_index + 1 < tp.considered_paths.len() {
+                            self.path_index += 1;
+                        }
+                    }
+                }
+            }
+            UiMode::Periods => {
+                let n = self.visible_period_events().len();
+                if self.period_event_index + 1 < n {
+                    self.period_event_index += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn page_up(&mut self) {
+        match self.mode {
+            UiMode::Live => {
+                let total = self.visible_live_events().len();
+                if total == 0 {
+                    return;
+                }
+                self.live_follow = false;
+                let window = self.live_window_rows.max(1);
+                let step = window.saturating_sub(20).max(1);
+                self.live_event_index = self.live_event_index.saturating_sub(step);
+                self.live_view_start = self.live_view_start.saturating_sub(step);
+                self.clamp_live_indices();
+                self.reposition_live_selection();
+            }
+            UiMode::Data => {
+                self.data_index = self.data_index.saturating_sub(30);
+            }
+            _ => {}
+        }
+    }
+
+    fn page_down(&mut self) {
+        match self.mode {
+            UiMode::Live => {
+                let total = self.visible_live_events().len();
+                if total == 0 {
+                    return;
+                }
+                self.live_follow = false;
+                let window = self.live_window_rows.max(1);
+                let step = window.saturating_sub(20).max(1);
+                self.live_event_index = (self.live_event_index + step).min(total.saturating_sub(1));
+                self.live_view_start = self.live_view_start.saturating_add(step);
+                self.clamp_live_indices();
+                self.reposition_live_selection();
+            }
+            UiMode::Data => {
+                self.data_index = self.data_index.saturating_add(30);
+            }
+            _ => {}
+        }
+    }
+
+    fn open_selected_event(&mut self) {
+        let selected = match self.mode {
+            UiMode::Live => self.visible_live_events().get(self.live_event_index).cloned().cloned(),
+            UiMode::Periods => self
+                .visible_period_events()
+                .get(self.period_event_index)
+                .cloned()
+                .cloned(),
+            UiMode::Data => self
+                .model
+                .filtered_events(&self.event_filters)
+                .get(self.data_index)
+                .cloned()
+                .cloned(),
+            UiMode::Types => None,
+        };
+
+        if let Some(event) = selected {
+            let mut key_paths = event.keys.clone();
+            key_paths.sort();
+            key_paths.dedup();
+            self.inspector = Some(ObjectInspector {
+                event,
+                key_paths,
+                key_index: 0,
+            });
+        }
+    }
+
+    fn visible_live_events(&self) -> Vec<&EventRecord> {
+        let mut events = self.model.filtered_events(&self.event_filters);
+        events.reverse();
+        events
+    }
+
+    fn live_anchor_at(&self, index: usize) -> Option<LiveAnchor> {
+        self.visible_live_events().get(index).map(|e| LiveAnchor {
+            ts: e.ts,
+            type_id: e.type_id.clone(),
+        })
+    }
+
+    fn find_live_index(&self, anchor: &LiveAnchor) -> Option<usize> {
+        self.visible_live_events()
+            .iter()
+            .position(|e| e.ts == anchor.ts && e.type_id == anchor.type_id)
+    }
+
+    pub fn set_live_window_rows(&mut self, rows: usize) {
+        self.live_window_rows = rows.max(1);
+    }
+
+    pub fn live_render_data_for_window(&self, max_rows: usize) -> LiveRenderData<'_> {
+        let all = self.visible_live_events();
+        let total = all.len();
+        if total == 0 {
+            return LiveRenderData {
+                rows: Vec::new(),
+                selected_visible: None,
+                selected: None,
+                total: 0,
+            };
+        }
+        let window = max_rows.max(1);
+        let mut start = if self.live_follow {
+            total.saturating_sub(window)
+        } else {
+            self.live_view_start.min(total.saturating_sub(1))
+        };
+        if self.live_event_index < start {
+            start = self.live_event_index;
+        } else if self.live_event_index >= start + window {
+            start = self.live_event_index + 1 - window;
+        }
+        if start + window > total {
+            start = total.saturating_sub(window);
+        }
+        let end = (start + window).min(total);
+        let rows: Vec<&EventRecord> = all[start..end].to_vec();
+        let selected = all.get(self.live_event_index).copied();
+        let selected_visible = if self.live_event_index >= start && self.live_event_index < end {
+            Some(self.live_event_index - start)
+        } else {
+            None
+        };
+        LiveRenderData {
+            rows,
+            selected_visible,
+            selected,
+            total,
+        }
+    }
+
+    fn clamp_live_indices(&mut self) {
+        let total = self.visible_live_events().len();
+        if total == 0 {
+            self.live_event_index = 0;
+            self.live_view_start = 0;
+            return;
+        }
+        self.live_event_index = self.live_event_index.min(total - 1);
+        self.live_view_start = self.live_view_start.min(total - 1);
+        let window = self.live_window_rows.max(1);
+        if self.live_view_start + window > total {
+            self.live_view_start = total.saturating_sub(window);
+        }
+    }
+
+    fn pin_live_to_latest(&mut self) {
+        let total = self.visible_live_events().len();
+        if total == 0 {
+            self.live_event_index = 0;
+            self.live_view_start = 0;
+            return;
+        }
+        let window = self.live_window_rows.max(1);
+        self.live_event_index = total - 1;
+        self.live_view_start = total.saturating_sub(window);
+    }
+
+    fn refresh_live_position(&mut self) {
+        if self.live_follow {
+            self.live_edge_until_center = false;
+            self.pin_live_to_latest();
+        } else {
+            self.clamp_live_indices();
+            self.reposition_live_selection();
+        }
+    }
+
+    fn ensure_live_selection_visible(&mut self) {
+        let total = self.visible_live_events().len();
+        if total == 0 {
+            self.live_event_index = 0;
+            self.live_view_start = 0;
+            return;
+        }
+        if self.live_event_index < self.live_view_start {
+            self.live_view_start = self.live_event_index;
+        } else if self.live_event_index >= self.live_view_start + self.live_window_rows.max(1) {
+            let window = self.live_window_rows.max(1);
+            self.live_view_start = self.live_event_index + 1 - window;
+        }
+        let window = self.live_window_rows.max(1);
+        if self.live_view_start + window > total {
+            self.live_view_start = total.saturating_sub(window);
+        }
+    }
+
+    fn center_live_selection_in_view(&mut self) {
+        let total = self.visible_live_events().len();
+        if total == 0 {
+            self.live_event_index = 0;
+            self.live_view_start = 0;
+            return;
+        }
+        let window = self.live_window_rows.max(1);
+        let half = window / 2;
+        let max_start = total.saturating_sub(window);
+        let desired_start = self.live_event_index.saturating_sub(half);
+        self.live_view_start = desired_start.min(max_start);
+    }
+
+    fn reposition_live_selection(&mut self) {
+        if self.live_edge_until_center {
+            self.ensure_live_selection_visible();
+
+            let total = self.visible_live_events().len();
+            if total == 0 {
+                self.live_event_index = 0;
+                self.live_view_start = 0;
+                return;
+            }
+
+            let window = self.live_window_rows.max(1);
+            let half = window / 2;
+            let max_start = total.saturating_sub(window);
+            let target_start = self.live_event_index.saturating_sub(half).min(max_start);
+
+            // During the transition out of follow mode, do not auto-scroll toward center.
+            // Let user movement naturally move the selected row to center, then lock it there.
+            if self.live_view_start == target_start && target_start > 0 && target_start < max_start {
+                self.live_edge_until_center = false;
+            }
+        } else {
+            self.center_live_selection_in_view();
+        }
+    }
+
+    fn visible_period_events(&self) -> Vec<&EventRecord> {
+        let periods = self.model.closed_periods();
+        if let Some(p) = periods.get(self.periods_index) {
+            let start = p.start;
+            let end = p.end.unwrap_or(p.start);
+            self.model
+                .filtered_events_in_range(&self.event_filters, Some((start, end)))
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn visible_types(&self) -> Vec<String> {
+        let query = self.types_filter.to_lowercase();
+        self.model
+            .types
+            .iter()
+            .filter(|(type_id, tp)| {
+                if query.is_empty() {
+                    return true;
+                }
+                let name = tp.name.clone().unwrap_or_default().to_lowercase();
+                let default = format!("type-{}", &type_id[..8]).to_lowercase();
+                type_id.to_lowercase().contains(&query) || name.contains(&query) || default.contains(&query)
+            })
+            .map(|(type_id, _)| type_id.clone())
+            .collect()
+    }
+
+    fn toggle_current_path(&mut self) {
+        if self.mode != UiMode::Types {
+            return;
+        }
+        let visible = self.visible_types();
+        if let Some(type_id) = visible.get(self.type_index) {
+            let type_id = type_id.clone();
+            if let Some(tp) = self.model.types.get(&type_id) {
+                let keys: Vec<String> = tp.considered_paths.keys().cloned().collect();
+                if let Some(path) = keys.get(self.path_index) {
+                    self.model.toggle_type_path(&type_id, path);
+                }
+            }
+        }
+    }
+
+    fn apply_selected_type_filter(&mut self) {
+        if self.mode != UiMode::Types {
+            return;
+        }
+        let visible = self.visible_types();
+        if let Some(type_id) = visible.get(self.type_index) {
+            self.stashed_event_filters = None;
+            self.event_filters.type_filter = self.model.canonical_type_name(type_id);
+            self.mode = UiMode::Data;
+            self.data_index = 0;
+            self.period_event_index = 0;
+            self.live_event_index = 0;
+            self.refresh_live_position();
+            self.status = format!("Applied type filter: {}", self.model.type_display_name(type_id));
+        }
+    }
+
+    fn toggle_known_unrelated(&mut self) {
+        if self.mode != UiMode::Types {
+            return;
+        }
+        let visible = self.visible_types();
+        if let Some(type_id) = visible.get(self.type_index) {
+            let type_id = type_id.clone();
+            self.model.toggle_known_unrelated_type(&type_id);
+        }
+    }
+
+    fn toggle_known_unrelated_pair(&mut self) {
+        if self.mode != UiMode::Live {
+            return;
+        }
+        if let Some(c) = self.model.correlations.get(self.corr_index) {
+            let label = c.label.clone();
+            let type_id = c.type_id.clone();
+            self.model.toggle_known_unrelated_pair(&label, &type_id);
+        }
+    }
+}
+
+fn parse_event_timestamp_millis(obj: &Value) -> Result<Option<f64>> {
+    let Some(raw) = obj.get("_timestamp") else {
+        return Ok(None);
+    };
+    let ms = if let Some(v) = raw.as_i64() {
+        v
+    } else if let Some(v) = raw.as_u64() {
+        if v > i64::MAX as u64 {
+            bail!("Unsupported input: `_timestamp` is out of range for epoch milliseconds.");
+        }
+        v as i64
+    } else if let Some(v) = raw.as_f64() {
+        if !v.is_finite() || v.fract() != 0.0 {
+            bail!("Unsupported input: `_timestamp` must be an integer epoch-milliseconds value, got non-integer number.");
+        }
+        v as i64
+    } else {
+        bail!("Unsupported input: `_timestamp` must be a number in epoch milliseconds.");
+    };
+
+    if ms < 1_000_000_000_000 || ms > 9_999_999_999_999 {
+        bail!(
+            "Unsupported input: `_timestamp` must be epoch milliseconds (13-digit) like 1739952000123."
+        );
+    }
+    Ok(Some(ms as f64 / 1000.0))
+}
+
+fn unix_ts() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}

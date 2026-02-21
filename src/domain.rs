@@ -1,0 +1,811 @@
+use indexmap::IndexMap;
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
+
+const MAX_EVENTS: usize = 80_000;
+const ACTION_BOUNDARY_EPS: f64 = 0.000_001;
+const MIN_ACTION_RATE_DURATION_SECS: f64 = 1.0;
+
+#[derive(Debug, Clone)]
+pub struct EventRecord {
+    pub ts: f64,
+    pub type_id: String,
+    pub obj: Value,
+    pub keys: Vec<String>,
+    pub action_period_id: Option<u64>,
+    pub in_action_period: bool,
+    pub rate_score: f64,
+    pub uniq_score: f64,
+    pub live_rate_score: f64,
+    pub live_uniq_score: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActionPeriod {
+    pub id: u64,
+    pub label: String,
+    pub start: f64,
+    pub end: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PathStats {
+    pub total: u64,
+    pub values: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathOverride {
+    ForcedOn,
+    ForcedOff,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeProfile {
+    pub type_id: String,
+    pub name: Option<String>,
+    pub count: u64,
+    pub example: Value,
+    pub considered_paths: IndexMap<String, bool>,
+    pub path_overrides: IndexMap<String, PathOverride>,
+    pub path_stats: IndexMap<String, PathStats>,
+    pub known_unrelated: bool,
+    pub latest_rate: f64,
+    pub latest_uniq: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TypeCorrelation {
+    pub label: String,
+    pub type_id: String,
+    pub score: f64,
+    pub presence: f64,
+    pub lift: f64,
+    pub trials: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PeriodRateState {
+    elapsed_secs: f64,
+    counts: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DataFilters {
+    pub key_filter: String,
+    pub type_filter: String,
+    pub fuzzy_filter: String,
+    pub exact_filter: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterField {
+    Key,
+    Type,
+    Fuzzy,
+    Exact,
+}
+
+impl FilterField {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Key => "keys",
+            Self::Type => "type",
+            Self::Fuzzy => "fuzzy",
+            Self::Exact => "exact key=value",
+        }
+    }
+}
+
+pub struct AnalyzerModel {
+    pub types: IndexMap<String, TypeProfile>,
+    pub events: VecDeque<EventRecord>,
+    pub periods: Vec<ActionPeriod>,
+    pub current_label: String,
+    pub known_unrelated_pairs: HashSet<(String, String)>,
+    pub smoothed_correlations: HashMap<(String, String), f64>,
+    pub correlations: Vec<TypeCorrelation>,
+
+    baseline_elapsed_secs: f64,
+    baseline_counts: HashMap<String, u64>,
+    period_rate_states: HashMap<u64, PeriodRateState>,
+    last_rate_ts: Option<f64>,
+    last_event_ts: Option<f64>,
+    next_period_id: u64,
+    last_corr_refresh: Instant,
+}
+
+impl AnalyzerModel {
+    pub fn new() -> Self {
+        Self {
+            types: IndexMap::new(),
+            events: VecDeque::new(),
+            periods: Vec::new(),
+            current_label: "action".to_string(),
+            known_unrelated_pairs: HashSet::new(),
+            smoothed_correlations: HashMap::new(),
+            correlations: Vec::new(),
+            baseline_elapsed_secs: 0.0,
+            baseline_counts: HashMap::new(),
+            period_rate_states: HashMap::new(),
+            last_rate_ts: None,
+            last_event_ts: None,
+            next_period_id: 1,
+            last_corr_refresh: Instant::now(),
+        }
+    }
+
+    pub fn total_objects(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn active_period(&self) -> Option<&ActionPeriod> {
+        self.periods.last().filter(|p| p.end.is_none())
+    }
+
+    pub fn toggle_period(&mut self) -> bool {
+        let Some(boundary_ts) = self.last_event_ts else {
+            return false;
+        };
+        self.account_rate_elapsed(boundary_ts);
+        if let Some(last) = self.periods.last_mut() {
+            if last.end.is_none() {
+                last.end = Some(boundary_ts);
+                return true;
+            }
+        }
+        let period_id = self.next_period_id;
+        self.periods.push(ActionPeriod {
+            id: period_id,
+            label: self.current_label.clone(),
+            start: boundary_ts + ACTION_BOUNDARY_EPS,
+            end: None,
+        });
+        self.period_rate_states.entry(period_id).or_default();
+        self.next_period_id += 1;
+        true
+    }
+
+    pub fn ingest(&mut self, obj: Value, ts: f64) {
+        self.account_rate_elapsed(ts);
+        self.last_event_ts = Some(ts);
+        let shape = extract_shape(&obj);
+        let type_id = structural_hash(&shape);
+        let keys = collect_all_paths(&obj);
+        let active_period_id = self.active_period().map(|p| p.id);
+        let in_action_period = active_period_id.is_some();
+
+        let uniq = {
+            let entry = self.types.entry(type_id.clone()).or_insert_with(|| TypeProfile {
+                type_id: type_id.clone(),
+                name: None,
+                count: 0,
+                example: obj.clone(),
+                considered_paths: IndexMap::new(),
+                path_overrides: IndexMap::new(),
+                path_stats: IndexMap::new(),
+                known_unrelated: false,
+                latest_rate: 0.0,
+                latest_uniq: 0.0,
+            });
+
+            entry.count += 1;
+            if entry.count == 1 {
+                entry.example = obj.clone();
+            }
+            update_uniqueness(entry, &obj)
+        };
+        let rate = self.update_rate_scores(&type_id, active_period_id);
+        if let Some(entry) = self.types.get_mut(&type_id) {
+            entry.latest_rate = rate;
+            entry.latest_uniq = uniq;
+        }
+
+        self.events.push_back(EventRecord {
+            ts,
+            type_id,
+            obj,
+            keys,
+            action_period_id: active_period_id,
+            in_action_period,
+            rate_score: rate,
+            uniq_score: uniq,
+            live_rate_score: rate,
+            live_uniq_score: uniq,
+        });
+        while self.events.len() > MAX_EVENTS {
+            self.events.pop_front();
+        }
+
+        self.refresh_correlation_scores();
+    }
+
+    pub fn refresh_live_anomaly_scores(&mut self) {
+        let mut updates = Vec::new();
+        for (idx, e) in self.events.iter().enumerate() {
+            let Some(period_id) = e.action_period_id else {
+                continue;
+            };
+            let rate = self.recomputed_rate_for(&e.type_id, period_id);
+            let uniq = self.recomputed_uniq_for(&e.type_id, &e.obj);
+            updates.push((idx, rate, uniq));
+        }
+        for (idx, rate, uniq) in updates {
+            if let Some(e) = self.events.get_mut(idx) {
+                e.live_rate_score = rate.max(e.rate_score);
+                e.live_uniq_score = uniq.max(e.uniq_score);
+            }
+        }
+    }
+
+    fn update_rate_scores(&mut self, type_id: &str, active_period_id: Option<u64>) -> f64 {
+        if let Some(pid) = active_period_id {
+            let pr = self.period_rate_states.entry(pid).or_default();
+            *pr.counts.entry(type_id.to_string()).or_insert(0) += 1;
+            if pr.elapsed_secs < MIN_ACTION_RATE_DURATION_SECS {
+                return 0.0;
+            }
+            let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
+            let action_rate = action_count / pr.elapsed_secs;
+            let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
+            let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
+            normalized_rate_anomaly(action_rate, baseline_rate)
+        } else {
+            *self.baseline_counts.entry(type_id.to_string()).or_insert(0) += 1;
+            0.0
+        }
+    }
+
+    fn account_rate_elapsed(&mut self, now_ts: f64) {
+        let Some(last_ts) = self.last_rate_ts else {
+            self.last_rate_ts = Some(now_ts);
+            return;
+        };
+        let elapsed = (now_ts - last_ts).max(0.0);
+        if elapsed == 0.0 {
+            return;
+        }
+        if let Some(pid) = self.active_period().map(|p| p.id) {
+            self.period_rate_states.entry(pid).or_default().elapsed_secs += elapsed;
+        } else {
+            self.baseline_elapsed_secs += elapsed;
+        }
+        self.last_rate_ts = Some(now_ts);
+    }
+
+    fn refresh_correlation_scores(&mut self) {
+        if self.last_corr_refresh.elapsed() < Duration::from_millis(900) {
+            return;
+        }
+        self.last_corr_refresh = Instant::now();
+
+        let closed: Vec<&ActionPeriod> = self.periods.iter().filter(|p| p.end.is_some()).collect();
+        if closed.is_empty() {
+            self.correlations.clear();
+            return;
+        }
+
+        let mut by_label: HashMap<String, Vec<&ActionPeriod>> = HashMap::new();
+        for p in closed {
+            by_label.entry(p.label.clone()).or_default().push(p);
+        }
+
+        let mut corr = Vec::new();
+        for (label, periods) in by_label {
+            let trials = periods.len();
+            if trials == 0 {
+                continue;
+            }
+            let avg_dur = periods
+                .iter()
+                .map(|p| p.end.unwrap_or(p.start) - p.start)
+                .sum::<f64>()
+                / trials as f64;
+
+            let mut present: HashMap<String, HashSet<u64>> = HashMap::new();
+            let mut counts_during: HashMap<String, u64> = HashMap::new();
+            let mut counts_outside: HashMap<String, u64> = HashMap::new();
+            let mut outside_time = 0.001;
+
+            let mut total_time = 0.0;
+            if let (Some(first), Some(last)) = (self.events.front(), self.events.back()) {
+                total_time = (last.ts - first.ts).max(0.001);
+            }
+            let during_time = periods
+                .iter()
+                .map(|p| p.end.unwrap_or(p.start) - p.start)
+                .sum::<f64>();
+            outside_time += (total_time - during_time).max(0.001);
+
+            for e in &self.events {
+                let mut in_any = None;
+                for p in &periods {
+                    let end = p.end.unwrap_or(p.start);
+                    if e.ts >= p.start && e.ts <= end {
+                        in_any = Some(p.id);
+                        break;
+                    }
+                }
+                if let Some(pid) = in_any {
+                    *counts_during.entry(e.type_id.clone()).or_insert(0) += 1;
+                    present.entry(e.type_id.clone()).or_default().insert(pid);
+                } else {
+                    *counts_outside.entry(e.type_id.clone()).or_insert(0) += 1;
+                }
+            }
+
+            for (type_id, dur_count) in counts_during {
+                if self
+                    .known_unrelated_pairs
+                    .contains(&(label.clone(), type_id.clone()))
+                {
+                    continue;
+                }
+                if self.types.get(&type_id).map(|t| t.known_unrelated).unwrap_or(false) {
+                    continue;
+                }
+                let presence_rate = present
+                    .get(&type_id)
+                    .map(|s| s.len() as f64 / trials as f64)
+                    .unwrap_or(0.0);
+                let during_rate = dur_count as f64 / (avg_dur * trials as f64).max(0.001);
+                let baseline_rate = counts_outside.get(&type_id).copied().unwrap_or(0) as f64 / outside_time;
+                let lift = during_rate / (baseline_rate + 0.001);
+                let raw = (presence_rate * (1.0 - (1.0 / lift.max(1.0)))).clamp(0.0, 1.0);
+
+                let key = (label.clone(), type_id.clone());
+                let prev = self.smoothed_correlations.get(&key).copied().unwrap_or(raw);
+                let smoothed = 0.75 * prev + 0.25 * raw;
+                self.smoothed_correlations.insert(key, smoothed);
+
+                corr.push(TypeCorrelation {
+                    label: label.clone(),
+                    type_id,
+                    score: smoothed,
+                    presence: presence_rate,
+                    lift,
+                    trials,
+                });
+            }
+        }
+
+        corr.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        self.correlations = corr;
+    }
+
+    fn recomputed_rate_for(&self, type_id: &str, period_id: u64) -> f64 {
+        let Some(pr) = self.period_rate_states.get(&period_id) else {
+            return 0.0;
+        };
+        if pr.elapsed_secs < MIN_ACTION_RATE_DURATION_SECS {
+            return 0.0;
+        }
+        let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
+        let action_rate = action_count / pr.elapsed_secs;
+        let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
+        let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
+        normalized_rate_anomaly(action_rate, baseline_rate)
+    }
+
+    fn recomputed_uniq_for(&self, type_id: &str, obj: &Value) -> f64 {
+        let Some(tp) = self.types.get(type_id) else {
+            return 0.0;
+        };
+        let mut scalar_paths = Vec::new();
+        collect_scalar_paths(obj, "", &mut scalar_paths);
+
+        let mut max_score = 0.0;
+        for (path, token) in scalar_paths {
+            let Some(stats) = tp.path_stats.get(path.as_str()) else {
+                continue;
+            };
+            let auto = auto_consider_path(path.as_str(), stats);
+            let considered = match tp.path_overrides.get(path.as_str()).copied() {
+                Some(PathOverride::ForcedOn) => true,
+                Some(PathOverride::ForcedOff) => false,
+                None => tp.considered_paths.get(path.as_str()).copied().unwrap_or(auto),
+            };
+            if !considered || stats.total <= 6 {
+                continue;
+            }
+            let total = stats.total as f64;
+            let prev = stats.values.get(token.as_str()).copied().unwrap_or(0);
+            let freq = prev as f64 / total;
+            let s = if prev == 0 { 1.0 } else { (1.0 - (freq / 0.10)).clamp(0.0, 1.0) };
+            if s > max_score {
+                max_score = s;
+            }
+        }
+        max_score
+    }
+
+    pub fn toggle_type_path(&mut self, type_id: &str, path: &str) {
+        if let Some(tp) = self.types.get_mut(type_id) {
+            let current = tp.considered_paths.get(path).copied().unwrap_or(false);
+            let next = match tp.path_overrides.get(path).copied() {
+                None => {
+                    if current {
+                        Some(PathOverride::ForcedOff)
+                    } else {
+                        Some(PathOverride::ForcedOn)
+                    }
+                }
+                Some(PathOverride::ForcedOff) => Some(PathOverride::ForcedOn),
+                Some(PathOverride::ForcedOn) => None,
+            };
+            match next {
+                Some(mode) => {
+                    tp.path_overrides.insert(path.to_string(), mode);
+                }
+                None => {
+                    tp.path_overrides.shift_remove(path);
+                }
+            }
+        }
+    }
+
+    pub fn toggle_known_unrelated_type(&mut self, type_id: &str) {
+        if let Some(tp) = self.types.get_mut(type_id) {
+            tp.known_unrelated = !tp.known_unrelated;
+        }
+    }
+
+    pub fn toggle_known_unrelated_pair(&mut self, label: &str, type_id: &str) {
+        let key = (label.to_string(), type_id.to_string());
+        if !self.known_unrelated_pairs.insert(key.clone()) {
+            self.known_unrelated_pairs.remove(&key);
+        }
+    }
+
+    pub fn rename_type(&mut self, type_id: &str, name: String) {
+        if let Some(tp) = self.types.get_mut(type_id) {
+            let cleaned = name.trim();
+            if cleaned.is_empty() {
+                tp.name = None;
+            } else {
+                tp.name = Some(cleaned.to_string());
+            }
+        }
+    }
+
+    pub fn type_display_name(&self, type_id: &str) -> String {
+        if let Some(tp) = self.types.get(type_id) {
+            let default = format!("type-{}", &tp.type_id[..8]);
+            if let Some(name) = &tp.name {
+                format!("{} ({})", name, default)
+            } else {
+                default
+            }
+        } else {
+            format!("type-{}", &type_id[..type_id.len().min(8)])
+        }
+    }
+
+    pub fn canonical_type_name(&self, type_id: &str) -> String {
+        if let Some(tp) = self.types.get(type_id) {
+            if let Some(name) = &tp.name {
+                return name.clone();
+            }
+        }
+        format!("type-{}", &type_id[..type_id.len().min(8)])
+    }
+
+    pub fn find_type_index(&self, type_id: &str) -> Option<usize> {
+        self.types.get_index_of(type_id)
+    }
+
+    pub fn filtered_events<'a>(&'a self, filters: &'a DataFilters) -> Vec<&'a EventRecord> {
+        self.filtered_events_in_range(filters, None)
+    }
+
+    pub fn filtered_events_in_range<'a>(
+        &'a self,
+        filters: &'a DataFilters,
+        range: Option<(f64, f64)>,
+    ) -> Vec<&'a EventRecord> {
+        let mut out = Vec::new();
+        let type_query = filters.type_filter.to_lowercase();
+        for e in self.events.iter().rev() {
+            if let Some((start, end)) = range {
+                if e.ts < start || e.ts > end {
+                    continue;
+                }
+            }
+            if !filters.type_filter.is_empty() {
+                let canonical = self.canonical_type_name(&e.type_id).to_lowercase();
+                if !canonical.contains(&type_query) {
+                    continue;
+                }
+            }
+            if !filters.key_filter.is_empty() {
+                let wanted: Vec<&str> = filters
+                    .key_filter
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !wanted.iter().all(|k| e.keys.iter().any(|ek| ek == k)) {
+                    continue;
+                }
+            }
+            if !filters.fuzzy_filter.is_empty() {
+                let s = serde_json::to_string(&e.obj).unwrap_or_default().to_lowercase();
+                if !fuzzy_match(&s, &filters.fuzzy_filter.to_lowercase()) {
+                    continue;
+                }
+            }
+            if !filters.exact_filter.is_empty() {
+                if let Some((k, v)) = parse_exact_filter(&filters.exact_filter) {
+                    let found = value_at_path(&e.obj, k)
+                        .map(value_token)
+                        .map(|t| t == v)
+                        .unwrap_or(false);
+                    if !found {
+                        continue;
+                    }
+                }
+            }
+            out.push(e);
+        }
+        out
+    }
+
+    pub fn closed_periods(&self) -> Vec<&ActionPeriod> {
+        self.periods.iter().filter(|p| p.end.is_some()).collect()
+    }
+
+}
+
+fn update_uniqueness(tp: &mut TypeProfile, obj: &Value) -> f64 {
+    let mut scalar_paths = Vec::new();
+    collect_scalar_paths(obj, "", &mut scalar_paths);
+
+    let mut max_score = 0.0;
+    for (path, token) in scalar_paths {
+        let stats = tp.path_stats.entry(path.clone()).or_default();
+        let prev = stats.values.get(&token).copied().unwrap_or(0);
+        let total = stats.total as f64;
+        let distinct = stats.values.len() as f64;
+
+        let auto = auto_consider_path(path.as_str(), stats);
+        let considered = tp.considered_paths.entry(path.clone()).or_insert(auto);
+        *considered = match tp.path_overrides.get(path.as_str()).copied() {
+            Some(PathOverride::ForcedOn) => true,
+            Some(PathOverride::ForcedOff) => false,
+            None => auto,
+        };
+
+        if *considered && total > 6.0 {
+            let freq = prev as f64 / total;
+            let s = if prev == 0 { 1.0 } else { (1.0 - (freq / 0.10)).clamp(0.0, 1.0) };
+            if s > max_score {
+                max_score = s;
+            }
+        }
+
+        stats.total += 1;
+        *stats.values.entry(token).or_insert(0) += 1;
+        // Fast path for very high uniqueness once enough support exists.
+        if !tp.path_overrides.contains_key(path.as_str()) && total >= 12.0 {
+            let unique_ratio = (distinct + 1.0) / (total + 1.0);
+            if unique_ratio >= 0.80 {
+                if let Some(v) = tp.considered_paths.get_mut(path.as_str()) {
+                    *v = false;
+                }
+            }
+        }
+    }
+
+    max_score
+}
+
+fn is_volatile_path(path: &str) -> bool {
+    let last = path
+        .trim_end_matches("[]")
+        .rsplit('.')
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    matches!(
+        last.as_str(),
+        "ts"
+            | "timestamp"
+            | "time"
+            | "event_time"
+            | "created_at"
+            | "updated_at"
+            | "nonce"
+            | "request_id"
+            | "trace_id"
+            | "span_id"
+    )
+}
+
+fn auto_consider_path(path: &str, stats: &PathStats) -> bool {
+    if is_volatile_path(path) {
+        return false;
+    }
+
+    let total = stats.total as f64;
+    if total < 10.0 {
+        return true;
+    }
+    let distinct = stats.values.len() as f64;
+    let unique_ratio = distinct / total;
+    if unique_ratio >= 0.80 {
+        return false;
+    }
+
+    // Numeric flat-ish heuristic: many distinct numeric values with no strong mode.
+    let mut numeric_distinct = 0usize;
+    let mut numeric_total = 0u64;
+    let mut numeric_top = 0u64;
+    for (k, c) in &stats.values {
+        if k.starts_with("n:") {
+            numeric_distinct += 1;
+            numeric_total += *c;
+            if *c > numeric_top {
+                numeric_top = *c;
+            }
+        }
+    }
+    if numeric_total >= 12 && numeric_distinct >= 10 {
+        let top_share = numeric_top as f64 / numeric_total as f64;
+        if top_share <= 0.12 {
+            return false;
+        }
+    }
+    true
+}
+
+fn collect_scalar_paths(v: &Value, path: &str, out: &mut Vec<(String, String)>) {
+    match v {
+        Value::Object(map) => {
+            for (k, child) in map {
+                let p = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
+                collect_scalar_paths(child, &p, out);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr.iter().take(3) {
+                let p = format!("{}[]", path);
+                collect_scalar_paths(child, &p, out);
+            }
+        }
+        _ => {
+            out.push((path.to_string(), value_token(v)));
+        }
+    }
+}
+
+fn value_token(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => format!("b:{}", b),
+        Value::Number(n) => format!("n:{}", n),
+        Value::String(s) => format!("s:{}", s),
+        Value::Array(_) => "array".to_string(),
+        Value::Object(_) => "object".to_string(),
+    }
+}
+
+fn parse_exact_filter(filter: &str) -> Option<(&str, String)> {
+    let (k, v) = filter.split_once('=')?;
+    Some((k.trim(), v.trim().to_string()))
+}
+
+fn value_at_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut cur = v;
+    for part in path.split('.') {
+        if part.ends_with("[]") {
+            let key = &part[..part.len().saturating_sub(2)];
+            cur = cur.get(key)?;
+            if let Value::Array(arr) = cur {
+                cur = arr.first()?;
+            } else {
+                return None;
+            }
+        } else {
+            cur = cur.get(part)?;
+        }
+    }
+    Some(cur)
+}
+
+fn fuzzy_match(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let mut n = needle.chars();
+    let mut target = n.next();
+    for c in haystack.chars() {
+        if Some(c) == target {
+            target = n.next();
+            if target.is_none() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn extract_shape(v: &Value) -> Value {
+    match v {
+        Value::Null => Value::String("null".to_string()),
+        Value::Bool(_) => Value::String("boolean".to_string()),
+        Value::Number(_) => Value::String("number".to_string()),
+        Value::String(_) => Value::String("string".to_string()),
+        Value::Array(arr) => {
+            if arr.is_empty() {
+                return Value::Array(vec![Value::String("empty".to_string())]);
+            }
+            let mut uniq: HashMap<String, Value> = HashMap::new();
+            for item in arr.iter().take(5) {
+                let shape = extract_shape(item);
+                let key = serde_json::to_string(&shape).unwrap_or_default();
+                uniq.insert(key, shape);
+            }
+            let mut vals: Vec<(String, Value)> = uniq.into_iter().collect();
+            vals.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Array(vals.into_iter().map(|(_, v)| v).collect())
+        }
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let mut out = Map::new();
+            for (k, child) in entries {
+                out.insert(k.clone(), extract_shape(child));
+            }
+            Value::Object(out)
+        }
+    }
+}
+
+pub fn structural_hash(shape: &Value) -> String {
+    let payload = serde_json::to_vec(shape).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let full = format!("{:x}", digest);
+    full[..12].to_string()
+}
+
+fn collect_all_paths(v: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_paths(v, "", &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn collect_paths(v: &Value, path: &str, out: &mut Vec<String>) {
+    match v {
+        Value::Object(map) => {
+            for (k, child) in map {
+                let p = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
+                out.push(p.clone());
+                collect_paths(child, &p, out);
+            }
+        }
+        Value::Array(arr) => {
+            let p = format!("{}[]", path);
+            out.push(p.clone());
+            for child in arr.iter().take(3) {
+                collect_paths(child, &p, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalized_rate_anomaly(action_rate: f64, baseline_rate: f64) -> f64 {
+    if action_rate <= 0.0 {
+        return 0.0;
+    }
+    if baseline_rate <= 0.0 {
+        return 1.0;
+    }
+    ((action_rate - baseline_rate) / action_rate).clamp(0.0, 1.0)
+}
