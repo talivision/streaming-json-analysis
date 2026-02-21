@@ -452,13 +452,6 @@ impl App {
         self.stashed_event_filters.is_some()
     }
 
-    fn has_active_event_filters(&self) -> bool {
-        !self.event_filters.key_filter.is_empty()
-            || !self.event_filters.type_filter.is_empty()
-            || !self.event_filters.fuzzy_filter.is_empty()
-            || !self.event_filters.exact_filter.is_empty()
-    }
-
     fn toggle_event_filters_enabled(&mut self) {
         if let Some(saved) = self.stashed_event_filters.take() {
             self.event_filters = saved;
@@ -467,7 +460,7 @@ impl App {
             return;
         }
 
-        if !self.has_active_event_filters() {
+        if !self.event_filters.has_active() {
             self.status = "No active event filters to suspend".to_string();
             return;
         }

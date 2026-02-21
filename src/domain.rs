@@ -80,6 +80,29 @@ pub struct DataFilters {
     pub exact_filter: String,
 }
 
+impl DataFilters {
+    pub fn active_count(&self) -> usize {
+        let mut n = 0;
+        if !self.key_filter.is_empty() {
+            n += 1;
+        }
+        if !self.type_filter.is_empty() {
+            n += 1;
+        }
+        if !self.fuzzy_filter.is_empty() {
+            n += 1;
+        }
+        if !self.exact_filter.is_empty() {
+            n += 1;
+        }
+        n
+    }
+
+    pub fn has_active(&self) -> bool {
+        self.active_count() > 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterField {
     Key,
@@ -472,14 +495,14 @@ impl AnalyzerModel {
 
     pub fn type_display_name(&self, type_id: &str) -> String {
         if let Some(tp) = self.types.get(type_id) {
-            let default = format!("type-{}", &tp.type_id[..8]);
+            let default = default_type_label(&tp.type_id);
             if let Some(name) = &tp.name {
                 format!("{} ({})", name, default)
             } else {
                 default
             }
         } else {
-            format!("type-{}", &type_id[..type_id.len().min(8)])
+            default_type_label(type_id)
         }
     }
 
@@ -489,7 +512,15 @@ impl AnalyzerModel {
                 return name.clone();
             }
         }
-        format!("type-{}", &type_id[..type_id.len().min(8)])
+        default_type_label(type_id)
+    }
+
+    pub fn display_type_filter_value(&self, filter: &str) -> String {
+        if self.types.contains_key(filter) {
+            self.canonical_type_name(filter)
+        } else {
+            filter.to_string()
+        }
     }
 
     pub fn find_type_index(&self, type_id: &str) -> Option<usize> {
@@ -556,6 +587,10 @@ impl AnalyzerModel {
         self.periods.iter().filter(|p| p.end.is_some()).collect()
     }
 
+}
+
+fn default_type_label(type_id: &str) -> String {
+    format!("type-{}", &type_id[..type_id.len().min(8)])
 }
 
 fn update_uniqueness(tp: &mut TypeProfile, obj: &Value) -> f64 {

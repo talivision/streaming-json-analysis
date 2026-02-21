@@ -189,7 +189,7 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             app.live_view_start.saturating_add(1),
             (app.live_view_start + live.rows.len()).max(app.live_view_start)
         )),
-        Line::from(format!("filters active: {}", count_active_filters(app))),
+        Line::from(format!("filters active: {}", app.event_filters.active_count())),
     ]))
     .block(Block::default().title("Session").borders(Borders::ALL));
     frame.render_widget(stat, right[0]);
@@ -349,7 +349,9 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let slice = rows.into_iter().skip(start).take(120);
 
     let mut lines = Vec::new();
-    let type_filter_display = display_type_filter_value(app, &app.event_filters.type_filter);
+    let type_filter_display = app
+        .model
+        .display_type_filter_value(&app.event_filters.type_filter);
     lines.push(Line::from(vec![
         Span::styled("k:", Style::default().fg(Color::Yellow)),
         Span::raw(format!("{}  ", app.event_filters.key_filter)),
@@ -394,7 +396,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let mut row = Vec::new();
         let inner_width = area.width.saturating_sub(2) as usize;
         let action_on = app.model.active_period().is_some();
-        let filters_active = count_active_filters(app);
+        let filters_active = app.event_filters.active_count();
         let medium = inner_width >= 95;
 
         row.push(Span::styled(
@@ -463,7 +465,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let width = area.width.saturating_sub(2) as usize;
-    let filters_active = count_active_filters(app);
+    let filters_active = app.event_filters.active_count();
     let wide = width >= 110;
     let key = if app.event_filters.key_filter.is_empty() {
         "off".to_string()
@@ -473,7 +475,11 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let typ = if app.event_filters.type_filter.is_empty() {
         "off".to_string()
     } else {
-        truncate_text(&display_type_filter_value(app, &app.event_filters.type_filter), 20)
+        truncate_text(
+            &app.model
+                .display_type_filter_value(&app.event_filters.type_filter),
+            20,
+        )
     };
     let fuzzy = if app.event_filters.fuzzy_filter.is_empty() {
         "off".to_string()
@@ -542,16 +548,6 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .block(Block::default().title("Filters").borders(Borders::ALL)),
         area,
     );
-}
-
-fn display_type_filter_value(app: &App, filter: &str) -> String {
-    if let Some(tp) = app.model.types.get(filter) {
-        if let Some(name) = tp.name.as_ref() {
-            return name.clone();
-        }
-        return format!("type-{}", &filter[..filter.len().min(8)]);
-    }
-    filter.to_string()
 }
 
 fn draw_full_help(frame: &mut Frame<'_>) {
@@ -839,23 +835,6 @@ fn value_anomaly_color(norm: f64) -> Color {
 fn rate_anomaly_color(norm: f64) -> Color {
     let c = lerp_rgb((145, 145, 145), (0, 160, 255), norm);
     Color::Rgb(c.0, c.1, c.2)
-}
-
-fn count_active_filters(app: &App) -> usize {
-    let mut n = 0;
-    if !app.event_filters.key_filter.is_empty() {
-        n += 1;
-    }
-    if !app.event_filters.type_filter.is_empty() {
-        n += 1;
-    }
-    if !app.event_filters.fuzzy_filter.is_empty() {
-        n += 1;
-    }
-    if !app.event_filters.exact_filter.is_empty() {
-        n += 1;
-    }
-    n
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
