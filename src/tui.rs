@@ -476,7 +476,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let width = area.width.saturating_sub(2) as usize;
     let filters_active = app.event_filters.active_count();
-    let wide = width >= 110;
+    let show_long_names = width >= 100;
     let key = if app.event_filters.key_filter.is_empty() {
         "off".to_string()
     } else {
@@ -502,46 +502,38 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         truncate_text(&app.event_filters.exact_filter, 20)
     };
 
-    let mut row = vec![
-        Span::styled("set ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "k",
+    let mut row = vec![Span::raw(" ")];
+    let mut push_value = |label: &str, value: String, active: bool, idx: usize| {
+        if idx > 0 {
+            row.push(Span::raw("  "));
+        }
+        row.push(Span::styled(
+            format!("{}=", label),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" key  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "t",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" type  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "/",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" fuzzy  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "e",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" exact  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "c",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" clear", Style::default().fg(Color::Gray)),
-        Span::raw("  "),
-        Span::styled("state:", Style::default().fg(Color::Gray)),
-    ];
+        ));
+        row.push(Span::styled(
+            value,
+            Style::default().fg(if active {
+                Color::LightGreen
+            } else {
+                Color::DarkGray
+            }),
+        ));
+    };
+
+    let labels = if show_long_names {
+        ["k/key", "t/type", "/fuzzy", "e/exact"]
+    } else {
+        ["k", "t", "/", "e"]
+    };
+    push_value(labels[0], key, !app.event_filters.key_filter.is_empty(), 0);
+    push_value(labels[1], typ, !app.event_filters.type_filter.is_empty(), 1);
+    push_value(labels[2], fuzzy, !app.event_filters.fuzzy_filter.is_empty(), 2);
+    push_value(labels[3], exact, !app.event_filters.exact_filter.is_empty(), 3);
+    row.push(Span::raw("  "));
+    row.push(Span::styled("state:", Style::default().fg(Color::Gray)));
     if app.filters_suspended() {
         row.push(Span::styled(
             "suspended",
@@ -557,49 +549,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }),
         ));
     }
-
-    if wide {
-        row.push(Span::raw("  "));
-        row.push(Span::styled("k=", Style::default().fg(Color::Yellow)));
-        row.push(Span::styled(
-            key,
-            Style::default().fg(if app.event_filters.key_filter.is_empty() {
-                Color::DarkGray
-            } else {
-                Color::LightGreen
-            }),
-        ));
-        row.push(Span::raw("  "));
-        row.push(Span::styled("t=", Style::default().fg(Color::Yellow)));
-        row.push(Span::styled(
-            typ,
-            Style::default().fg(if app.event_filters.type_filter.is_empty() {
-                Color::DarkGray
-            } else {
-                Color::LightGreen
-            }),
-        ));
-        row.push(Span::raw("  "));
-        row.push(Span::styled("/=", Style::default().fg(Color::Yellow)));
-        row.push(Span::styled(
-            fuzzy,
-            Style::default().fg(if app.event_filters.fuzzy_filter.is_empty() {
-                Color::DarkGray
-            } else {
-                Color::LightGreen
-            }),
-        ));
-        row.push(Span::raw("  "));
-        row.push(Span::styled("e=", Style::default().fg(Color::Yellow)));
-        row.push(Span::styled(
-            exact,
-            Style::default().fg(if app.event_filters.exact_filter.is_empty() {
-                Color::DarkGray
-            } else {
-                Color::LightGreen
-            }),
-        ));
-    }
+    row.push(Span::raw("  "));
 
     frame.render_widget(
         Paragraph::new(Text::from(vec![Line::from(row)]))
