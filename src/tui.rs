@@ -1,4 +1,4 @@
-use crate::app::{App, ObjectInspector, RateBoundaryViewMode};
+use crate::app::{App, ObjectInspector};
 use crate::domain::{EventRecord, FilterField, PathOverride};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -136,12 +136,7 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 Span::raw("  "),
                 Span::styled("rate anomaly ", Style::default().fg(Color::Gray)),
                 Span::styled(
-                    match app.rate_view {
-                        RateBoundaryViewMode::Point => format!("{:.2}", show_rate),
-                        RateBoundaryViewMode::Interval => {
-                            format!("[{:.2}..{:.2}]", sel.live_rate_low, sel.live_rate_high)
-                        }
-                    },
+                    format!("{:.2}", show_rate),
                     Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
                 ),
             ]));
@@ -420,18 +415,6 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ));
         row.push(Span::raw("  "));
 
-        row.push(Span::styled(
-            if medium { "boundary (g)" } else { "g" },
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-        row.push(Span::raw(":"));
-        row.push(Span::styled(
-            app.rate_view.label(),
-            Style::default().fg(Color::Cyan),
-        ));
-        row.push(Span::raw("  "));
 
         row.push(Span::styled(
             if medium { "help (h)" } else { "h" },
@@ -586,7 +569,7 @@ fn draw_full_help(frame: &mut Frame<'_>) {
 
     let body = vec![
         Line::from("Global"),
-        Line::from("  q quit | h/? help | 1 Live | 2 Periods | 3 Types | 4 Data | g rate boundary"),
+        Line::from("  q quit | h/? help | 1 Live | 2 Periods | 3 Types | 4 Data"),
         Line::from(""),
         Line::from("Live"),
         Line::from("  m toggle action period"),
@@ -718,12 +701,7 @@ fn render_event_line(
     let show_metrics = e.in_action_period;
     let (show_uniq, show_rate) = displayed_anomaly_scores(app, e);
     let (rate_text, value_text, tail_len) = if show_metrics {
-        let rate_live_text = match app.rate_view {
-            RateBoundaryViewMode::Point => format!("{:>5.2}", e.live_rate_score),
-            RateBoundaryViewMode::Interval => {
-                format!("[{:>4.2}..{:>4.2}]", e.live_rate_low, e.live_rate_high)
-            }
-        };
+        let rate_live_text = format!("{:>5.2}", e.live_rate_score);
         let value_live_text = format!("{:>5.2}", e.live_uniq_score);
         let tail_len = 2 + 2 + rate_live_text.chars().count() + 3 + value_live_text.chars().count();
         (Some(rate_live_text), Some(value_live_text), tail_len)
@@ -852,10 +830,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn displayed_anomaly_scores(app: &App, e: &EventRecord) -> (f64, f64) {
-    let rate = match app.rate_view {
-        RateBoundaryViewMode::Point => e.live_rate_score,
-        RateBoundaryViewMode::Interval => 0.5 * (e.live_rate_low + e.live_rate_high),
-    };
-    (e.live_uniq_score, rate)
+fn displayed_anomaly_scores(_app: &App, e: &EventRecord) -> (f64, f64) {
+    (e.live_uniq_score, e.live_rate_score)
 }

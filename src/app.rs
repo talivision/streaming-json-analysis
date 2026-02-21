@@ -39,28 +39,6 @@ pub struct LiveRenderData<'a> {
     pub total: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RateBoundaryViewMode {
-    Point,
-    Interval,
-}
-
-impl RateBoundaryViewMode {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Point => Self::Interval,
-            Self::Interval => Self::Point,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Point => "point",
-            Self::Interval => "interval",
-        }
-    }
-}
-
 #[derive(Clone)]
 struct LiveAnchor {
     ts: f64,
@@ -96,8 +74,10 @@ pub struct App {
     pub live_window_rows: usize,
     pub live_follow: bool,
     pub live_edge_until_center: bool,
+    pub live_key_focus: bool,
+    pub live_key_index: usize,
     pub show_help_overlay: bool,
-    pub rate_view: RateBoundaryViewMode,
+
     pub offline: bool,
     pub status: String,
     pub inspector: Option<ObjectInspector>,
@@ -136,8 +116,10 @@ impl App {
             live_window_rows: LIVE_WINDOW_DEFAULT,
             live_follow: true,
             live_edge_until_center: false,
+            live_key_focus: false,
+            live_key_index: 0,
             show_help_overlay: false,
-            rate_view: RateBoundaryViewMode::Point,
+
             offline,
             status: if offline {
                 format!(
@@ -353,10 +335,22 @@ impl App {
             KeyCode::Char('h') | KeyCode::Char('?') => {
                 self.show_help_overlay = !self.show_help_overlay;
             }
-            KeyCode::Char('1') => self.mode = UiMode::Live,
-            KeyCode::Char('2') => self.mode = UiMode::Periods,
-            KeyCode::Char('3') => self.mode = UiMode::Types,
-            KeyCode::Char('4') => self.mode = UiMode::Data,
+            KeyCode::Char('1') => {
+                self.mode = UiMode::Live;
+                self.clamp_live_key_selection();
+            }
+            KeyCode::Char('2') => {
+                self.mode = UiMode::Periods;
+                self.live_key_focus = false;
+            }
+            KeyCode::Char('3') => {
+                self.mode = UiMode::Types;
+                self.live_key_focus = false;
+            }
+            KeyCode::Char('4') => {
+                self.mode = UiMode::Data;
+                self.live_key_focus = false;
+            }
             KeyCode::Char('m') => {
                 if self.model.toggle_period() {
                     self.status = if let Some(p) = self.model.active_period() {
@@ -370,10 +364,7 @@ impl App {
                             .to_string();
                 }
             }
-            KeyCode::Char('g') => {
-                self.rate_view = self.rate_view.next();
-                self.status = format!("Rate boundary: {}", self.rate_view.label());
-            }
+
             KeyCode::Char('f') if self.mode == UiMode::Live => {
                 self.live_follow = !self.live_follow;
                 if self.live_follow {
@@ -396,8 +387,14 @@ impl App {
                 self.input_mode = InputMode::Label;
                 self.input_buffer = self.model.current_label.clone();
             }
+            KeyCode::Char('k') if self.mode == UiMode::Live && self.live_key_focus => {
+                self.apply_live_selected_key_filter()
+            }
             KeyCode::Char('k') if self.mode != UiMode::Types => {
                 self.start_event_filter_input(FilterField::Key)
+            }
+            KeyCode::Char('t') if self.mode == UiMode::Live && self.live_key_focus => {
+                self.jump_to_live_selected_event_type()
             }
             KeyCode::Char('t') if self.mode != UiMode::Types => {
                 self.start_event_filter_input(FilterField::Type)
@@ -436,6 +433,7 @@ impl App {
             KeyCode::PageDown => self.handle_navigation_intent(NavIntent::PageDown),
             KeyCode::Left => self.handle_navigation_intent(NavIntent::Left),
             KeyCode::Right => self.handle_navigation_intent(NavIntent::Right),
+            KeyCode::Enter if self.mode == UiMode::Live => self.toggle_live_key_focus(),
             KeyCode::Enter => self.open_selected_event(),
             KeyCode::Char(' ') => self.toggle_current_path(),
             KeyCode::Char('u') => self.toggle_known_unrelated(),
@@ -585,10 +583,35 @@ impl App {
     }
 
     fn navigate_live(&mut self, intent: NavIntent) {
+        if self.live_key_focus {
+            match intent {
+                NavIntent::LineUp => {
+                    self.live_key_index = self.live_key_index.saturating_sub(1);
+                    return;
+                }
+                NavIntent::LineDown => {
+                    let keys = self.live_selected_key_paths();
+                    if self.live_key_index + 1 < keys.len() {
+                        self.live_key_index += 1;
+                    }
+                    return;
+                }
+                NavIntent::Left => {
+                    self.live_key_focus = false;
+                    return;
+                }
+                NavIntent::Right => return,
+                NavIntent::PageUp | NavIntent::PageDown | NavIntent::Home | NavIntent::End => {
+                    self.live_key_focus = false;
+                }
+            }
+        }
         let total = self.visible_live_events().len();
         if total == 0 {
             self.live_event_index = 0;
             self.live_view_start = 0;
+            self.live_key_index = 0;
+            self.live_key_focus = false;
             return;
         }
 
@@ -601,7 +624,18 @@ impl App {
             NavIntent::PageDown => (self.live_event_index + step).min(total.saturating_sub(1)),
             NavIntent::Home => 0,
             NavIntent::End => total.saturating_sub(1),
-            NavIntent::Left | NavIntent::Right => return,
+            NavIntent::Left => {
+                self.live_key_focus = false;
+                return;
+            }
+            NavIntent::Right => {
+                let has_keys = !self.live_selected_key_paths().is_empty();
+                self.live_key_focus = has_keys;
+                if !has_keys {
+                    self.status = "Selected event has no keys".to_string();
+                }
+                return;
+            }
         };
 
         self.live_follow = false;
@@ -627,6 +661,7 @@ impl App {
 
         self.clamp_live_indices();
         self.reposition_live_selection();
+        self.clamp_live_key_selection();
     }
 
     fn navigate_periods(&mut self, intent: NavIntent) {
@@ -725,6 +760,80 @@ impl App {
             NavIntent::End => total.saturating_sub(1),
             NavIntent::Left | NavIntent::Right => self.data_index,
         };
+    }
+
+    fn live_selected_event(&self) -> Option<&EventRecord> {
+        self.visible_live_events()
+            .get(self.live_event_index)
+            .copied()
+    }
+
+    pub fn live_selected_key_paths(&self) -> Vec<String> {
+        let Some(event) = self.live_selected_event() else {
+            return Vec::new();
+        };
+        let mut key_paths = event.keys.clone();
+        key_paths.sort();
+        key_paths.dedup();
+        key_paths
+    }
+
+    fn clamp_live_key_selection(&mut self) {
+        let key_count = self.live_selected_key_paths().len();
+        if key_count == 0 {
+            self.live_key_index = 0;
+            self.live_key_focus = false;
+            return;
+        }
+        self.live_key_index = self.live_key_index.min(key_count.saturating_sub(1));
+    }
+
+    fn toggle_live_key_focus(&mut self) {
+        if self.mode != UiMode::Live {
+            return;
+        }
+        self.clamp_live_key_selection();
+        if self.live_selected_key_paths().is_empty() {
+            self.status = "Selected event has no keys".to_string();
+            self.live_key_focus = false;
+            return;
+        }
+        self.live_key_focus = !self.live_key_focus;
+        self.status = if self.live_key_focus {
+            "Live JSON keys focus: ON (up/down select key, k apply filter)".to_string()
+        } else {
+            "Live JSON keys focus: OFF".to_string()
+        };
+    }
+
+    fn apply_live_selected_key_filter(&mut self) {
+        let keys = self.live_selected_key_paths();
+        if let Some(path) = keys.get(self.live_key_index) {
+            self.event_filters.key_filter = path.clone();
+            self.stashed_event_filters = None;
+            self.mode = UiMode::Data;
+            self.data_index = 0;
+            self.period_event_index = 0;
+            self.live_event_index = 0;
+            self.live_key_focus = false;
+            self.refresh_live_position();
+            self.status = format!("Applied key filter: {}", path);
+        }
+    }
+
+    fn jump_to_live_selected_event_type(&mut self) {
+        let Some(event) = self.live_selected_event() else {
+            return;
+        };
+        let type_id = event.type_id.clone();
+        if let Some(idx) = self.model.find_type_index(&type_id) {
+            let type_name = self.model.type_display_name(&type_id);
+            self.mode = UiMode::Types;
+            self.type_index = idx;
+            self.path_index = 0;
+            self.live_key_focus = false;
+            self.status = format!("Jumped to type {}", type_name);
+        }
     }
 
     fn live_page_step(&self) -> usize {
@@ -854,11 +963,14 @@ impl App {
         if total == 0 {
             self.live_event_index = 0;
             self.live_view_start = 0;
+            self.live_key_index = 0;
+            self.live_key_focus = false;
             return;
         }
         let window = self.live_window_rows.max(1);
         self.live_event_index = total - 1;
         self.live_view_start = total.saturating_sub(window);
+        self.clamp_live_key_selection();
     }
 
     fn refresh_live_position(&mut self) {
@@ -868,6 +980,7 @@ impl App {
         } else {
             self.clamp_live_indices();
             self.reposition_live_selection();
+            self.clamp_live_key_selection();
         }
     }
 
@@ -876,6 +989,8 @@ impl App {
         if total == 0 {
             self.live_event_index = 0;
             self.live_view_start = 0;
+            self.live_key_index = 0;
+            self.live_key_focus = false;
             return;
         }
         if self.live_event_index < self.live_view_start {

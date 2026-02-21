@@ -16,8 +16,6 @@ pub struct EventRecord {
     pub action_period_id: Option<u64>,
     pub in_action_period: bool,
     pub live_rate_score: f64,
-    pub live_rate_low: f64,
-    pub live_rate_high: f64,
     pub live_uniq_score: f64,
 }
 
@@ -219,8 +217,6 @@ impl AnalyzerModel {
             action_period_id: active_period_id,
             in_action_period,
             live_rate_score: rate,
-            live_rate_low: rate,
-            live_rate_high: rate,
             live_uniq_score: uniq,
         });
         while self.events.len() > MAX_EVENTS {
@@ -235,22 +231,12 @@ impl AnalyzerModel {
                 continue;
             };
             let rate = self.recomputed_rate_for(&e.type_id, period_id);
-            let (mut rate_low, mut rate_high) =
-                self.recomputed_rate_range_for(&e.type_id, period_id);
             let uniq = self.recomputed_uniq_for(&e.type_id, &e.obj);
-            if rate_low > rate_high {
-                std::mem::swap(&mut rate_low, &mut rate_high);
-            }
-            updates.push((idx, rate, rate_low, rate_high, uniq));
+            updates.push((idx, rate, uniq));
         }
-        for (idx, rate, rate_low, rate_high, uniq) in updates {
+        for (idx, rate, uniq) in updates {
             if let Some(e) = self.events.get_mut(idx) {
                 e.live_rate_score = rate;
-                e.live_rate_low = rate_low;
-                e.live_rate_high = rate_high;
-                if e.live_rate_high < e.live_rate_low {
-                    e.live_rate_high = e.live_rate_low;
-                }
                 e.live_uniq_score = uniq;
             }
         }
@@ -306,34 +292,6 @@ impl AnalyzerModel {
         let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
         let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
         normalized_rate_anomaly(action_rate, baseline_rate)
-    }
-
-    fn recomputed_rate_range_for(&self, type_id: &str, period_id: u64) -> (f64, f64) {
-        let Some(pr) = self.period_rate_states.get(&period_id) else {
-            return (0.0, 0.0);
-        };
-        if pr.elapsed_secs < MIN_ACTION_RATE_DURATION_SECS {
-            return (0.0, 0.0);
-        }
-        let Some(period) = self.periods.iter().find(|p| p.id == period_id) else {
-            return (0.0, 0.0);
-        };
-        let start_low = period.start - ACTION_BOUNDARY_EPS;
-        let start_high = pr.first_event_ts.unwrap_or(start_low);
-        let end_ts = period
-            .end
-            .unwrap_or(self.last_event_ts.unwrap_or(period.start));
-        let dur_max = (end_ts - start_low).max(0.001);
-        let dur_min = (end_ts - start_high).max(0.001);
-
-        let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
-        let action_rate_low = action_count / dur_max;
-        let action_rate_high = action_count / dur_min;
-        let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
-        let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
-        let low = normalized_rate_anomaly(action_rate_low, baseline_rate);
-        let high = normalized_rate_anomaly(action_rate_high, baseline_rate);
-        (low.min(high), low.max(high))
     }
 
     fn recomputed_uniq_for(&self, type_id: &str, obj: &Value) -> f64 {
