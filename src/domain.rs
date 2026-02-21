@@ -6,6 +6,8 @@ use std::collections::{HashMap, VecDeque};
 const MAX_EVENTS: usize = 80_000;
 const ACTION_BOUNDARY_EPS: f64 = 0.000_001;
 const MIN_ACTION_RATE_DURATION_SECS: f64 = 1.0;
+const VALUE_ANOMALY_RARE_FREQ: f64 = 0.25;
+const VALUE_ANOMALY_CURVE: f64 = 0.6;
 
 #[derive(Debug, Clone)]
 pub struct EventRecord {
@@ -48,6 +50,7 @@ pub struct TypeProfile {
     pub considered_paths: IndexMap<String, bool>,
     pub path_overrides: IndexMap<String, PathOverride>,
     pub path_stats: IndexMap<String, PathStats>,
+    pub baseline_path_stats: IndexMap<String, PathStats>,
     pub known_unrelated: bool,
     pub latest_rate: f64,
     pub latest_uniq: f64,
@@ -192,6 +195,7 @@ impl AnalyzerModel {
                     considered_paths: IndexMap::new(),
                     path_overrides: IndexMap::new(),
                     path_stats: IndexMap::new(),
+                    baseline_path_stats: IndexMap::new(),
                     known_unrelated: false,
                     latest_rate: 0.0,
                     latest_uniq: 0.0,
@@ -201,7 +205,7 @@ impl AnalyzerModel {
             if entry.count == 1 {
                 entry.example = obj.clone();
             }
-            update_uniqueness(entry, &obj)
+            update_uniqueness(entry, &obj, in_action_period)
         };
         let rate = self.update_rate_scores(&type_id, active_period_id);
         if let Some(entry) = self.types.get_mut(&type_id) {
@@ -319,13 +323,12 @@ impl AnalyzerModel {
             if !considered || stats.total <= 6 {
                 continue;
             }
-            let total = stats.total as f64;
-            let prev = stats.values.get(token.as_str()).copied().unwrap_or(0);
-            let freq = prev as f64 / total;
-            let s = if prev == 0 {
-                1.0
+            let baseline_stats = tp.baseline_path_stats.get(path.as_str());
+            let s = if let Some(bstats) = baseline_stats {
+                let prev = bstats.values.get(token.as_str()).copied().unwrap_or(0);
+                value_frequency_anomaly(prev, bstats.total)
             } else {
-                (1.0 - (freq / 0.10)).clamp(0.0, 1.0)
+                1.0
             };
             if s > max_score {
                 max_score = s;
@@ -421,7 +424,21 @@ impl AnalyzerModel {
     ) -> Vec<&'a EventRecord> {
         let mut out = Vec::new();
         let type_query = filters.type_filter.to_lowercase();
+        // Parse once outside the loop instead of per-event.
+        let parsed_exact: Option<(String, String)> = if !filters.exact_filter.is_empty() {
+            parse_exact_filter(&filters.exact_filter).map(|(k, v)| (k.to_string(), v))
+        } else {
+            None
+        };
         for e in self.events.iter().rev() {
+            if self
+                .types
+                .get(e.type_id.as_str())
+                .map(|tp| tp.known_unrelated)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if let Some((start, end)) = range {
                 if e.ts < start || e.ts > end {
                     continue;
@@ -452,15 +469,12 @@ impl AnalyzerModel {
                     continue;
                 }
             }
-            if !filters.exact_filter.is_empty() {
-                if let Some((k, v)) = parse_exact_filter(&filters.exact_filter) {
-                    let found = value_at_path(&e.obj, k)
-                        .map(value_token)
-                        .map(|t| t == v)
-                        .unwrap_or(false);
-                    if !found {
-                        continue;
-                    }
+            if let Some((ref k, ref v)) = parsed_exact {
+                let found = value_at_path(&e.obj, k)
+                    .map(|actual| exact_value_matches(actual, v))
+                    .unwrap_or(false);
+                if !found {
+                    continue;
                 }
             }
             out.push(e);
@@ -477,7 +491,19 @@ fn default_type_label(type_id: &str) -> String {
     format!("type-{}", &type_id[..type_id.len().min(8)])
 }
 
-fn update_uniqueness(tp: &mut TypeProfile, obj: &Value) -> f64 {
+fn value_frequency_anomaly(prev: u64, total: u64) -> f64 {
+    if prev == 0 {
+        return 1.0;
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    let freq = prev as f64 / total as f64;
+    let scaled = (freq / VALUE_ANOMALY_RARE_FREQ).max(0.0);
+    (1.0 - scaled.powf(VALUE_ANOMALY_CURVE)).clamp(0.0, 1.0)
+}
+
+fn update_uniqueness(tp: &mut TypeProfile, obj: &Value, in_action_period: bool) -> f64 {
     let mut scalar_paths = Vec::new();
     collect_scalar_paths(obj, "", &mut scalar_paths);
 
@@ -497,11 +523,16 @@ fn update_uniqueness(tp: &mut TypeProfile, obj: &Value) -> f64 {
         };
 
         if *considered && total > 6.0 {
-            let freq = prev as f64 / total;
-            let s = if prev == 0 {
-                1.0
+            let s = if in_action_period {
+                let baseline_stats = tp.baseline_path_stats.get(path.as_str());
+                if let Some(bstats) = baseline_stats {
+                    let baseline_prev = bstats.values.get(token.as_str()).copied().unwrap_or(0);
+                    value_frequency_anomaly(baseline_prev, bstats.total)
+                } else {
+                    1.0
+                }
             } else {
-                (1.0 - (freq / 0.10)).clamp(0.0, 1.0)
+                value_frequency_anomaly(prev, stats.total)
             };
             if s > max_score {
                 max_score = s;
@@ -509,7 +540,12 @@ fn update_uniqueness(tp: &mut TypeProfile, obj: &Value) -> f64 {
         }
 
         stats.total += 1;
-        *stats.values.entry(token).or_insert(0) += 1;
+        *stats.values.entry(token.clone()).or_insert(0) += 1;
+        if !in_action_period {
+            let baseline_stats = tp.baseline_path_stats.entry(path.clone()).or_default();
+            baseline_stats.total += 1;
+            *baseline_stats.values.entry(token).or_insert(0) += 1;
+        }
         // Fast path for very high uniqueness once enough support exists.
         if !tp.path_overrides.contains_key(path.as_str()) && total >= 12.0 {
             let unique_ratio = (distinct + 1.0) / (total + 1.0);
@@ -529,20 +565,21 @@ fn is_volatile_path(path: &str) -> bool {
         .trim_end_matches("[]")
         .rsplit('.')
         .next()
-        .unwrap_or(path)
-        .to_ascii_lowercase();
-    matches!(
-        last.as_str(),
-        "ts" | "timestamp"
-            | "time"
-            | "event_time"
-            | "created_at"
-            | "updated_at"
-            | "nonce"
-            | "request_id"
-            | "trace_id"
-            | "span_id"
-    )
+        .unwrap_or(path);
+    [
+        "ts",
+        "timestamp",
+        "time",
+        "event_time",
+        "created_at",
+        "updated_at",
+        "nonce",
+        "request_id",
+        "trace_id",
+        "span_id",
+    ]
+    .iter()
+    .any(|&v| last.eq_ignore_ascii_case(v))
 }
 
 fn auto_consider_path(path: &str, stats: &PathStats) -> bool {
@@ -606,7 +643,7 @@ fn collect_scalar_paths(v: &Value, path: &str, out: &mut Vec<(String, String)>) 
     }
 }
 
-fn value_token(v: &Value) -> String {
+pub fn value_token(v: &Value) -> String {
     match v {
         Value::Null => "null".to_string(),
         Value::Bool(b) => format!("b:{}", b),
@@ -622,7 +659,20 @@ fn parse_exact_filter(filter: &str) -> Option<(&str, String)> {
     Some((k.trim(), v.trim().to_string()))
 }
 
-fn value_at_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
+fn exact_value_matches(actual: &Value, expected: &str) -> bool {
+    if value_token(actual) == expected {
+        return true;
+    }
+    match actual {
+        Value::String(s) => s == expected,
+        Value::Number(n) => n.to_string() == expected,
+        Value::Bool(b) => b.to_string() == expected,
+        Value::Null => expected == "null",
+        Value::Array(_) | Value::Object(_) => false,
+    }
+}
+
+pub fn value_at_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = v;
     for part in path.split('.') {
         if part.ends_with("[]") {
@@ -738,4 +788,166 @@ fn normalized_rate_anomaly(action_rate: f64, baseline_rate: f64) -> f64 {
         return 1.0;
     }
     ((action_rate - baseline_rate) / action_rate).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn shape_and_hash_are_structural_not_value_based() {
+        let a = json!({
+            "z": 1,
+            "nested": { "b": true, "a": "x" },
+            "arr": [1, "s", {"k": 1}]
+        });
+        let b = json!({
+            "arr": [5, "other", {"k": 9}],
+            "nested": { "a": "y", "b": false },
+            "z": 999
+        });
+
+        let shape_a = extract_shape(&a);
+        let shape_b = extract_shape(&b);
+        assert_eq!(shape_a, shape_b);
+        assert_eq!(structural_hash(&shape_a), structural_hash(&shape_b));
+    }
+
+    #[test]
+    fn value_at_path_handles_array_notation() {
+        let v = json!({
+            "items": [{"name": "first"}, {"name": "second"}],
+            "meta": {"ok": true}
+        });
+        assert_eq!(value_at_path(&v, "items[].name"), Some(&json!("first")));
+        assert_eq!(value_at_path(&v, "meta.ok"), Some(&json!(true)));
+        assert_eq!(value_at_path(&v, "items[].missing"), None);
+    }
+
+    #[test]
+    fn data_filters_count_active_fields() {
+        let mut f = DataFilters::default();
+        assert_eq!(f.active_count(), 0);
+        assert!(!f.has_active());
+
+        f.key_filter = "a,b".to_string();
+        f.exact_filter = "x=1".to_string();
+        assert_eq!(f.active_count(), 2);
+        assert!(f.has_active());
+    }
+
+    #[test]
+    fn period_toggle_requires_event_and_closes_with_last_timestamp() {
+        let mut model = AnalyzerModel::new();
+        assert!(!model.toggle_period());
+        assert!(model.periods.is_empty());
+
+        model.ingest(json!({"event":"baseline"}), 100.0);
+        assert!(model.toggle_period());
+        assert_eq!(model.periods.len(), 1);
+        let p = model.active_period().expect("period should be open");
+        assert!(p.start > 100.0);
+        assert_eq!(p.end, None);
+
+        model.ingest(json!({"event":"inside"}), 101.0);
+        assert!(model.toggle_period());
+        assert!(model.active_period().is_none());
+        assert_eq!(model.periods[0].end, Some(101.0));
+    }
+
+    #[test]
+    fn rename_and_display_type_name_behaves_as_expected() {
+        let mut model = AnalyzerModel::new();
+        model.ingest(json!({"event":"login","user":"a"}), 1.0);
+        let type_id = model.events.front().expect("event exists").type_id.clone();
+
+        let default_name = model.type_display_name(&type_id);
+        assert!(default_name.starts_with("type-"));
+
+        model.rename_type(&type_id, "  Login Event  ".to_string());
+        let renamed = model.type_display_name(&type_id);
+        assert!(renamed.starts_with("Login Event (type-"));
+
+        model.rename_type(&type_id, "   ".to_string());
+        assert!(model.type_display_name(&type_id).starts_with("type-"));
+    }
+
+    #[test]
+    fn filtered_events_support_type_key_fuzzy_and_exact() {
+        let mut model = AnalyzerModel::new();
+        model.ingest(
+            json!({"event":"login","user":"alice","meta":{"host":"web"}}),
+            10.0,
+        );
+        model.ingest(json!({"event":"purchase","user":"bob","amount":42}), 20.0);
+
+        let login_type = model.events.back().expect("latest exists").type_id.clone();
+        model.rename_type(&login_type, "Purchase".to_string());
+
+        let type_filter = DataFilters {
+            type_filter: "purchase".to_string(),
+            ..DataFilters::default()
+        };
+        let type_filtered = model.filtered_events(&type_filter);
+        assert_eq!(type_filtered.len(), 1);
+        assert_eq!(
+            value_at_path(&type_filtered[0].obj, "event"),
+            Some(&json!("purchase"))
+        );
+
+        let key_filter = DataFilters {
+            key_filter: "meta.host".to_string(),
+            ..DataFilters::default()
+        };
+        let key_filtered = model.filtered_events(&key_filter);
+        assert_eq!(key_filtered.len(), 1);
+        assert_eq!(
+            value_at_path(&key_filtered[0].obj, "user"),
+            Some(&json!("alice"))
+        );
+
+        let fuzzy_filter = DataFilters {
+            fuzzy_filter: "pch".to_string(),
+            ..DataFilters::default()
+        };
+        let fuzzy_filtered = model.filtered_events(&fuzzy_filter);
+        assert_eq!(fuzzy_filtered.len(), 1);
+
+        let exact_filter = DataFilters {
+            exact_filter: "user=alice".to_string(),
+            ..DataFilters::default()
+        };
+        let exact_filtered = model.filtered_events(&exact_filter);
+        assert_eq!(exact_filtered.len(), 1);
+        assert_eq!(
+            value_at_path(&exact_filtered[0].obj, "event"),
+            Some(&json!("login"))
+        );
+
+        let exact_token_filter = DataFilters {
+            exact_filter: "user=s:alice".to_string(),
+            ..DataFilters::default()
+        };
+        let exact_token_filtered = model.filtered_events(&exact_token_filter);
+        assert_eq!(exact_token_filtered.len(), 1);
+    }
+
+    #[test]
+    fn known_unrelated_types_are_suppressed_from_filtered_events() {
+        let mut model = AnalyzerModel::new();
+        model.ingest(json!({"event":"noise","k":1}), 1.0);
+        model.ingest(json!({"event":"signal","k":2,"ctx":{"source":"web"}}), 2.0);
+
+        let signal_type = model.events.back().expect("event exists").type_id.clone();
+        model.toggle_known_unrelated_type(&signal_type);
+
+        let filters = DataFilters::default();
+        let events = model.filtered_events(&filters);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            value_at_path(&events[0].obj, "event"),
+            Some(&json!("noise"))
+        );
+    }
 }
