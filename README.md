@@ -15,8 +15,6 @@ This app is now a Rust terminal UI focused on fast, practical anomaly discovery.
   - explore collected data with filters on keys, type ID, fuzzy text, exact key=value
 - Known unrelated controls:
   - suppress entire types
-  - suppress specific correlation pairs
-- Correlations auto-refresh on a throttled cadence with smoothing.
 
 Removed by design: palette controls, long-tail analysis, semantic/fuzzy typing.
 
@@ -90,6 +88,7 @@ All event-list modes (`Live`, `Periods`, `Data`):
 
 - `enter`: open object inspector
 - `a`: cycle anomaly display (`snapshot` -> `snapshot+live` -> `live`)
+- `g`: toggle rate boundary display (`point` / `interval`)
 - `k`: edit key filter
 - `t`: edit type filter
 - `/`: edit fuzzy filter
@@ -100,7 +99,6 @@ All event-list modes (`Live`, `Periods`, `Data`):
 Live mode:
 
 - `up/down`: select event row
-- `x`: mark selected correlation as known unrelated
 
 Periods mode:
 
@@ -124,6 +122,6 @@ Object inspector:
 - `t`: jump to the selected event's type in Types mode
 - `esc`: close inspector
 
-Type names are shown in all event lists and correlations as either:
+Type names are shown in all event lists as either:
 - `type-<hash8>` (default)
 - `<custom name> (type-<hash8>)` (renamed)

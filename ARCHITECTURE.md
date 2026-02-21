@@ -7,7 +7,6 @@
 - Analytics: only
   - rate anomaly
   - value uniqueness anomaly
-- Correlation: period-based during-vs-outside lift, refreshed on a throttled interval and smoothed.
 
 ## Modules
 
@@ -17,7 +16,7 @@
   - per-type path/value stats
   - uniqueness-path toggles (normalization controls)
   - anomaly scoring
-  - action periods + correlation scoring
+  - action periods
   - known-unrelated suppression
   - filtering for data explorer
 - `src/io.rs`
@@ -34,7 +33,6 @@
 1. Live
 - recent events with anomaly highlighting
 - action state
-- auto-updating smoothed correlations
 
 2. Periods
 - all closed action periods in one list
@@ -63,4 +61,3 @@
 - bounded event buffer (`VecDeque`, capped)
 - incremental stream tailing
 - anomaly windows updated in O(types active in window)
-- correlation refresh throttled (~900ms) to reduce noisy visual churn
