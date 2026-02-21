@@ -84,7 +84,7 @@ In the source terminal, use single-key triggers:
 - `m`: start/stop action period
 - `n`: set current action label
 
-All event-list modes (`Live`, `Periods`, `Data`):
+Event-list modes (`Periods`, `Data`):
 
 - `enter`: open object inspector
 - `g`: toggle rate boundary display (`point` / `interval`)
@@ -98,6 +98,11 @@ All event-list modes (`Live`, `Periods`, `Data`):
 Live mode:
 
 - `up/down`: select event row
+- `right` or `enter`: focus inline key picker in the selected object pane
+- `esc` or `left`: return focus to event rows (resumes follow if it was on)
+- while key-focused: `up/down` select key, `right` focus value, `enter` or `k` toggle key filter, `t` jump to type
+- while value-focused: `enter` or `e` toggle exact `path=value` filter in place, `left` back to key focus
+- follow mode is paused while key-focused and resumes when key focus exits
 
 Periods mode:
 
@@ -117,7 +122,7 @@ Types mode:
 Object inspector:
 
 - `up/down`: select key
-- `k`: apply selected key as event filter and jump to Data mode
+- `k`: apply selected key as event filter in the current mode
 - `t`: jump to the selected event's type in Types mode
 - `esc`: close inspector
 

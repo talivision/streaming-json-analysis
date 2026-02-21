@@ -112,7 +112,6 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(stream, cols[0]);
 
     let preview_text = if let Some(sel) = live.selected {
-        let pretty = serde_json::to_string_pretty(&sel.obj).unwrap_or_else(|_| "{}".to_string());
         let mut lines = vec![Line::from(Span::styled(
             app.model.type_display_name(&sel.type_id),
             Style::default()
@@ -142,18 +141,27 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             ]));
         }
         lines.push(Line::from(""));
-        lines.extend(pretty.lines().map(|l| Line::from(l.to_string())));
+        let key_paths = app.live_selected_key_paths();
+        let selected_path = if app.live_key_focus {
+            key_paths.get(app.live_key_index)
+        } else {
+            None
+        };
+        lines.extend(render_json_keypicker(
+            &sel.obj,
+            selected_path,
+            app.live_key_focus,
+            app.live_value_focus,
+            &app.event_filters.key_filter,
+        ));
         Text::from(lines)
     } else {
         Text::from("No event selected")
     };
+    let title = live_json_title(app, cols[1].width);
     let preview = Paragraph::new(preview_text)
         .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .title("Selected JSON")
-                .borders(Borders::ALL),
-        );
+        .block(Block::default().title(title).borders(Borders::ALL));
     frame.render_widget(preview, cols[1]);
 }
 
@@ -211,6 +219,38 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         cols[1],
     );
+}
+
+fn live_json_title(app: &App, pane_width: u16) -> Line<'static> {
+    if !app.live_key_focus {
+        return Line::from("selected JSON");
+    }
+    let narrow = pane_width < 56;
+    let hotkey = |label: &str| {
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    if narrow {
+        Line::from(vec![
+            Span::raw("selected JSON ("),
+            hotkey("↵"),
+            Span::raw(", "),
+            hotkey("t"),
+            Span::raw(")"),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw("selected JSON ("),
+            hotkey("↵"),
+            Span::raw(" apply filter, "),
+            hotkey("t"),
+            Span::raw(" jump type)"),
+        ])
+    }
 }
 
 fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -415,7 +455,6 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ));
         row.push(Span::raw("  "));
 
-
         row.push(Span::styled(
             if medium { "help (h)" } else { "h" },
             Style::default()
@@ -447,11 +486,8 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     frame.render_widget(
-        Paragraph::new(Text::from(text)).block(
-            Block::default()
-                .title("Input / Toggles")
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(Text::from(text))
+            .block(Block::default().title("Toggles").borders(Borders::ALL)),
         area,
     );
 }
@@ -513,8 +549,18 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     push_value(labels[0], key, !app.event_filters.key_filter.is_empty(), 0);
     push_value(labels[1], typ, !app.event_filters.type_filter.is_empty(), 1);
-    push_value(labels[2], fuzzy, !app.event_filters.fuzzy_filter.is_empty(), 2);
-    push_value(labels[3], exact, !app.event_filters.exact_filter.is_empty(), 3);
+    push_value(
+        labels[2],
+        fuzzy,
+        !app.event_filters.fuzzy_filter.is_empty(),
+        2,
+    );
+    push_value(
+        labels[3],
+        exact,
+        !app.event_filters.exact_filter.is_empty(),
+        3,
+    );
     row.push(Span::raw("  "));
     row.push(Span::styled("state:", Style::default().fg(Color::Gray)));
     if app.filters_suspended() {
@@ -575,9 +621,11 @@ fn draw_full_help(frame: &mut Frame<'_>) {
         Line::from("  m toggle action period"),
         Line::from("  f toggle follow"),
         Line::from("  up/down move cursor (disables follow)"),
+        Line::from("  right or enter focus key selection in selected-object pane"),
+        Line::from("  left returns from key selection to event list"),
         Line::from("  Home/End jump to top/bottom"),
         Line::from("  PageUp/PageDown move viewport and cursor (Ctrl+U / Ctrl+D also)"),
-        Line::from("  enter inspect selected event"),
+        Line::from("  with key focus: up/down select key, k apply key filter, t jump to type"),
         Line::from("  k/t//e set filters, c clear filters, y toggle filters on/off"),
         Line::from(""),
         Line::from("Periods"),
@@ -638,39 +686,229 @@ fn draw_inspector(frame: &mut Frame<'_>, inspector: &ObjectInspector, app: &App)
         rows[0],
     );
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(rows[1]);
-
-    let mut key_items = Vec::new();
-    for (idx, key) in inspector.key_paths.iter().enumerate() {
-        let sel = if idx == inspector.key_index { ">" } else { " " };
-        let style = if idx == inspector.key_index {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        key_items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!("{} {}", sel, key),
-            style,
-        )])));
-    }
-    frame.render_widget(
-        List::new(key_items).block(Block::default().title("Keys").borders(Borders::ALL)),
-        cols[0],
+    let selected_path = inspector.key_paths.get(inspector.key_index);
+    let lines = render_json_keypicker(
+        &inspector.event.obj,
+        selected_path,
+        true,
+        false,
+        &app.event_filters.key_filter,
     );
-
-    let obj =
-        serde_json::to_string_pretty(&inspector.event.obj).unwrap_or_else(|_| "{}".to_string());
     frame.render_widget(
-        Paragraph::new(obj)
+        Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
             .block(Block::default().title("Object").borders(Borders::ALL)),
-        cols[1],
+        rows[1],
     );
+}
+
+fn render_json_keypicker(
+    value: &serde_json::Value,
+    selected_path: Option<&String>,
+    _focused: bool,
+    value_focus: bool,
+    active_key_filter: &str,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    render_json_value_lines(
+        value,
+        "",
+        0,
+        true,
+        selected_path.map(|s| s.as_str()),
+        value_focus,
+        active_key_filter,
+        &mut lines,
+    );
+    lines
+}
+
+fn render_json_value_lines(
+    value: &serde_json::Value,
+    path: &str,
+    indent: usize,
+    is_last: bool,
+    selected_path: Option<&str>,
+    value_focus: bool,
+    active_key_filter: &str,
+    out: &mut Vec<Line<'static>>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            out.push(Line::from(format!("{}{{", "  ".repeat(indent))));
+            let len = map.len();
+            for (idx, (k, child)) in map.iter().enumerate() {
+                let key_path = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{}.{}", path, k)
+                };
+                let child_is_last = idx + 1 == len;
+                render_json_keyed_value_line(
+                    Some(k),
+                    child,
+                    &key_path,
+                    indent + 1,
+                    child_is_last,
+                    selected_path,
+                    value_focus,
+                    active_key_filter,
+                    out,
+                );
+            }
+            let tail = if is_last { "}" } else { "}," };
+            out.push(Line::from(format!("{}{}", "  ".repeat(indent), tail)));
+        }
+        serde_json::Value::Array(arr) => {
+            out.push(Line::from(format!("{}[", "  ".repeat(indent))));
+            for (idx, child) in arr.iter().enumerate() {
+                let child_is_last = idx + 1 == arr.len();
+                let child_path = if path.is_empty() {
+                    "[]".to_string()
+                } else {
+                    format!("{}[]", path)
+                };
+                render_json_keyed_value_line(
+                    None,
+                    child,
+                    &child_path,
+                    indent + 1,
+                    child_is_last,
+                    selected_path,
+                    value_focus,
+                    active_key_filter,
+                    out,
+                );
+            }
+            let tail = if is_last { "]" } else { "]," };
+            out.push(Line::from(format!("{}{}", "  ".repeat(indent), tail)));
+        }
+        _ => {
+            let value_text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+            let tail = if is_last { "" } else { "," };
+            out.push(Line::from(format!(
+                "{}{}{}",
+                "  ".repeat(indent),
+                value_text,
+                tail
+            )));
+        }
+    }
+}
+
+fn render_json_keyed_value_line(
+    key: Option<&str>,
+    value: &serde_json::Value,
+    path: &str,
+    indent: usize,
+    is_last: bool,
+    selected_path: Option<&str>,
+    value_focus: bool,
+    active_key_filter: &str,
+    out: &mut Vec<Line<'static>>,
+) {
+    let selected = selected_path == Some(path);
+    let filtered = !active_key_filter.is_empty() && active_key_filter == path;
+    let key_style = if selected {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else if filtered {
+        Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    };
+    let open_style = if selected {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if filtered {
+        Style::default().fg(Color::LightGreen)
+    } else {
+        Style::default()
+    };
+
+    let mut prefix = vec![Span::raw("  ".repeat(indent))];
+    if let Some(k) = key {
+        prefix.push(Span::styled(format!("\"{}\"", k), key_style));
+        prefix.push(Span::raw(": "));
+    }
+
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut open = prefix;
+            open.push(Span::styled("{", open_style));
+            out.push(Line::from(open));
+            let len = map.len();
+            for (idx, (k, child)) in map.iter().enumerate() {
+                let key_path = format!("{}.{}", path, k);
+                render_json_keyed_value_line(
+                    Some(k),
+                    child,
+                    &key_path,
+                    indent + 1,
+                    idx + 1 == len,
+                    selected_path,
+                    value_focus,
+                    active_key_filter,
+                    out,
+                );
+            }
+            let tail = if is_last { "}" } else { "}," };
+            out.push(Line::from(vec![
+                Span::raw("  ".repeat(indent)),
+                Span::styled(tail, open_style),
+            ]));
+        }
+        serde_json::Value::Array(arr) => {
+            let mut open = prefix;
+            open.push(Span::styled("[", open_style));
+            out.push(Line::from(open));
+            for (idx, child) in arr.iter().enumerate() {
+                let child_path = format!("{}[]", path);
+                render_json_keyed_value_line(
+                    None,
+                    child,
+                    &child_path,
+                    indent + 1,
+                    idx + 1 == arr.len(),
+                    selected_path,
+                    value_focus,
+                    active_key_filter,
+                    out,
+                );
+            }
+            let tail = if is_last { "]" } else { "]," };
+            out.push(Line::from(vec![
+                Span::raw("  ".repeat(indent)),
+                Span::styled(tail, open_style),
+            ]));
+        }
+        _ => {
+            let mut line = prefix;
+            let value_text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+            let value_style = if selected && value_focus {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else if selected {
+                Style::default().fg(Color::Yellow)
+            } else if filtered {
+                Style::default().fg(Color::LightGreen)
+            } else {
+                Style::default()
+            };
+            line.push(Span::styled(value_text, value_style));
+            if !is_last {
+                line.push(Span::raw(","));
+            }
+            out.push(Line::from(line));
+        }
+    }
 }
 
 fn render_event_line(

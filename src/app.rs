@@ -75,6 +75,9 @@ pub struct App {
     pub live_follow: bool,
     pub live_edge_until_center: bool,
     pub live_key_focus: bool,
+    pub live_value_focus: bool,
+    pub live_resume_follow_on_key_exit: bool,
+    pub return_to_live_object_on_types_esc: bool,
     pub live_key_index: usize,
     pub show_help_overlay: bool,
 
@@ -117,6 +120,9 @@ impl App {
             live_follow: true,
             live_edge_until_center: false,
             live_key_focus: false,
+            live_value_focus: false,
+            live_resume_follow_on_key_exit: false,
+            return_to_live_object_on_types_esc: false,
             live_key_index: 0,
             show_help_overlay: false,
 
@@ -332,24 +338,43 @@ impl App {
 
         match code {
             KeyCode::Char('q') => return true,
+            KeyCode::Esc if self.mode == UiMode::Live && self.live_key_focus => {
+                self.exit_live_key_focus();
+            }
             KeyCode::Char('h') | KeyCode::Char('?') => {
                 self.show_help_overlay = !self.show_help_overlay;
             }
             KeyCode::Char('1') => {
                 self.mode = UiMode::Live;
+                self.return_to_live_object_on_types_esc = false;
                 self.clamp_live_key_selection();
             }
             KeyCode::Char('2') => {
                 self.mode = UiMode::Periods;
-                self.live_key_focus = false;
+                self.return_to_live_object_on_types_esc = false;
+                self.exit_live_key_focus();
             }
             KeyCode::Char('3') => {
                 self.mode = UiMode::Types;
-                self.live_key_focus = false;
+                self.return_to_live_object_on_types_esc = false;
+                self.exit_live_key_focus();
             }
             KeyCode::Char('4') => {
                 self.mode = UiMode::Data;
-                self.live_key_focus = false;
+                self.return_to_live_object_on_types_esc = false;
+                self.exit_live_key_focus();
+            }
+            KeyCode::Esc
+                if self.mode == UiMode::Types && self.return_to_live_object_on_types_esc =>
+            {
+                self.mode = UiMode::Live;
+                self.return_to_live_object_on_types_esc = false;
+                self.live_key_focus = true;
+                self.live_value_focus = false;
+                self.clamp_live_indices();
+                self.ensure_live_selection_visible();
+                self.clamp_live_key_selection();
+                self.status = "Returned to selected JSON".to_string();
             }
             KeyCode::Char('m') => {
                 if self.model.toggle_period() {
@@ -366,6 +391,11 @@ impl App {
             }
 
             KeyCode::Char('f') if self.mode == UiMode::Live => {
+                if self.live_key_focus {
+                    self.status =
+                        "Exit key focus first (left or enter) to toggle follow".to_string();
+                    return false;
+                }
                 self.live_follow = !self.live_follow;
                 if self.live_follow {
                     self.live_edge_until_center = false;
@@ -388,7 +418,12 @@ impl App {
                 self.input_buffer = self.model.current_label.clone();
             }
             KeyCode::Char('k') if self.mode == UiMode::Live && self.live_key_focus => {
-                self.apply_live_selected_key_filter()
+                self.apply_live_selected_key_filter();
+            }
+            KeyCode::Char('e')
+                if self.mode == UiMode::Live && self.live_key_focus && self.live_value_focus =>
+            {
+                self.apply_live_selected_value_filter();
             }
             KeyCode::Char('k') if self.mode != UiMode::Types => {
                 self.start_event_filter_input(FilterField::Key)
@@ -433,6 +468,13 @@ impl App {
             KeyCode::PageDown => self.handle_navigation_intent(NavIntent::PageDown),
             KeyCode::Left => self.handle_navigation_intent(NavIntent::Left),
             KeyCode::Right => self.handle_navigation_intent(NavIntent::Right),
+            KeyCode::Enter if self.mode == UiMode::Live && self.live_key_focus => {
+                if self.live_value_focus {
+                    self.apply_live_selected_value_filter();
+                } else {
+                    self.apply_live_selected_key_filter();
+                }
+            }
             KeyCode::Enter if self.mode == UiMode::Live => self.toggle_live_key_focus(),
             KeyCode::Enter => self.open_selected_event(),
             KeyCode::Char(' ') => self.toggle_current_path(),
@@ -460,13 +502,14 @@ impl App {
                 }
             }
             KeyCode::Char('k') => {
-                if let Some(ins) = self.inspector.as_ref() {
-                    if let Some(path) = ins.key_paths.get(ins.key_index) {
-                        self.event_filters.key_filter = path.clone();
-                        self.mode = UiMode::Data;
-                        self.data_index = 0;
-                        self.status = format!("Applied key filter: {}", path);
-                    }
+                if let Some(path) = self
+                    .inspector
+                    .as_ref()
+                    .and_then(|ins| ins.key_paths.get(ins.key_index))
+                    .cloned()
+                {
+                    self.apply_key_filter_in_place(&path);
+                    self.inspector = None;
                 }
             }
             KeyCode::Char('t') => {
@@ -587,6 +630,7 @@ impl App {
             match intent {
                 NavIntent::LineUp => {
                     self.live_key_index = self.live_key_index.saturating_sub(1);
+                    self.live_value_focus = false;
                     return;
                 }
                 NavIntent::LineDown => {
@@ -594,15 +638,27 @@ impl App {
                     if self.live_key_index + 1 < keys.len() {
                         self.live_key_index += 1;
                     }
+                    self.live_value_focus = false;
                     return;
                 }
                 NavIntent::Left => {
-                    self.live_key_focus = false;
+                    if self.live_value_focus {
+                        self.live_value_focus = false;
+                        return;
+                    }
+                    self.exit_live_key_focus();
                     return;
                 }
-                NavIntent::Right => return,
+                NavIntent::Right => {
+                    if self.selected_live_value_token().is_some() {
+                        self.live_value_focus = true;
+                    } else {
+                        self.status = "Selected path has no value".to_string();
+                    }
+                    return;
+                }
                 NavIntent::PageUp | NavIntent::PageDown | NavIntent::Home | NavIntent::End => {
-                    self.live_key_focus = false;
+                    self.exit_live_key_focus();
                 }
             }
         }
@@ -625,12 +681,16 @@ impl App {
             NavIntent::Home => 0,
             NavIntent::End => total.saturating_sub(1),
             NavIntent::Left => {
-                self.live_key_focus = false;
+                self.exit_live_key_focus();
                 return;
             }
             NavIntent::Right => {
                 let has_keys = !self.live_selected_key_paths().is_empty();
-                self.live_key_focus = has_keys;
+                if has_keys {
+                    self.enter_live_key_focus();
+                } else {
+                    self.live_key_focus = false;
+                }
                 if !has_keys {
                     self.status = "Selected event has no keys".to_string();
                 }
@@ -798,27 +858,127 @@ impl App {
             self.live_key_focus = false;
             return;
         }
-        self.live_key_focus = !self.live_key_focus;
-        self.status = if self.live_key_focus {
-            "Live JSON keys focus: ON (up/down select key, k apply filter)".to_string()
+        let next = !self.live_key_focus;
+        if next {
+            self.enter_live_key_focus();
+            self.status = "Live JSON keys focus: ON".to_string()
         } else {
-            "Live JSON keys focus: OFF".to_string()
+            self.exit_live_key_focus();
+            self.status = "Live JSON keys focus: OFF".to_string()
         };
+    }
+
+    fn enter_live_key_focus(&mut self) {
+        if !self.live_key_focus {
+            self.live_resume_follow_on_key_exit = self.live_follow;
+            self.live_follow = false;
+        }
+        self.live_key_focus = true;
+        self.live_value_focus = false;
     }
 
     fn apply_live_selected_key_filter(&mut self) {
         let keys = self.live_selected_key_paths();
         if let Some(path) = keys.get(self.live_key_index) {
-            self.event_filters.key_filter = path.clone();
-            self.stashed_event_filters = None;
-            self.mode = UiMode::Data;
-            self.data_index = 0;
-            self.period_event_index = 0;
-            self.live_event_index = 0;
-            self.live_key_focus = false;
-            self.refresh_live_position();
+            self.apply_key_filter_in_place(path);
+        }
+    }
+
+    fn exit_live_key_focus(&mut self) {
+        let was_focus = self.live_key_focus;
+        self.live_key_focus = false;
+        self.live_value_focus = false;
+        if was_focus && self.live_resume_follow_on_key_exit {
+            self.live_resume_follow_on_key_exit = false;
+            self.live_follow = true;
+            self.live_edge_until_center = false;
+            self.pin_live_to_latest();
+        } else {
+            self.live_resume_follow_on_key_exit = false;
+        }
+    }
+
+    fn apply_key_filter_in_place(&mut self, path: &str) {
+        let selected_anchor = if self.mode == UiMode::Live {
+            self.live_anchor_at(self.live_event_index)
+        } else {
+            None
+        };
+        if self.event_filters.key_filter == path {
+            self.event_filters.key_filter.clear();
+            self.status = format!("Removed key filter: {}", path);
+        } else {
+            self.event_filters.key_filter = path.to_string();
             self.status = format!("Applied key filter: {}", path);
         }
+        self.stashed_event_filters = None;
+        match self.mode {
+            UiMode::Live => {
+                self.refresh_live_position();
+                if let Some(anchor) = selected_anchor.as_ref() {
+                    if let Some(idx) = self.find_live_index(anchor) {
+                        self.live_event_index = idx;
+                        self.ensure_live_selection_visible();
+                    }
+                }
+                self.clamp_live_key_selection();
+            }
+            UiMode::Periods => {
+                let n = self.visible_period_events().len();
+                if n == 0 {
+                    self.period_event_index = 0;
+                } else {
+                    self.period_event_index = self.period_event_index.min(n.saturating_sub(1));
+                }
+            }
+            UiMode::Data => {
+                let n = self.model.filtered_events(&self.event_filters).len();
+                if n == 0 {
+                    self.data_index = 0;
+                } else {
+                    self.data_index = self.data_index.min(n.saturating_sub(1));
+                }
+            }
+            UiMode::Types => {}
+        }
+    }
+
+    fn apply_live_selected_value_filter(&mut self) {
+        let selected_anchor = self.live_anchor_at(self.live_event_index);
+        let keys = self.live_selected_key_paths();
+        let Some(path) = keys.get(self.live_key_index) else {
+            return;
+        };
+        let Some(token) = self.selected_live_value_token() else {
+            self.status = "Selected path has no value".to_string();
+            return;
+        };
+        let exact = format!("{}={}", path, token);
+        if self.event_filters.exact_filter == exact {
+            self.event_filters.exact_filter.clear();
+            self.status = format!("Removed exact filter: {}", exact);
+        } else {
+            self.event_filters.exact_filter = exact.clone();
+            self.status = format!("Applied exact filter: {}", exact);
+        }
+        self.stashed_event_filters = None;
+        self.refresh_live_position();
+        if let Some(anchor) = selected_anchor.as_ref() {
+            if let Some(idx) = self.find_live_index(anchor) {
+                self.live_event_index = idx;
+                self.ensure_live_selection_visible();
+            }
+        }
+        self.clamp_live_key_selection();
+    }
+
+    fn selected_live_value_token(&self) -> Option<String> {
+        let event = self.live_selected_event()?;
+        let key = self
+            .live_selected_key_paths()
+            .get(self.live_key_index)?
+            .clone();
+        value_at_path(&event.obj, &key).map(value_token)
     }
 
     fn jump_to_live_selected_event_type(&mut self) {
@@ -832,6 +992,8 @@ impl App {
             self.type_index = idx;
             self.path_index = 0;
             self.live_key_focus = false;
+            self.live_value_focus = false;
+            self.return_to_live_object_on_types_esc = true;
             self.status = format!("Jumped to type {}", type_name);
         }
     }
@@ -1122,6 +1284,35 @@ impl App {
             let type_id = type_id.clone();
             self.model.toggle_known_unrelated_type(&type_id);
         }
+    }
+}
+
+fn value_at_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut cur = v;
+    for part in path.split('.') {
+        if part.ends_with("[]") {
+            let key = &part[..part.len().saturating_sub(2)];
+            cur = cur.get(key)?;
+            if let Value::Array(arr) = cur {
+                cur = arr.first()?;
+            } else {
+                return None;
+            }
+        } else {
+            cur = cur.get(part)?;
+        }
+    }
+    Some(cur)
+}
+
+fn value_token(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => format!("b:{}", b),
+        Value::Number(n) => format!("n:{}", n),
+        Value::String(s) => format!("s:{}", s),
+        Value::Array(_) => "array".to_string(),
+        Value::Object(_) => "object".to_string(),
     }
 }
 
