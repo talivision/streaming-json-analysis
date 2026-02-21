@@ -11,13 +11,11 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
     LeaveAlternateScreen,
 };
-use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 use serde_json::Value;
 use std::io::stdout;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -204,21 +202,6 @@ impl App {
         let backend = CrosstermBackend::new(out);
         let mut terminal = Terminal::new(backend)?;
 
-        let stream_path = self.reader.path().to_path_buf();
-        let mut _watcher = None;
-        let mut watch_rx = None;
-        if !self.offline {
-            match setup_stream_watcher(&stream_path) {
-                Ok((w, rx)) => {
-                    _watcher = Some(w);
-                    watch_rx = Some(rx);
-                }
-                Err(err) => {
-                    self.status = format!("Watcher unavailable ({err}); using fallback polling");
-                }
-            }
-        }
-
         let mut last_poll = Instant::now() - LIVE_FALLBACK_POLL_INTERVAL;
         let mut last_live_recompute = Instant::now();
 
@@ -230,32 +213,6 @@ impl App {
                 if !self.offline || !self.offline_loaded {
                     let mut should_poll = self.offline && !self.offline_loaded;
                     if !self.offline {
-                        let mut watcher_disconnected = false;
-                        if let Some(rx) = watch_rx.as_mut() {
-                            loop {
-                                match rx.try_recv() {
-                                    Ok(Ok(ev)) => {
-                                        if should_poll_from_watch_event(&ev, &stream_path) {
-                                            should_poll = true;
-                                        }
-                                    }
-                                    Ok(Err(err)) => {
-                                        self.status = format!("Watcher error: {err}");
-                                    }
-                                    Err(TryRecvError::Empty) => break,
-                                    Err(TryRecvError::Disconnected) => {
-                                        watcher_disconnected = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if watcher_disconnected {
-                            watch_rx = None;
-                            _watcher = None;
-                            self.status =
-                                "Watcher disconnected; using fallback polling".to_string();
-                        }
                         if last_poll.elapsed() >= LIVE_FALLBACK_POLL_INTERVAL {
                             should_poll = true;
                         }
@@ -697,8 +654,6 @@ impl App {
             // When leaving follow, keep context from the stream head first, then converge to centered.
             self.live_view_start = self.live_event_index.saturating_sub(10);
             self.live_edge_until_center = true;
-        } else {
-            self.live_edge_until_center = false;
         }
 
         self.clamp_live_indices();
@@ -1139,63 +1094,6 @@ fn normalize_navigation_code(key: KeyEvent) -> KeyCode {
             KeyCode::PageDown
         }
         _ => key.code,
-    }
-}
-
-fn setup_stream_watcher(
-    stream_path: &Path,
-) -> Result<(RecommendedWatcher, Receiver<notify::Result<notify::Event>>)> {
-    let (tx, rx) = mpsc::channel();
-    let mut watcher = RecommendedWatcher::new(
-        move |res| {
-            let _ = tx.send(res);
-        },
-        Config::default(),
-    )?;
-
-    let target = if stream_path.exists() {
-        stream_path.to_path_buf()
-    } else {
-        nearest_existing_ancestor(stream_path)
-    };
-    watcher.watch(&target, RecursiveMode::NonRecursive)?;
-    Ok((watcher, rx))
-}
-
-fn nearest_existing_ancestor(path: &Path) -> PathBuf {
-    for ancestor in path.ancestors() {
-        if ancestor.exists() {
-            return ancestor.to_path_buf();
-        }
-    }
-    PathBuf::from(".")
-}
-
-fn should_poll_from_watch_event(ev: &notify::Event, stream_path: &Path) -> bool {
-    let stream_name = stream_path.file_name();
-    let stream_parent = stream_path.parent();
-    let touches_stream = ev.paths.is_empty()
-        || ev.paths.iter().any(|p| {
-            if p == stream_path {
-                return true;
-            }
-            if p.file_name() != stream_name {
-                return false;
-            }
-            match (p.parent(), stream_parent) {
-                (Some(p_parent), Some(s_parent)) => p_parent == s_parent,
-                _ => false,
-            }
-        });
-    if !touches_stream {
-        return false;
-    }
-
-    match ev.kind {
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any => {
-            true
-        }
-        EventKind::Access(_) | EventKind::Other => false,
     }
 }
 
