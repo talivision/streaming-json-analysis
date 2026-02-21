@@ -87,7 +87,6 @@ In the source terminal, use single-key triggers:
 All event-list modes (`Live`, `Periods`, `Data`):
 
 - `enter`: open object inspector
-- `a`: cycle anomaly display (`snapshot` -> `snapshot+live` -> `live`)
 - `g`: toggle rate boundary display (`point` / `interval`)
 - `k`: edit key filter
 - `t`: edit type filter

@@ -15,8 +15,6 @@ pub struct EventRecord {
     pub keys: Vec<String>,
     pub action_period_id: Option<u64>,
     pub in_action_period: bool,
-    pub rate_score: f64,
-    pub uniq_score: f64,
     pub live_rate_score: f64,
     pub live_rate_low: f64,
     pub live_rate_high: f64,
@@ -220,8 +218,6 @@ impl AnalyzerModel {
             keys,
             action_period_id: active_period_id,
             in_action_period,
-            rate_score: rate,
-            uniq_score: uniq,
             live_rate_score: rate,
             live_rate_low: rate,
             live_rate_high: rate,
@@ -249,14 +245,13 @@ impl AnalyzerModel {
         }
         for (idx, rate, rate_low, rate_high, uniq) in updates {
             if let Some(e) = self.events.get_mut(idx) {
-                e.live_rate_score = rate.max(e.rate_score);
-                let floor = e.rate_score;
-                e.live_rate_low = rate_low.max(floor);
-                e.live_rate_high = rate_high.max(floor);
+                e.live_rate_score = rate;
+                e.live_rate_low = rate_low;
+                e.live_rate_high = rate_high;
                 if e.live_rate_high < e.live_rate_low {
                     e.live_rate_high = e.live_rate_low;
                 }
-                e.live_uniq_score = uniq.max(e.uniq_score);
+                e.live_uniq_score = uniq;
             }
         }
     }

@@ -1,4 +1,4 @@
-use crate::app::{AnomalyViewMode, App, ObjectInspector, RateBoundaryViewMode};
+use crate::app::{App, ObjectInspector, RateBoundaryViewMode};
 use crate::domain::{EventRecord, FilterField, PathOverride};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -125,48 +125,26 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let value_color = value_anomaly_color(value_norm);
         let rate_color = rate_anomaly_color(rate_norm);
         if sel.in_action_period {
-            if app.anomaly_view == AnomalyViewMode::Both {
-                lines.push(Line::from(vec![
-                    Span::styled("value anomaly snap/live ", Style::default().fg(Color::Gray)),
-                    Span::styled(
-                        format!("{:.2}/{:.2}", sel.uniq_score, sel.live_uniq_score),
-                        Style::default()
-                            .fg(value_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled("rate anomaly snap/live ", Style::default().fg(Color::Gray)),
-                    Span::styled(
-                        match app.rate_view {
-                            RateBoundaryViewMode::Point => {
-                                format!("{:.2}/{:.2}", sel.rate_score, sel.live_rate_score)
-                            }
-                            RateBoundaryViewMode::Interval => format!(
-                                "{:.2}/[{:.2}..{:.2}]",
-                                sel.rate_score, sel.live_rate_low, sel.live_rate_high
-                            ),
-                        },
-                        Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-            } else {
-                lines.push(Line::from(vec![
-                    Span::styled("value anomaly ", Style::default().fg(Color::Gray)),
-                    Span::styled(
-                        format!("{:.2}", show_uniq),
-                        Style::default()
-                            .fg(value_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                    Span::styled("rate anomaly ", Style::default().fg(Color::Gray)),
-                    Span::styled(
-                        format!("{:.2}", show_rate),
-                        Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-            }
+            lines.push(Line::from(vec![
+                Span::styled("value anomaly ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{:.2}", show_uniq),
+                    Style::default()
+                        .fg(value_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled("rate anomaly ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    match app.rate_view {
+                        RateBoundaryViewMode::Point => format!("{:.2}", show_rate),
+                        RateBoundaryViewMode::Interval => {
+                            format!("[{:.2}..{:.2}]", sel.live_rate_low, sel.live_rate_high)
+                        }
+                    },
+                    Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
         }
         lines.push(Line::from(""));
         lines.extend(pretty.lines().map(|l| Line::from(l.to_string())));
@@ -443,20 +421,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         row.push(Span::raw("  "));
 
         row.push(Span::styled(
-            if medium { "anomaly (a)" } else { "a" },
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-        row.push(Span::raw(":"));
-        row.push(Span::styled(
-            app.anomaly_view.label(),
-            Style::default().fg(Color::Cyan),
-        ));
-        row.push(Span::raw("  "));
-
-        row.push(Span::styled(
-            if medium { "rate (g)" } else { "g" },
+            if medium { "boundary (g)" } else { "g" },
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -671,7 +636,7 @@ fn draw_full_help(frame: &mut Frame<'_>) {
 
     let body = vec![
         Line::from("Global"),
-        Line::from("  q quit | h/? help | 1 Live | 2 Periods | 3 Types | 4 Data | a anomaly view | g rate view"),
+        Line::from("  q quit | h/? help | 1 Live | 2 Periods | 3 Types | 4 Data | g rate boundary"),
         Line::from(""),
         Line::from("Live"),
         Line::from("  m toggle action period"),
@@ -803,37 +768,15 @@ fn render_event_line(
     let show_metrics = e.in_action_period;
     let (show_uniq, show_rate) = displayed_anomaly_scores(app, e);
     let (rate_text, value_text, tail_len) = if show_metrics {
-        let (rate_snap_text, rate_live_text, value_snap_text, value_live_text) = (
-            format!("{:>5.2}", e.rate_score),
-            format!("{:>5.2}", e.live_rate_score),
-            format!("{:>5.2}", e.uniq_score),
-            format!("{:>5.2}", e.live_uniq_score),
-        );
-        match app.anomaly_view {
-            AnomalyViewMode::Both => {
-                let live_rate_text = match app.rate_view {
-                    RateBoundaryViewMode::Point => rate_live_text,
-                    RateBoundaryViewMode::Interval => {
-                        format!("[{:>4.2}..{:>4.2}]", e.live_rate_low, e.live_rate_high)
-                    }
-                };
-                let rate_text = format!("{}/{}", rate_snap_text, live_rate_text);
-                let value_text = format!("{}/{}", value_snap_text, value_live_text);
-                let tail_len = 2 + 2 + rate_text.chars().count() + 3 + value_text.chars().count();
-                (Some(rate_text), Some(value_text), tail_len)
+        let rate_live_text = match app.rate_view {
+            RateBoundaryViewMode::Point => format!("{:>5.2}", e.live_rate_score),
+            RateBoundaryViewMode::Interval => {
+                format!("[{:>4.2}..{:>4.2}]", e.live_rate_low, e.live_rate_high)
             }
-            _ => {
-                let rate_live_text = match app.rate_view {
-                    RateBoundaryViewMode::Point => rate_live_text,
-                    RateBoundaryViewMode::Interval => {
-                        format!("[{:>4.2}..{:>4.2}]", e.live_rate_low, e.live_rate_high)
-                    }
-                };
-                let tail_len =
-                    2 + 2 + rate_live_text.chars().count() + 3 + value_live_text.chars().count();
-                (Some(rate_live_text), Some(value_live_text), tail_len)
-            }
-        }
+        };
+        let value_live_text = format!("{:>5.2}", e.live_uniq_score);
+        let tail_len = 2 + 2 + rate_live_text.chars().count() + 3 + value_live_text.chars().count();
+        (Some(rate_live_text), Some(value_live_text), tail_len)
     } else {
         (None, None, 0)
     };
@@ -960,14 +903,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn displayed_anomaly_scores(app: &App, e: &EventRecord) -> (f64, f64) {
-    match app.anomaly_view {
-        AnomalyViewMode::Snapshot => (e.uniq_score, e.rate_score),
-        AnomalyViewMode::Both | AnomalyViewMode::Recomputed => {
-            let rate = match app.rate_view {
-                RateBoundaryViewMode::Point => e.live_rate_score,
-                RateBoundaryViewMode::Interval => 0.5 * (e.live_rate_low + e.live_rate_high),
-            };
-            (e.live_uniq_score, rate)
-        }
-    }
+    let rate = match app.rate_view {
+        RateBoundaryViewMode::Point => e.live_rate_score,
+        RateBoundaryViewMode::Interval => 0.5 * (e.live_rate_low + e.live_rate_high),
+    };
+    (e.live_uniq_score, rate)
 }

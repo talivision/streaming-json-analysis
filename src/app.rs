@@ -40,13 +40,6 @@ pub struct LiveRenderData<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnomalyViewMode {
-    Snapshot,
-    Both,
-    Recomputed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateBoundaryViewMode {
     Point,
     Interval,
@@ -64,24 +57,6 @@ impl RateBoundaryViewMode {
         match self {
             Self::Point => "point",
             Self::Interval => "interval",
-        }
-    }
-}
-
-impl AnomalyViewMode {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Snapshot => Self::Both,
-            Self::Both => Self::Recomputed,
-            Self::Recomputed => Self::Snapshot,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Snapshot => "snapshot",
-            Self::Both => "snapshot+live",
-            Self::Recomputed => "live",
         }
     }
 }
@@ -122,7 +97,6 @@ pub struct App {
     pub live_follow: bool,
     pub live_edge_until_center: bool,
     pub show_help_overlay: bool,
-    pub anomaly_view: AnomalyViewMode,
     pub rate_view: RateBoundaryViewMode,
     pub offline: bool,
     pub status: String,
@@ -163,7 +137,6 @@ impl App {
             live_follow: true,
             live_edge_until_center: false,
             show_help_overlay: false,
-            anomaly_view: AnomalyViewMode::Recomputed,
             rate_view: RateBoundaryViewMode::Point,
             offline,
             status: if offline {
@@ -397,13 +370,9 @@ impl App {
                             .to_string();
                 }
             }
-            KeyCode::Char('a') => {
-                self.anomaly_view = self.anomaly_view.next();
-                self.status = format!("Anomaly view: {}", self.anomaly_view.label());
-            }
             KeyCode::Char('g') => {
                 self.rate_view = self.rate_view.next();
-                self.status = format!("Rate boundary view: {}", self.rate_view.label());
+                self.status = format!("Rate boundary: {}", self.rate_view.label());
             }
             KeyCode::Char('f') if self.mode == UiMode::Live => {
                 self.live_follow = !self.live_follow;
