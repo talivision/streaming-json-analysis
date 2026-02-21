@@ -1,5 +1,5 @@
-use crate::app::{AnomalyViewMode, App, ObjectInspector};
-use crate::domain::{EventRecord, FilterField, PathOverride, TypeCorrelation};
+use crate::app::{AnomalyViewMode, App, ObjectInspector, RateBoundaryViewMode};
+use crate::domain::{EventRecord, FilterField, PathOverride};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -61,8 +61,16 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, mode: UiMode) {
         UiMode::Data => 3,
     };
     let tabs = Tabs::new(titles)
-        .block(Block::default().title("JSON Analyzer").borders(Borders::ALL))
-        .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .block(
+            Block::default()
+                .title("JSON Analyzer")
+                .borders(Borders::ALL),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
         .select(selected);
     frame.render_widget(tabs, area);
 }
@@ -70,15 +78,10 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, mode: UiMode) {
 fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(area);
 
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-        .split(cols[0]);
-
-    let list_rows = left[0].height.saturating_sub(2) as usize;
+    let list_rows = cols[0].height.saturating_sub(2) as usize;
     app.set_live_window_rows(list_rows);
     let live = app.live_render_data_for_window(list_rows);
     let selected_visible = if live.rows.is_empty() {
@@ -87,7 +90,7 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         live.selected_visible.or(Some(0))
     };
     let mut items = Vec::new();
-    let stream_inner_width = left[0].width.saturating_sub(2) as usize;
+    let stream_inner_width = cols[0].width.saturating_sub(2) as usize;
     for (idx, e) in live.rows.iter().enumerate() {
         let selected = Some(idx) == selected_visible;
         items.push(ListItem::new(render_event_line(
@@ -98,20 +101,23 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         )));
     }
 
-    let live_title = if app.live_follow {
-        "Events (FOLLOW ON - auto-scrolling, press f to freeze)"
-    } else {
-        "Events (FOLLOW OFF - frozen, arrows/PageUp/PageDown inspect history)"
-    };
-    let stream = List::new(items)
-        .block(Block::default().title(live_title).borders(Borders::ALL));
-    frame.render_widget(stream, left[0]);
+    let live_title = format!(
+        "Events  row {}/{}  objects {}  types {}",
+        app.live_event_index.saturating_add(1),
+        live.total,
+        app.model.total_objects(),
+        app.model.types.len()
+    );
+    let stream = List::new(items).block(Block::default().title(live_title).borders(Borders::ALL));
+    frame.render_widget(stream, cols[0]);
 
     let preview_text = if let Some(sel) = live.selected {
         let pretty = serde_json::to_string_pretty(&sel.obj).unwrap_or_else(|_| "{}".to_string());
         let mut lines = vec![Line::from(Span::styled(
             app.model.type_display_name(&sel.type_id),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ))];
         let (show_uniq, show_rate) = displayed_anomaly_scores(app, sel);
         let value_norm = value_anomaly_norm(show_uniq);
@@ -124,13 +130,23 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     Span::styled("value anomaly snap/live ", Style::default().fg(Color::Gray)),
                     Span::styled(
                         format!("{:.2}/{:.2}", sel.uniq_score, sel.live_uniq_score),
-                        Style::default().fg(value_color).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(value_color)
+                            .add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("rate anomaly snap/live ", Style::default().fg(Color::Gray)),
                     Span::styled(
-                        format!("{:.2}/{:.2}", sel.rate_score, sel.live_rate_score),
+                        match app.rate_view {
+                            RateBoundaryViewMode::Point => {
+                                format!("{:.2}/{:.2}", sel.rate_score, sel.live_rate_score)
+                            }
+                            RateBoundaryViewMode::Interval => format!(
+                                "{:.2}/[{:.2}..{:.2}]",
+                                sel.rate_score, sel.live_rate_low, sel.live_rate_high
+                            ),
+                        },
                         Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
                     ),
                 ]));
@@ -139,7 +155,9 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     Span::styled("value anomaly ", Style::default().fg(Color::Gray)),
                     Span::styled(
                         format!("{:.2}", show_uniq),
-                        Style::default().fg(value_color).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(value_color)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("  "),
                     Span::styled("rate anomaly ", Style::default().fg(Color::Gray)),
@@ -158,50 +176,12 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     };
     let preview = Paragraph::new(preview_text)
         .wrap(Wrap { trim: false })
-        .block(Block::default().title("Selected JSON (no enter needed)").borders(Borders::ALL));
-    frame.render_widget(preview, left[1]);
-
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(6)])
-        .split(cols[1]);
-
-    let action_text = if let Some(p) = app.model.active_period() {
-        format!("action: {} #{} (active)", p.label, p.id)
-    } else {
-        format!("action: idle | label={}", app.model.current_label)
-    };
-    let stat = Paragraph::new(Text::from(vec![
-        Line::from(format!("objects: {}", app.model.total_objects())),
-        Line::from(format!("types: {}", app.model.types.len())),
-        Line::from(action_text),
-        Line::from(format!(
-            "FOLLOW: {} (f)",
-            if app.live_follow { "ON" } else { "OFF" }
-        )),
-        Line::from(format!(
-            "row: {}/{}",
-            app.live_event_index.saturating_add(1),
-            live.total
-        )),
-        Line::from(format!(
-            "view: {}-{}",
-            app.live_view_start.saturating_add(1),
-            (app.live_view_start + live.rows.len()).max(app.live_view_start)
-        )),
-        Line::from(format!("filters active: {}", app.event_filters.active_count())),
-    ]))
-    .block(Block::default().title("Session").borders(Borders::ALL));
-    frame.render_widget(stat, right[0]);
-
-    let corrs = render_correlations(
-        &app.model.correlations,
-        app.corr_index,
-        &app.model.known_unrelated_pairs,
-        app,
-    );
-    let corr_widget = List::new(corrs).block(Block::default().title("Correlations").borders(Borders::ALL));
-    frame.render_widget(corr_widget, right[1]);
+        .block(
+            Block::default()
+                .title("Selected JSON")
+                .borders(Borders::ALL),
+        );
+    frame.render_widget(preview, cols[1]);
 }
 
 fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -215,10 +195,17 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App) {
     for (idx, p) in periods.iter().enumerate() {
         let sel = if idx == app.periods_index { ">" } else { " " };
         let dur = p.end.unwrap_or(p.start) - p.start;
-        p_items.push(ListItem::new(format!("{} #{} {} ({:.2}s)", sel, p.id, p.label, dur)));
+        p_items.push(ListItem::new(format!(
+            "{} #{} {} ({:.2}s)",
+            sel, p.id, p.label, dur
+        )));
     }
     frame.render_widget(
-        List::new(p_items).block(Block::default().title("All Action Periods").borders(Borders::ALL)),
+        List::new(p_items).block(
+            Block::default()
+                .title("All Action Periods")
+                .borders(Borders::ALL),
+        ),
         cols[0],
     );
 
@@ -244,7 +231,11 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     }
     frame.render_widget(
-        List::new(rows).block(Block::default().title("Events in Selected Period").borders(Borders::ALL)),
+        List::new(rows).block(
+            Block::default()
+                .title("Events in Selected Period")
+                .borders(Borders::ALL),
+        ),
         cols[1],
     );
 }
@@ -285,12 +276,19 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         let name = app.model.type_display_name(type_id.as_str());
         type_items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!("{}  count={}  r={:.2} u={:.2}", name, tp.count, tp.latest_rate, tp.latest_uniq),
+            format!(
+                "{}  count={}  r={:.2} u={:.2}",
+                name, tp.count, tp.latest_rate, tp.latest_uniq
+            ),
             style,
         )])));
     }
     frame.render_widget(
-        List::new(type_items).block(Block::default().title("Types (filtered)").borders(Borders::ALL)),
+        List::new(type_items).block(
+            Block::default()
+                .title("Types (filtered)")
+                .borders(Borders::ALL),
+        ),
         cols[0],
     );
 
@@ -298,11 +296,18 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some((type_id, tp)) = visible.get(app.type_index) {
         lines.push(Line::from(Span::styled(
             app.model.type_display_name(type_id.as_str()),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(format!("id: {}", type_id)));
-        lines.push(Line::from(format!("paths considered: {}", tp.considered_paths.len())));
-        lines.push(Line::from("Legend: [AUTO ON] [AUTO OFF] [FORCED ON] [FORCED OFF]"));
+        lines.push(Line::from(format!(
+            "paths considered: {}",
+            tp.considered_paths.len()
+        )));
+        lines.push(Line::from(
+            "Legend: [AUTO ON] [AUTO OFF] [FORCED ON] [FORCED OFF]",
+        ));
         lines.push(Line::from("space cycles: auto -> forced off/on -> auto"));
         lines.push(Line::from(""));
 
@@ -373,13 +378,18 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: true })
-            .block(Block::default().title("Data Explorer").borders(Borders::ALL)),
+            .block(
+                Block::default()
+                    .title("Data Explorer")
+                    .borders(Borders::ALL),
+            ),
         area,
     );
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut text = Vec::new();
+    let inner_width = area.width.saturating_sub(2) as usize;
     if app.input_mode != InputMode::None {
         let title = match app.input_mode {
             InputMode::None => "",
@@ -394,36 +404,49 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]));
     } else {
         let mut row = Vec::new();
-        let inner_width = area.width.saturating_sub(2) as usize;
         let action_on = app.model.active_period().is_some();
         let filters_active = app.event_filters.active_count();
         let medium = inner_width >= 95;
 
         row.push(Span::styled(
             if medium { "action (m)" } else { "m" },
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
         row.push(Span::raw(":"));
         row.push(Span::styled(
             if action_on { "ON" } else { "OFF" },
-            Style::default().fg(if action_on { Color::LightGreen } else { Color::DarkGray }),
+            Style::default().fg(if action_on {
+                Color::LightGreen
+            } else {
+                Color::DarkGray
+            }),
         ));
         row.push(Span::raw("  "));
 
         row.push(Span::styled(
             if medium { "follow (f)" } else { "f" },
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
         row.push(Span::raw(":"));
         row.push(Span::styled(
             if app.live_follow { "ON" } else { "OFF" },
-            Style::default().fg(if app.live_follow { Color::LightGreen } else { Color::DarkGray }),
+            Style::default().fg(if app.live_follow {
+                Color::LightGreen
+            } else {
+                Color::DarkGray
+            }),
         ));
         row.push(Span::raw("  "));
 
         row.push(Span::styled(
             if medium { "anomaly (a)" } else { "a" },
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
         row.push(Span::raw(":"));
         row.push(Span::styled(
@@ -433,32 +456,54 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         row.push(Span::raw("  "));
 
         row.push(Span::styled(
-            if medium { "help (h)" } else { "h" },
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            if medium { "rate (g)" } else { "g" },
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
         row.push(Span::raw(":"));
         row.push(Span::styled(
-            "show",
-            Style::default().fg(Color::Gray),
+            app.rate_view.label(),
+            Style::default().fg(Color::Cyan),
         ));
         row.push(Span::raw("  "));
 
         row.push(Span::styled(
+            if medium { "help (h)" } else { "h" },
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        row.push(Span::raw(":"));
+        row.push(Span::styled("show", Style::default().fg(Color::Gray)));
+        row.push(Span::raw("  "));
+
+        row.push(Span::styled(
             if medium { "filters (y)" } else { "y" },
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
         row.push(Span::raw(":"));
         let filters_on = !app.filters_suspended() && filters_active > 0;
         row.push(Span::styled(
             if filters_on { "ON" } else { "OFF" },
-            Style::default().fg(if filters_on { Color::LightGreen } else { Color::DarkGray }),
+            Style::default().fg(if filters_on {
+                Color::LightGreen
+            } else {
+                Color::DarkGray
+            }),
         ));
 
         text.push(Line::from(row));
     }
 
     frame.render_widget(
-        Paragraph::new(Text::from(text)).block(Block::default().title("Input / Toggles").borders(Borders::ALL)),
+        Paragraph::new(Text::from(text)).block(
+            Block::default()
+                .title("Input / Toggles")
+                .borders(Borders::ALL),
+        ),
         area,
     );
 }
@@ -494,25 +539,57 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let mut row = vec![
         Span::styled("set ", Style::default().fg(Color::Gray)),
-        Span::styled("k", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "k",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" key  ", Style::default().fg(Color::Gray)),
-        Span::styled("t", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "t",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" type  ", Style::default().fg(Color::Gray)),
-        Span::styled("/", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "/",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" fuzzy  ", Style::default().fg(Color::Gray)),
-        Span::styled("e", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "e",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" exact  ", Style::default().fg(Color::Gray)),
-        Span::styled("c", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "c",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" clear", Style::default().fg(Color::Gray)),
         Span::raw("  "),
         Span::styled("state:", Style::default().fg(Color::Gray)),
     ];
     if app.filters_suspended() {
-        row.push(Span::styled("suspended", Style::default().fg(Color::Yellow)));
+        row.push(Span::styled(
+            "suspended",
+            Style::default().fg(Color::Yellow),
+        ));
     } else {
         row.push(Span::styled(
             format!("active:{}/4", filters_active),
-            Style::default().fg(if filters_active > 0 { Color::LightGreen } else { Color::DarkGray }),
+            Style::default().fg(if filters_active > 0 {
+                Color::LightGreen
+            } else {
+                Color::DarkGray
+            }),
         ));
     }
 
@@ -521,25 +598,41 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         row.push(Span::styled("k=", Style::default().fg(Color::Yellow)));
         row.push(Span::styled(
             key,
-            Style::default().fg(if app.event_filters.key_filter.is_empty() { Color::DarkGray } else { Color::LightGreen }),
+            Style::default().fg(if app.event_filters.key_filter.is_empty() {
+                Color::DarkGray
+            } else {
+                Color::LightGreen
+            }),
         ));
         row.push(Span::raw("  "));
         row.push(Span::styled("t=", Style::default().fg(Color::Yellow)));
         row.push(Span::styled(
             typ,
-            Style::default().fg(if app.event_filters.type_filter.is_empty() { Color::DarkGray } else { Color::LightGreen }),
+            Style::default().fg(if app.event_filters.type_filter.is_empty() {
+                Color::DarkGray
+            } else {
+                Color::LightGreen
+            }),
         ));
         row.push(Span::raw("  "));
         row.push(Span::styled("/=", Style::default().fg(Color::Yellow)));
         row.push(Span::styled(
             fuzzy,
-            Style::default().fg(if app.event_filters.fuzzy_filter.is_empty() { Color::DarkGray } else { Color::LightGreen }),
+            Style::default().fg(if app.event_filters.fuzzy_filter.is_empty() {
+                Color::DarkGray
+            } else {
+                Color::LightGreen
+            }),
         ));
         row.push(Span::raw("  "));
         row.push(Span::styled("e=", Style::default().fg(Color::Yellow)));
         row.push(Span::styled(
             exact,
-            Style::default().fg(if app.event_filters.exact_filter.is_empty() { Color::DarkGray } else { Color::LightGreen }),
+            Style::default().fg(if app.event_filters.exact_filter.is_empty() {
+                Color::DarkGray
+            } else {
+                Color::LightGreen
+            }),
         ));
     }
 
@@ -562,23 +655,30 @@ fn draw_full_help(frame: &mut Frame<'_>) {
         Paragraph::new(Text::from(vec![
             Line::from(Span::styled(
                 "Quick Help",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from("Press h or ? to close this help."),
         ]))
-        .block(Block::default().borders(Borders::ALL).title("Discoverability")),
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Discoverability"),
+        ),
         rows[0],
     );
 
     let body = vec![
         Line::from("Global"),
-        Line::from("  q quit | h/? help | 1 Live | 2 Periods | 3 Types | 4 Data | a anomaly view"),
+        Line::from("  q quit | h/? help | 1 Live | 2 Periods | 3 Types | 4 Data | a anomaly view | g rate view"),
         Line::from(""),
         Line::from("Live"),
         Line::from("  m toggle action period"),
         Line::from("  f toggle follow"),
         Line::from("  up/down move cursor (disables follow)"),
-        Line::from("  PageUp/PageDown move viewport and cursor (disables follow)"),
+        Line::from("  Home/End jump to top/bottom"),
+        Line::from("  PageUp/PageDown move viewport and cursor (Ctrl+U / Ctrl+D also)"),
         Line::from("  enter inspect selected event"),
         Line::from("  k/t//e set filters, c clear filters, y toggle filters on/off"),
         Line::from(""),
@@ -601,7 +701,11 @@ fn draw_full_help(frame: &mut Frame<'_>) {
     frame.render_widget(
         Paragraph::new(Text::from(body))
             .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title("Commands by Mode")),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Commands by Mode"),
+            ),
         rows[1],
     );
 }
@@ -618,10 +722,21 @@ fn draw_inspector(frame: &mut Frame<'_>, inspector: &ObjectInspector, app: &App)
     let name = app.model.type_display_name(&inspector.event.type_id);
     frame.render_widget(
         Paragraph::new(Text::from(vec![
-            Line::from(Span::styled(name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-            Line::from("Select key and press k to filter events by key, t to jump to type, esc to close"),
+            Line::from(Span::styled(
+                name,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(
+                "Select key and press k to filter events by key, t to jump to type, esc to close",
+            ),
         ]))
-        .block(Block::default().title("Object Inspector").borders(Borders::ALL)),
+        .block(
+            Block::default()
+                .title("Object Inspector")
+                .borders(Borders::ALL),
+        ),
         rows[0],
     );
 
@@ -634,18 +749,24 @@ fn draw_inspector(frame: &mut Frame<'_>, inspector: &ObjectInspector, app: &App)
     for (idx, key) in inspector.key_paths.iter().enumerate() {
         let sel = if idx == inspector.key_index { ">" } else { " " };
         let style = if idx == inspector.key_index {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
-        key_items.push(ListItem::new(Line::from(vec![Span::styled(format!("{} {}", sel, key), style)])));
+        key_items.push(ListItem::new(Line::from(vec![Span::styled(
+            format!("{} {}", sel, key),
+            style,
+        )])));
     }
     frame.render_widget(
         List::new(key_items).block(Block::default().title("Keys").borders(Borders::ALL)),
         cols[0],
     );
 
-    let obj = serde_json::to_string_pretty(&inspector.event.obj).unwrap_or_else(|_| "{}".to_string());
+    let obj =
+        serde_json::to_string_pretty(&inspector.event.obj).unwrap_or_else(|_| "{}".to_string());
     frame.render_widget(
         Paragraph::new(obj)
             .wrap(Wrap { trim: false })
@@ -654,36 +775,12 @@ fn draw_inspector(frame: &mut Frame<'_>, inspector: &ObjectInspector, app: &App)
     );
 }
 
-fn render_correlations(
-    corrs: &[TypeCorrelation],
-    selected: usize,
-    unrelated_pairs: &std::collections::HashSet<(String, String)>,
+fn render_event_line(
     app: &App,
-) -> Vec<ListItem<'static>> {
-    let mut out = Vec::new();
-    for (idx, c) in corrs.iter().take(40).enumerate() {
-        let sel = if idx == selected { ">" } else { " " };
-        let muted = unrelated_pairs.contains(&(c.label.clone(), c.type_id.clone()));
-        let style = if muted {
-            Style::default().fg(Color::DarkGray)
-        } else if c.score > 0.75 {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-        } else if c.score > 0.45 {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        let name = app.model.type_display_name(&c.type_id);
-        let line = format!(
-            "{} {} {} score={:.2} presence={:.2} lift={:.1} trials={}",
-            sel, c.label, name, c.score, c.presence, c.lift, c.trials
-        );
-        out.push(ListItem::new(Line::from(vec![Span::styled(line, style)])));
-    }
-    out
-}
-
-fn render_event_line(app: &App, e: &EventRecord, selected: bool, row_width: usize) -> Line<'static> {
+    e: &EventRecord,
+    selected: bool,
+    row_width: usize,
+) -> Line<'static> {
     let obj = serde_json::to_string(&e.obj).unwrap_or_default();
     let name = app.model.type_display_name(&e.type_id);
     let mut style = event_style(app, e);
@@ -703,25 +800,65 @@ fn render_event_line(app: &App, e: &EventRecord, selected: bool, row_width: usiz
     } else {
         Style::default().fg(Color::Cyan)
     };
-    let show_anomaly = e.in_action_period;
+    let show_metrics = e.in_action_period;
     let (show_uniq, show_rate) = displayed_anomaly_scores(app, e);
-    let anomaly_text = if show_anomaly {
+    let (rate_text, value_text, tail_len) = if show_metrics {
+        let (rate_snap_text, rate_live_text, value_snap_text, value_live_text) = (
+            format!("{:>5.2}", e.rate_score),
+            format!("{:>5.2}", e.live_rate_score),
+            format!("{:>5.2}", e.uniq_score),
+            format!("{:>5.2}", e.live_uniq_score),
+        );
         match app.anomaly_view {
             AnomalyViewMode::Both => {
-                format!(
-                    "  [v:{:.2}/{:.2} r:{:.2}/{:.2}]",
-                    e.uniq_score, e.live_uniq_score, e.rate_score, e.live_rate_score
-                )
+                let live_rate_text = match app.rate_view {
+                    RateBoundaryViewMode::Point => rate_live_text,
+                    RateBoundaryViewMode::Interval => {
+                        format!("[{:>4.2}..{:>4.2}]", e.live_rate_low, e.live_rate_high)
+                    }
+                };
+                let rate_text = format!("{}/{}", rate_snap_text, live_rate_text);
+                let value_text = format!("{}/{}", value_snap_text, value_live_text);
+                let tail_len = 2 + 2 + rate_text.chars().count() + 3 + value_text.chars().count();
+                (Some(rate_text), Some(value_text), tail_len)
             }
-            _ => format!("  [v:{:.2} r:{:.2}]", show_uniq, show_rate),
+            _ => {
+                let rate_live_text = match app.rate_view {
+                    RateBoundaryViewMode::Point => rate_live_text,
+                    RateBoundaryViewMode::Interval => {
+                        format!("[{:>4.2}..{:>4.2}]", e.live_rate_low, e.live_rate_high)
+                    }
+                };
+                let tail_len =
+                    2 + 2 + rate_live_text.chars().count() + 3 + value_live_text.chars().count();
+                (Some(rate_live_text), Some(value_live_text), tail_len)
+            }
         }
     } else {
-        String::new()
+        (None, None, 0)
     };
-    let fixed_prefix = 2 + 1 + 3; // action marker + spacer + selection marker
-    let reserved = fixed_prefix + name.chars().count() + 1 + anomaly_text.chars().count();
-    let obj_budget = row_width.saturating_sub(reserved);
-    let short = truncate_text(&obj, obj_budget.max(10));
+    let fixed_prefix = 2 + 1 + 3 + name.chars().count() + 1;
+    let mut obj_budget = row_width.saturating_sub(fixed_prefix + tail_len);
+    obj_budget = obj_budget.min(48);
+    let short = if obj_budget == 0 {
+        String::new()
+    } else {
+        truncate_text(&obj, obj_budget)
+    };
+    let line_len = fixed_prefix + short.chars().count() + tail_len;
+    let spacer_len = row_width.saturating_sub(line_len);
+    let spacer = " ".repeat(spacer_len);
+
+    let rate_color = if show_metrics {
+        rate_anomaly_color(rate_anomaly_norm(show_rate))
+    } else {
+        Color::DarkGray
+    };
+    let value_color = if show_metrics {
+        value_anomaly_color(value_anomaly_norm(show_uniq))
+    } else {
+        Color::DarkGray
+    };
     let mut spans = vec![
         action_marker,
         Span::raw(" "),
@@ -729,57 +866,22 @@ fn render_event_line(app: &App, e: &EventRecord, selected: bool, row_width: usiz
         Span::styled(format!("{} ", name), name_style),
         Span::styled(short, style),
     ];
-    if show_anomaly {
-        let value_color = value_anomaly_color(value_anomaly_norm(show_uniq));
-        let rate_color = rate_anomaly_color(rate_anomaly_norm(show_rate));
-        match app.anomaly_view {
-            AnomalyViewMode::Both => spans.extend([
-                Span::raw("  ["),
-                Span::styled("v:", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    format!("{:.2}", e.uniq_score),
-                    Style::default().fg(value_color),
-                ),
-                Span::raw("/"),
-                Span::styled(
-                    format!("{:.2}", e.live_uniq_score),
-                    Style::default().fg(value_color),
-                ),
-                Span::raw(" "),
-                Span::styled("r:", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    format!("{:.2}", e.rate_score),
-                    Style::default().fg(rate_color),
-                ),
-                Span::raw("/"),
-                Span::styled(
-                    format!("{:.2}", e.live_rate_score),
-                    Style::default().fg(rate_color),
-                ),
-                Span::raw("]"),
-            ]),
-            _ => spans.extend([
-                Span::raw("  ["),
-                Span::styled("v:", Style::default().fg(Color::Gray)),
-                Span::styled(format!("{:.2}", show_uniq), Style::default().fg(value_color)),
-                Span::raw(" "),
-                Span::styled("r:", Style::default().fg(Color::Gray)),
-                Span::styled(format!("{:.2}", show_rate), Style::default().fg(rate_color)),
-                Span::raw("]"),
-            ]),
-        }
+    if let (Some(rate_text), Some(value_text)) = (rate_text, value_text) {
+        spans.extend([
+            Span::raw(spacer),
+            Span::raw("  "),
+            Span::styled("R:", Style::default().fg(Color::Gray)),
+            Span::styled(rate_text, Style::default().fg(rate_color)),
+            Span::raw("  "),
+            Span::styled("V:", Style::default().fg(Color::Gray)),
+            Span::styled(value_text, Style::default().fg(value_color)),
+        ]);
     }
     Line::from(spans)
 }
 
 fn event_style(app: &App, e: &EventRecord) -> Style {
-    let max_count = app
-        .model
-        .types
-        .values()
-        .map(|t| t.count)
-        .max()
-        .unwrap_or(1) as f64;
+    let max_count = app.model.types.values().map(|t| t.count).max().unwrap_or(1) as f64;
     let count = app
         .model
         .types
@@ -860,6 +962,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 fn displayed_anomaly_scores(app: &App, e: &EventRecord) -> (f64, f64) {
     match app.anomaly_view {
         AnomalyViewMode::Snapshot => (e.uniq_score, e.rate_score),
-        AnomalyViewMode::Both | AnomalyViewMode::Recomputed => (e.live_uniq_score, e.live_rate_score),
+        AnomalyViewMode::Both | AnomalyViewMode::Recomputed => {
+            let rate = match app.rate_view {
+                RateBoundaryViewMode::Point => e.live_rate_score,
+                RateBoundaryViewMode::Interval => 0.5 * (e.live_rate_low + e.live_rate_high),
+            };
+            (e.live_uniq_score, rate)
+        }
     }
 }

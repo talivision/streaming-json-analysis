@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct StreamReader {
     path: PathBuf,
@@ -47,5 +47,9 @@ impl StreamReader {
             }
         }
         Ok(out)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }

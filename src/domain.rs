@@ -1,8 +1,7 @@
 use indexmap::IndexMap;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, VecDeque};
 
 const MAX_EVENTS: usize = 80_000;
 const ACTION_BOUNDARY_EPS: f64 = 0.000_001;
@@ -19,6 +18,8 @@ pub struct EventRecord {
     pub rate_score: f64,
     pub uniq_score: f64,
     pub live_rate_score: f64,
+    pub live_rate_low: f64,
+    pub live_rate_high: f64,
     pub live_uniq_score: f64,
 }
 
@@ -57,19 +58,10 @@ pub struct TypeProfile {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct TypeCorrelation {
-    pub label: String,
-    pub type_id: String,
-    pub score: f64,
-    pub presence: f64,
-    pub lift: f64,
-    pub trials: usize,
-}
-
-#[derive(Debug, Clone, Default)]
 struct PeriodRateState {
     elapsed_secs: f64,
     counts: HashMap<String, u64>,
+    first_event_ts: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -127,9 +119,6 @@ pub struct AnalyzerModel {
     pub events: VecDeque<EventRecord>,
     pub periods: Vec<ActionPeriod>,
     pub current_label: String,
-    pub known_unrelated_pairs: HashSet<(String, String)>,
-    pub smoothed_correlations: HashMap<(String, String), f64>,
-    pub correlations: Vec<TypeCorrelation>,
 
     baseline_elapsed_secs: f64,
     baseline_counts: HashMap<String, u64>,
@@ -137,7 +126,6 @@ pub struct AnalyzerModel {
     last_rate_ts: Option<f64>,
     last_event_ts: Option<f64>,
     next_period_id: u64,
-    last_corr_refresh: Instant,
 }
 
 impl AnalyzerModel {
@@ -147,16 +135,12 @@ impl AnalyzerModel {
             events: VecDeque::new(),
             periods: Vec::new(),
             current_label: "action".to_string(),
-            known_unrelated_pairs: HashSet::new(),
-            smoothed_correlations: HashMap::new(),
-            correlations: Vec::new(),
             baseline_elapsed_secs: 0.0,
             baseline_counts: HashMap::new(),
             period_rate_states: HashMap::new(),
             last_rate_ts: None,
             last_event_ts: None,
             next_period_id: 1,
-            last_corr_refresh: Instant::now(),
         }
     }
 
@@ -201,18 +185,21 @@ impl AnalyzerModel {
         let in_action_period = active_period_id.is_some();
 
         let uniq = {
-            let entry = self.types.entry(type_id.clone()).or_insert_with(|| TypeProfile {
-                type_id: type_id.clone(),
-                name: None,
-                count: 0,
-                example: obj.clone(),
-                considered_paths: IndexMap::new(),
-                path_overrides: IndexMap::new(),
-                path_stats: IndexMap::new(),
-                known_unrelated: false,
-                latest_rate: 0.0,
-                latest_uniq: 0.0,
-            });
+            let entry = self
+                .types
+                .entry(type_id.clone())
+                .or_insert_with(|| TypeProfile {
+                    type_id: type_id.clone(),
+                    name: None,
+                    count: 0,
+                    example: obj.clone(),
+                    considered_paths: IndexMap::new(),
+                    path_overrides: IndexMap::new(),
+                    path_stats: IndexMap::new(),
+                    known_unrelated: false,
+                    latest_rate: 0.0,
+                    latest_uniq: 0.0,
+                });
 
             entry.count += 1;
             if entry.count == 1 {
@@ -236,13 +223,13 @@ impl AnalyzerModel {
             rate_score: rate,
             uniq_score: uniq,
             live_rate_score: rate,
+            live_rate_low: rate,
+            live_rate_high: rate,
             live_uniq_score: uniq,
         });
         while self.events.len() > MAX_EVENTS {
             self.events.pop_front();
         }
-
-        self.refresh_correlation_scores();
     }
 
     pub fn refresh_live_anomaly_scores(&mut self) {
@@ -252,12 +239,23 @@ impl AnalyzerModel {
                 continue;
             };
             let rate = self.recomputed_rate_for(&e.type_id, period_id);
+            let (mut rate_low, mut rate_high) =
+                self.recomputed_rate_range_for(&e.type_id, period_id);
             let uniq = self.recomputed_uniq_for(&e.type_id, &e.obj);
-            updates.push((idx, rate, uniq));
+            if rate_low > rate_high {
+                std::mem::swap(&mut rate_low, &mut rate_high);
+            }
+            updates.push((idx, rate, rate_low, rate_high, uniq));
         }
-        for (idx, rate, uniq) in updates {
+        for (idx, rate, rate_low, rate_high, uniq) in updates {
             if let Some(e) = self.events.get_mut(idx) {
                 e.live_rate_score = rate.max(e.rate_score);
+                let floor = e.rate_score;
+                e.live_rate_low = rate_low.max(floor);
+                e.live_rate_high = rate_high.max(floor);
+                if e.live_rate_high < e.live_rate_low {
+                    e.live_rate_high = e.live_rate_low;
+                }
                 e.live_uniq_score = uniq.max(e.uniq_score);
             }
         }
@@ -267,6 +265,9 @@ impl AnalyzerModel {
         if let Some(pid) = active_period_id {
             let pr = self.period_rate_states.entry(pid).or_default();
             *pr.counts.entry(type_id.to_string()).or_insert(0) += 1;
+            if pr.first_event_ts.is_none() {
+                pr.first_event_ts = self.last_event_ts;
+            }
             if pr.elapsed_secs < MIN_ACTION_RATE_DURATION_SECS {
                 return 0.0;
             }
@@ -298,106 +299,6 @@ impl AnalyzerModel {
         self.last_rate_ts = Some(now_ts);
     }
 
-    fn refresh_correlation_scores(&mut self) {
-        if self.last_corr_refresh.elapsed() < Duration::from_millis(900) {
-            return;
-        }
-        self.last_corr_refresh = Instant::now();
-
-        let closed: Vec<&ActionPeriod> = self.periods.iter().filter(|p| p.end.is_some()).collect();
-        if closed.is_empty() {
-            self.correlations.clear();
-            return;
-        }
-
-        let mut by_label: HashMap<String, Vec<&ActionPeriod>> = HashMap::new();
-        for p in closed {
-            by_label.entry(p.label.clone()).or_default().push(p);
-        }
-
-        let mut corr = Vec::new();
-        for (label, periods) in by_label {
-            let trials = periods.len();
-            if trials == 0 {
-                continue;
-            }
-            let avg_dur = periods
-                .iter()
-                .map(|p| p.end.unwrap_or(p.start) - p.start)
-                .sum::<f64>()
-                / trials as f64;
-
-            let mut present: HashMap<String, HashSet<u64>> = HashMap::new();
-            let mut counts_during: HashMap<String, u64> = HashMap::new();
-            let mut counts_outside: HashMap<String, u64> = HashMap::new();
-            let mut outside_time = 0.001;
-
-            let mut total_time = 0.0;
-            if let (Some(first), Some(last)) = (self.events.front(), self.events.back()) {
-                total_time = (last.ts - first.ts).max(0.001);
-            }
-            let during_time = periods
-                .iter()
-                .map(|p| p.end.unwrap_or(p.start) - p.start)
-                .sum::<f64>();
-            outside_time += (total_time - during_time).max(0.001);
-
-            for e in &self.events {
-                let mut in_any = None;
-                for p in &periods {
-                    let end = p.end.unwrap_or(p.start);
-                    if e.ts >= p.start && e.ts <= end {
-                        in_any = Some(p.id);
-                        break;
-                    }
-                }
-                if let Some(pid) = in_any {
-                    *counts_during.entry(e.type_id.clone()).or_insert(0) += 1;
-                    present.entry(e.type_id.clone()).or_default().insert(pid);
-                } else {
-                    *counts_outside.entry(e.type_id.clone()).or_insert(0) += 1;
-                }
-            }
-
-            for (type_id, dur_count) in counts_during {
-                if self
-                    .known_unrelated_pairs
-                    .contains(&(label.clone(), type_id.clone()))
-                {
-                    continue;
-                }
-                if self.types.get(&type_id).map(|t| t.known_unrelated).unwrap_or(false) {
-                    continue;
-                }
-                let presence_rate = present
-                    .get(&type_id)
-                    .map(|s| s.len() as f64 / trials as f64)
-                    .unwrap_or(0.0);
-                let during_rate = dur_count as f64 / (avg_dur * trials as f64).max(0.001);
-                let baseline_rate = counts_outside.get(&type_id).copied().unwrap_or(0) as f64 / outside_time;
-                let lift = during_rate / (baseline_rate + 0.001);
-                let raw = (presence_rate * (1.0 - (1.0 / lift.max(1.0)))).clamp(0.0, 1.0);
-
-                let key = (label.clone(), type_id.clone());
-                let prev = self.smoothed_correlations.get(&key).copied().unwrap_or(raw);
-                let smoothed = 0.75 * prev + 0.25 * raw;
-                self.smoothed_correlations.insert(key, smoothed);
-
-                corr.push(TypeCorrelation {
-                    label: label.clone(),
-                    type_id,
-                    score: smoothed,
-                    presence: presence_rate,
-                    lift,
-                    trials,
-                });
-            }
-        }
-
-        corr.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        self.correlations = corr;
-    }
-
     fn recomputed_rate_for(&self, type_id: &str, period_id: u64) -> f64 {
         let Some(pr) = self.period_rate_states.get(&period_id) else {
             return 0.0;
@@ -410,6 +311,34 @@ impl AnalyzerModel {
         let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
         let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
         normalized_rate_anomaly(action_rate, baseline_rate)
+    }
+
+    fn recomputed_rate_range_for(&self, type_id: &str, period_id: u64) -> (f64, f64) {
+        let Some(pr) = self.period_rate_states.get(&period_id) else {
+            return (0.0, 0.0);
+        };
+        if pr.elapsed_secs < MIN_ACTION_RATE_DURATION_SECS {
+            return (0.0, 0.0);
+        }
+        let Some(period) = self.periods.iter().find(|p| p.id == period_id) else {
+            return (0.0, 0.0);
+        };
+        let start_low = period.start - ACTION_BOUNDARY_EPS;
+        let start_high = pr.first_event_ts.unwrap_or(start_low);
+        let end_ts = period
+            .end
+            .unwrap_or(self.last_event_ts.unwrap_or(period.start));
+        let dur_max = (end_ts - start_low).max(0.001);
+        let dur_min = (end_ts - start_high).max(0.001);
+
+        let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
+        let action_rate_low = action_count / dur_max;
+        let action_rate_high = action_count / dur_min;
+        let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
+        let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
+        let low = normalized_rate_anomaly(action_rate_low, baseline_rate);
+        let high = normalized_rate_anomaly(action_rate_high, baseline_rate);
+        (low.min(high), low.max(high))
     }
 
     fn recomputed_uniq_for(&self, type_id: &str, obj: &Value) -> f64 {
@@ -428,7 +357,11 @@ impl AnalyzerModel {
             let considered = match tp.path_overrides.get(path.as_str()).copied() {
                 Some(PathOverride::ForcedOn) => true,
                 Some(PathOverride::ForcedOff) => false,
-                None => tp.considered_paths.get(path.as_str()).copied().unwrap_or(auto),
+                None => tp
+                    .considered_paths
+                    .get(path.as_str())
+                    .copied()
+                    .unwrap_or(auto),
             };
             if !considered || stats.total <= 6 {
                 continue;
@@ -436,7 +369,11 @@ impl AnalyzerModel {
             let total = stats.total as f64;
             let prev = stats.values.get(token.as_str()).copied().unwrap_or(0);
             let freq = prev as f64 / total;
-            let s = if prev == 0 { 1.0 } else { (1.0 - (freq / 0.10)).clamp(0.0, 1.0) };
+            let s = if prev == 0 {
+                1.0
+            } else {
+                (1.0 - (freq / 0.10)).clamp(0.0, 1.0)
+            };
             if s > max_score {
                 max_score = s;
             }
@@ -472,13 +409,6 @@ impl AnalyzerModel {
     pub fn toggle_known_unrelated_type(&mut self, type_id: &str) {
         if let Some(tp) = self.types.get_mut(type_id) {
             tp.known_unrelated = !tp.known_unrelated;
-        }
-    }
-
-    pub fn toggle_known_unrelated_pair(&mut self, label: &str, type_id: &str) {
-        let key = (label.to_string(), type_id.to_string());
-        if !self.known_unrelated_pairs.insert(key.clone()) {
-            self.known_unrelated_pairs.remove(&key);
         }
     }
 
@@ -562,7 +492,9 @@ impl AnalyzerModel {
                 }
             }
             if !filters.fuzzy_filter.is_empty() {
-                let s = serde_json::to_string(&e.obj).unwrap_or_default().to_lowercase();
+                let s = serde_json::to_string(&e.obj)
+                    .unwrap_or_default()
+                    .to_lowercase();
                 if !fuzzy_match(&s, &filters.fuzzy_filter.to_lowercase()) {
                     continue;
                 }
@@ -586,7 +518,6 @@ impl AnalyzerModel {
     pub fn closed_periods(&self) -> Vec<&ActionPeriod> {
         self.periods.iter().filter(|p| p.end.is_some()).collect()
     }
-
 }
 
 fn default_type_label(type_id: &str) -> String {
@@ -614,7 +545,11 @@ fn update_uniqueness(tp: &mut TypeProfile, obj: &Value) -> f64 {
 
         if *considered && total > 6.0 {
             let freq = prev as f64 / total;
-            let s = if prev == 0 { 1.0 } else { (1.0 - (freq / 0.10)).clamp(0.0, 1.0) };
+            let s = if prev == 0 {
+                1.0
+            } else {
+                (1.0 - (freq / 0.10)).clamp(0.0, 1.0)
+            };
             if s > max_score {
                 max_score = s;
             }
@@ -645,8 +580,7 @@ fn is_volatile_path(path: &str) -> bool {
         .to_ascii_lowercase();
     matches!(
         last.as_str(),
-        "ts"
-            | "timestamp"
+        "ts" | "timestamp"
             | "time"
             | "event_time"
             | "created_at"
@@ -699,7 +633,11 @@ fn collect_scalar_paths(v: &Value, path: &str, out: &mut Vec<(String, String)>) 
     match v {
         Value::Object(map) => {
             for (k, child) in map {
-                let p = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
+                let p = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{}.{}", path, k)
+                };
                 collect_scalar_paths(child, &p, out);
             }
         }
@@ -819,7 +757,11 @@ fn collect_paths(v: &Value, path: &str, out: &mut Vec<String>) {
     match v {
         Value::Object(map) => {
             for (k, child) in map {
-                let p = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
+                let p = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{}.{}", path, k)
+                };
                 out.push(p.clone());
                 collect_paths(child, &p, out);
             }

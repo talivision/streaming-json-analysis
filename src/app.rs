@@ -2,19 +2,31 @@ use crate::domain::{AnalyzerModel, DataFilters, EventRecord, FilterField};
 use crate::io::StreamReader;
 use crate::tui::{draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
+};
+use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 use serde_json::Value;
 use std::io::stdout;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const LIVE_WINDOW_DEFAULT: usize = 120;
 const LIVE_RECOMPUTE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const LIVE_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const UI_FRAME_SLEEP: Duration = Duration::from_millis(16);
+const UI_BURST_SLEEP: Duration = Duration::from_millis(1);
 
 pub struct ObjectInspector {
     pub event: EventRecord,
@@ -34,6 +46,28 @@ pub enum AnomalyViewMode {
     Snapshot,
     Both,
     Recomputed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateBoundaryViewMode {
+    Point,
+    Interval,
+}
+
+impl RateBoundaryViewMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Point => Self::Interval,
+            Self::Interval => Self::Point,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Point => "point",
+            Self::Interval => "interval",
+        }
+    }
 }
 
 impl AnomalyViewMode {
@@ -60,6 +94,18 @@ struct LiveAnchor {
     type_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavIntent {
+    LineUp,
+    LineDown,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Left,
+    Right,
+}
+
 pub struct App {
     pub model: AnalyzerModel,
     pub mode: UiMode,
@@ -69,7 +115,6 @@ pub struct App {
     pub types_filter: String,
     pub type_index: usize,
     pub path_index: usize,
-    pub corr_index: usize,
     pub data_index: usize,
     pub periods_index: usize,
     pub period_event_index: usize,
@@ -80,6 +125,7 @@ pub struct App {
     pub live_edge_until_center: bool,
     pub show_help_overlay: bool,
     pub anomaly_view: AnomalyViewMode,
+    pub rate_view: RateBoundaryViewMode,
     pub offline: bool,
     pub status: String,
     pub inspector: Option<ObjectInspector>,
@@ -110,7 +156,6 @@ impl App {
             types_filter: String::new(),
             type_index: 0,
             path_index: 0,
-            corr_index: 0,
             data_index: 0,
             periods_index: 0,
             period_event_index: 0,
@@ -120,10 +165,14 @@ impl App {
             live_follow: true,
             live_edge_until_center: false,
             show_help_overlay: false,
-            anomaly_view: AnomalyViewMode::Both,
+            anomaly_view: AnomalyViewMode::Recomputed,
+            rate_view: RateBoundaryViewMode::Point,
             offline,
             status: if offline {
-                format!("Offline mode: analyzing {} (no live tail)", stream_path.display())
+                format!(
+                    "Offline mode: analyzing {} (no live tail)",
+                    stream_path.display()
+                )
             } else {
                 format!("Watching {}", stream_path.display())
             },
@@ -138,72 +187,83 @@ impl App {
     pub fn run(&mut self) -> Result<()> {
         enable_raw_mode()?;
         let mut out = stdout();
-        execute!(out, EnterAlternateScreen)?;
+        let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
+        if keyboard_enhanced {
+            execute!(
+                out,
+                EnterAlternateScreen,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            )?;
+        } else {
+            execute!(out, EnterAlternateScreen)?;
+        }
 
         let backend = CrosstermBackend::new(out);
         let mut terminal = Terminal::new(backend)?;
 
-        let mut last_poll = Instant::now();
+        let stream_path = self.reader.path().to_path_buf();
+        let mut _watcher = None;
+        let mut watch_rx = None;
+        if !self.offline {
+            match setup_stream_watcher(&stream_path) {
+                Ok((w, rx)) => {
+                    _watcher = Some(w);
+                    watch_rx = Some(rx);
+                }
+                Err(err) => {
+                    self.status = format!("Watcher unavailable ({err}); using fallback polling");
+                }
+            }
+        }
+
+        let mut last_poll = Instant::now() - LIVE_FALLBACK_POLL_INTERVAL;
         let mut last_live_recompute = Instant::now();
-        let tick = Duration::from_millis(110);
 
         let loop_result = (|| -> Result<()> {
             loop {
-                terminal.draw(|f| draw_ui(f, self))?;
+                let loop_started_at = Instant::now();
 
                 let mut ingested_any = false;
-                if (!self.offline || !self.offline_loaded) && last_poll.elapsed() >= Duration::from_millis(120)
-                {
-                    match self.reader.poll() {
-                        Ok(events) => {
-                            let selected_anchor = if self.mode == UiMode::Live && !self.live_follow {
-                                self.live_anchor_at(self.live_event_index)
-                            } else {
-                                None
-                            };
-                            let view_anchor = if self.mode == UiMode::Live && !self.live_follow {
-                                self.live_anchor_at(self.live_view_start)
-                            } else {
-                                None
-                            };
-                            let n = events.len();
-                            let batch_now = unix_ts();
-                            for (idx, e) in events.into_iter().enumerate() {
-                                let ts = self.resolve_event_ts(&e, batch_now, idx)?;
-                                self.model.ingest(e, ts);
-                            }
-                            if n > 0 {
-                                ingested_any = true;
-                                self.status = format!("Ingested {} events", n);
-                                if self.mode == UiMode::Live && self.live_follow {
-                                    self.live_edge_until_center = false;
-                                    self.pin_live_to_latest();
-                                } else if self.mode == UiMode::Live {
-                                    if let Some(anchor) = selected_anchor.as_ref() {
-                                        if let Some(idx) = self.find_live_index(anchor) {
-                                            self.live_event_index = idx;
+                if !self.offline || !self.offline_loaded {
+                    let mut should_poll = self.offline && !self.offline_loaded;
+                    if !self.offline {
+                        let mut watcher_disconnected = false;
+                        if let Some(rx) = watch_rx.as_mut() {
+                            loop {
+                                match rx.try_recv() {
+                                    Ok(Ok(ev)) => {
+                                        if should_poll_from_watch_event(&ev, &stream_path) {
+                                            should_poll = true;
                                         }
                                     }
-                                    if let Some(anchor) = view_anchor.as_ref() {
-                                        if let Some(idx) = self.find_live_index(anchor) {
-                                            self.live_view_start = idx;
-                                        }
+                                    Ok(Err(err)) => {
+                                        self.status = format!("Watcher error: {err}");
                                     }
-                                    self.clamp_live_indices();
-                                    self.ensure_live_selection_visible();
+                                    Err(TryRecvError::Empty) => break,
+                                    Err(TryRecvError::Disconnected) => {
+                                        watcher_disconnected = true;
+                                        break;
+                                    }
                                 }
-                            } else if self.offline && !self.offline_loaded {
-                                self.status = "Offline mode: no events found".to_string();
-                            }
-                            if self.offline {
-                                self.offline_loaded = true;
                             }
                         }
-                        Err(err) => {
-                            self.status = format!("Stream read error: {err}");
+                        if watcher_disconnected {
+                            watch_rx = None;
+                            _watcher = None;
+                            self.status =
+                                "Watcher disconnected; using fallback polling".to_string();
+                        }
+                        if last_poll.elapsed() >= LIVE_FALLBACK_POLL_INTERVAL {
+                            should_poll = true;
                         }
                     }
-                    last_poll = Instant::now();
+                    if should_poll {
+                        ingested_any = self.ingest_new_events()?;
+                        last_poll = Instant::now();
+                    }
                 }
 
                 let force_refresh = last_live_recompute.elapsed() >= LIVE_RECOMPUTE_MIN_INTERVAL;
@@ -212,24 +272,105 @@ impl App {
                     last_live_recompute = Instant::now();
                 }
 
-                if event::poll(tick)? {
+                let mut should_quit = false;
+                while event::poll(Duration::from_millis(0))? {
                     if let Event::Key(key) = event::read()? {
-                        if key.kind != KeyEventKind::Press {
+                        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                             continue;
                         }
                         if self.handle_key(key) {
+                            should_quit = true;
                             break;
                         }
                     }
+                }
+                if should_quit {
+                    break;
+                }
+
+                terminal.draw(|f| draw_ui(f, self))?;
+
+                let target_sleep = if ingested_any {
+                    UI_BURST_SLEEP
+                } else {
+                    UI_FRAME_SLEEP
+                };
+                let elapsed = loop_started_at.elapsed();
+                if elapsed < target_sleep {
+                    thread::sleep(target_sleep - elapsed);
                 }
             }
             Ok(())
         })();
 
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        if keyboard_enhanced {
+            execute!(
+                terminal.backend_mut(),
+                PopKeyboardEnhancementFlags,
+                LeaveAlternateScreen
+            )?;
+        } else {
+            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        }
         terminal.show_cursor()?;
         loop_result
+    }
+
+    fn ingest_new_events(&mut self) -> Result<bool> {
+        match self.reader.poll() {
+            Ok(events) => {
+                let selected_anchor = if self.mode == UiMode::Live && !self.live_follow {
+                    self.live_anchor_at(self.live_event_index)
+                } else {
+                    None
+                };
+                let view_anchor = if self.mode == UiMode::Live && !self.live_follow {
+                    self.live_anchor_at(self.live_view_start)
+                } else {
+                    None
+                };
+
+                let n = events.len();
+                let batch_now = unix_ts();
+                for (idx, e) in events.into_iter().enumerate() {
+                    let ts = self.resolve_event_ts(&e, batch_now, idx)?;
+                    self.model.ingest(e, ts);
+                }
+
+                if n > 0 {
+                    self.status = format!("Ingested {} events", n);
+                    if self.mode == UiMode::Live && self.live_follow {
+                        self.live_edge_until_center = false;
+                        self.pin_live_to_latest();
+                    } else if self.mode == UiMode::Live {
+                        if let Some(anchor) = selected_anchor.as_ref() {
+                            if let Some(idx) = self.find_live_index(anchor) {
+                                self.live_event_index = idx;
+                            }
+                        }
+                        if let Some(anchor) = view_anchor.as_ref() {
+                            if let Some(idx) = self.find_live_index(anchor) {
+                                self.live_view_start = idx;
+                            }
+                        }
+                        self.clamp_live_indices();
+                        self.ensure_live_selection_visible();
+                    }
+                } else if self.offline && !self.offline_loaded {
+                    self.status = "Offline mode: no events found".to_string();
+                }
+
+                if self.offline {
+                    self.offline_loaded = true;
+                }
+                Ok(n > 0)
+            }
+            Err(err) => {
+                self.status = format!("Stream read error: {err}");
+                Ok(false)
+            }
+        }
     }
 
     fn resolve_event_ts(&mut self, obj: &Value, batch_now: f64, idx: usize) -> Result<f64> {
@@ -254,8 +395,20 @@ impl App {
         {
             return true;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('U'))
+        {
+            self.handle_navigation_intent(NavIntent::PageUp);
+            return false;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
+        {
+            self.handle_navigation_intent(NavIntent::PageDown);
+            return false;
+        }
 
-        let code = key.code;
+        let code = normalize_navigation_code(key);
 
         if self.input_mode != InputMode::None {
             return self.handle_input(code);
@@ -283,12 +436,17 @@ impl App {
                     };
                 } else {
                     self.status =
-                        "Cannot toggle action period before first event timestamp is ingested".to_string();
+                        "Cannot toggle action period before first event timestamp is ingested"
+                            .to_string();
                 }
             }
             KeyCode::Char('a') => {
                 self.anomaly_view = self.anomaly_view.next();
                 self.status = format!("Anomaly view: {}", self.anomaly_view.label());
+            }
+            KeyCode::Char('g') => {
+                self.rate_view = self.rate_view.next();
+                self.status = format!("Rate boundary view: {}", self.rate_view.label());
             }
             KeyCode::Char('f') if self.mode == UiMode::Live => {
                 self.live_follow = !self.live_follow;
@@ -312,11 +470,19 @@ impl App {
                 self.input_mode = InputMode::Label;
                 self.input_buffer = self.model.current_label.clone();
             }
-            KeyCode::Char('k') if self.mode != UiMode::Types => self.start_event_filter_input(FilterField::Key),
-            KeyCode::Char('t') if self.mode != UiMode::Types => self.start_event_filter_input(FilterField::Type),
+            KeyCode::Char('k') if self.mode != UiMode::Types => {
+                self.start_event_filter_input(FilterField::Key)
+            }
+            KeyCode::Char('t') if self.mode != UiMode::Types => {
+                self.start_event_filter_input(FilterField::Type)
+            }
             KeyCode::Char('t') if self.mode == UiMode::Types => self.apply_selected_type_filter(),
-            KeyCode::Char('/') if self.mode != UiMode::Types => self.start_event_filter_input(FilterField::Fuzzy),
-            KeyCode::Char('e') if self.mode != UiMode::Types => self.start_event_filter_input(FilterField::Exact),
+            KeyCode::Char('/') if self.mode != UiMode::Types => {
+                self.start_event_filter_input(FilterField::Fuzzy)
+            }
+            KeyCode::Char('e') if self.mode != UiMode::Types => {
+                self.start_event_filter_input(FilterField::Exact)
+            }
             KeyCode::Char('y') if self.mode != UiMode::Types => self.toggle_event_filters_enabled(),
             KeyCode::Char('/') if self.mode == UiMode::Types => {
                 self.input_mode = InputMode::TypesFilter;
@@ -336,16 +502,17 @@ impl App {
                 self.refresh_live_position();
                 self.status = "Event filters cleared".to_string();
             }
-            KeyCode::Up => self.move_up(),
-            KeyCode::Down => self.move_down(),
-            KeyCode::PageUp => self.page_up(),
-            KeyCode::PageDown => self.page_down(),
-            KeyCode::Left => self.move_left(),
-            KeyCode::Right => self.move_right(),
+            KeyCode::Up => self.handle_navigation_intent(NavIntent::LineUp),
+            KeyCode::Down => self.handle_navigation_intent(NavIntent::LineDown),
+            KeyCode::Home => self.handle_navigation_intent(NavIntent::Home),
+            KeyCode::End => self.handle_navigation_intent(NavIntent::End),
+            KeyCode::PageUp => self.handle_navigation_intent(NavIntent::PageUp),
+            KeyCode::PageDown => self.handle_navigation_intent(NavIntent::PageDown),
+            KeyCode::Left => self.handle_navigation_intent(NavIntent::Left),
+            KeyCode::Right => self.handle_navigation_intent(NavIntent::Right),
             KeyCode::Enter => self.open_selected_event(),
             KeyCode::Char(' ') => self.toggle_current_path(),
             KeyCode::Char('u') => self.toggle_known_unrelated(),
-            KeyCode::Char('x') => self.toggle_known_unrelated_pair(),
             _ => {}
         }
         false
@@ -384,7 +551,10 @@ impl App {
                         self.mode = UiMode::Types;
                         self.type_index = idx;
                         self.path_index = 0;
-                        self.status = format!("Jumped to type {}", self.model.type_display_name(&ins.event.type_id));
+                        self.status = format!(
+                            "Jumped to type {}",
+                            self.model.type_display_name(&ins.event.type_id)
+                        );
                     }
                 }
             }
@@ -479,28 +649,65 @@ impl App {
         self.status = "Event filters suspended (press y to restore)".to_string();
     }
 
-    fn move_up(&mut self) {
+    fn handle_navigation_intent(&mut self, intent: NavIntent) {
         match self.mode {
-            UiMode::Live => {
-                let was_follow = self.live_follow;
-                let n = self.visible_live_events().len();
-                if n == 0 {
-                    return;
-                }
-                if self.live_event_index > 0 {
-                    self.live_event_index -= 1;
-                }
-                if self.live_event_index < self.live_view_start {
-                    self.live_view_start = self.live_event_index;
-                }
-                self.live_follow = false;
-                if was_follow {
-                    self.live_view_start = self.live_event_index.saturating_sub(10);
-                    self.live_edge_until_center = true;
-                }
-                self.reposition_live_selection();
-            }
-            UiMode::Periods => {
+            UiMode::Live => self.navigate_live(intent),
+            UiMode::Periods => self.navigate_periods(intent),
+            UiMode::Types => self.navigate_types(intent),
+            UiMode::Data => self.navigate_data(intent),
+        }
+    }
+
+    fn navigate_live(&mut self, intent: NavIntent) {
+        let total = self.visible_live_events().len();
+        if total == 0 {
+            self.live_event_index = 0;
+            self.live_view_start = 0;
+            return;
+        }
+
+        let was_follow = self.live_follow;
+        let step = self.live_page_step();
+        self.live_event_index = match intent {
+            NavIntent::LineUp => self.live_event_index.saturating_sub(1),
+            NavIntent::LineDown => (self.live_event_index + 1).min(total.saturating_sub(1)),
+            NavIntent::PageUp => self.live_event_index.saturating_sub(step),
+            NavIntent::PageDown => (self.live_event_index + step).min(total.saturating_sub(1)),
+            NavIntent::Home => 0,
+            NavIntent::End => total.saturating_sub(1),
+            NavIntent::Left | NavIntent::Right => return,
+        };
+
+        self.live_follow = false;
+        if matches!(intent, NavIntent::Home) {
+            self.live_edge_until_center = false;
+            self.live_view_start = 0;
+            self.clamp_live_indices();
+            return;
+        }
+        if matches!(intent, NavIntent::End) {
+            self.live_edge_until_center = false;
+            let window = self.live_window_rows.max(1);
+            self.live_view_start = total.saturating_sub(window);
+            self.clamp_live_indices();
+            return;
+        }
+
+        if was_follow {
+            // When leaving follow, keep context from the stream head first, then converge to centered.
+            self.live_view_start = self.live_event_index.saturating_sub(10);
+            self.live_edge_until_center = true;
+        } else {
+            self.live_edge_until_center = false;
+        }
+
+        self.clamp_live_indices();
+        self.reposition_live_selection();
+    }
+
+    fn navigate_periods(&mut self, intent: NavIntent) {
+        match intent {
+            NavIntent::LineUp => {
                 if self.periods_index > 0 {
                     self.periods_index -= 1;
                     self.period_event_index = 0;
@@ -508,81 +715,67 @@ impl App {
                     self.period_event_index -= 1;
                 }
             }
-            UiMode::Types => {
-                if self.type_index > 0 {
-                    self.type_index -= 1;
-                    self.path_index = 0;
-                }
-            }
-            UiMode::Data => {
-                if self.data_index > 0 {
-                    self.data_index -= 1;
-                }
-            }
-        }
-    }
-
-    fn move_down(&mut self) {
-        match self.mode {
-            UiMode::Live => {
-                let was_follow = self.live_follow;
-                let total = self.visible_live_events().len();
-                if total == 0 {
-                    return;
-                }
-                if self.live_event_index + 1 < total {
-                    self.live_event_index += 1;
-                }
-                if self.live_event_index >= self.live_view_start + self.live_window_rows.max(1) {
-                    let window = self.live_window_rows.max(1);
-                    self.live_view_start = self.live_event_index + 1 - window;
-                }
-                self.live_follow = false;
-                if was_follow {
-                    self.live_view_start = self.live_event_index.saturating_sub(10);
-                    self.live_edge_until_center = true;
-                }
-                self.reposition_live_selection();
-            }
-            UiMode::Periods => {
+            NavIntent::LineDown => {
                 let periods = self.model.closed_periods();
                 if self.periods_index + 1 < periods.len() {
                     self.periods_index += 1;
                     self.period_event_index = 0;
                 }
             }
-            UiMode::Types => {
-                let n = self.visible_types().len();
+            NavIntent::Home => {
+                self.periods_index = 0;
+                self.period_event_index = 0;
+            }
+            NavIntent::End => {
+                let periods = self.model.closed_periods();
+                self.periods_index = periods.len().saturating_sub(1);
+                self.period_event_index = 0;
+            }
+            NavIntent::Left => {
+                self.period_event_index = self.period_event_index.saturating_sub(1);
+            }
+            NavIntent::Right => {
+                let n = self.visible_period_events().len();
+                if self.period_event_index + 1 < n {
+                    self.period_event_index += 1;
+                }
+            }
+            NavIntent::PageUp | NavIntent::PageDown => {}
+        }
+    }
+
+    fn navigate_types(&mut self, intent: NavIntent) {
+        let n = self.visible_types().len();
+        if n == 0 {
+            self.type_index = 0;
+            self.path_index = 0;
+            return;
+        }
+        match intent {
+            NavIntent::LineUp => {
+                if self.type_index > 0 {
+                    self.type_index -= 1;
+                    self.path_index = 0;
+                }
+            }
+            NavIntent::LineDown => {
                 if self.type_index + 1 < n {
                     self.type_index += 1;
                     self.path_index = 0;
                 }
             }
-            UiMode::Data => {
-                self.data_index += 1;
+            NavIntent::Home => {
+                self.type_index = 0;
+                self.path_index = 0;
             }
-        }
-    }
-
-    fn move_left(&mut self) {
-        match self.mode {
-            UiMode::Types => {
-                if self.path_index > 0 {
-                    self.path_index -= 1;
-                }
+            NavIntent::End => {
+                self.type_index = n.saturating_sub(1);
+                self.path_index = 0;
             }
-            UiMode::Periods => {
-                if self.period_event_index > 0 {
-                    self.period_event_index -= 1;
-                }
+            NavIntent::Left => {
+                self.path_index = self.path_index.saturating_sub(1);
             }
-            _ => {}
-        }
-    }
-
-    fn move_right(&mut self) {
-        match self.mode {
-            UiMode::Types => {
+            NavIntent::Right => {
                 let visible = self.visible_types();
                 if let Some(type_id) = visible.get(self.type_index) {
                     if let Some(tp) = self.model.types.get(type_id) {
@@ -592,63 +785,41 @@ impl App {
                     }
                 }
             }
-            UiMode::Periods => {
-                let n = self.visible_period_events().len();
-                if self.period_event_index + 1 < n {
-                    self.period_event_index += 1;
-                }
-            }
-            _ => {}
+            NavIntent::PageUp | NavIntent::PageDown => {}
         }
     }
 
-    fn page_up(&mut self) {
-        match self.mode {
-            UiMode::Live => {
-                let total = self.visible_live_events().len();
-                if total == 0 {
-                    return;
-                }
-                self.live_follow = false;
-                let window = self.live_window_rows.max(1);
-                let step = window.saturating_sub(20).max(1);
-                self.live_event_index = self.live_event_index.saturating_sub(step);
-                self.live_view_start = self.live_view_start.saturating_sub(step);
-                self.clamp_live_indices();
-                self.reposition_live_selection();
-            }
-            UiMode::Data => {
-                self.data_index = self.data_index.saturating_sub(30);
-            }
-            _ => {}
-        }
+    fn navigate_data(&mut self, intent: NavIntent) {
+        let total = self.model.filtered_events(&self.event_filters).len();
+        let page_step = 30usize;
+        self.data_index = match intent {
+            NavIntent::LineUp => self.data_index.saturating_sub(1),
+            NavIntent::LineDown => self.data_index.saturating_add(1),
+            NavIntent::PageUp => self.data_index.saturating_sub(page_step),
+            NavIntent::PageDown => self.data_index.saturating_add(page_step),
+            NavIntent::Home => 0,
+            NavIntent::End => total.saturating_sub(1),
+            NavIntent::Left | NavIntent::Right => self.data_index,
+        };
     }
 
-    fn page_down(&mut self) {
-        match self.mode {
-            UiMode::Live => {
-                let total = self.visible_live_events().len();
-                if total == 0 {
-                    return;
-                }
-                self.live_follow = false;
-                let window = self.live_window_rows.max(1);
-                let step = window.saturating_sub(20).max(1);
-                self.live_event_index = (self.live_event_index + step).min(total.saturating_sub(1));
-                self.live_view_start = self.live_view_start.saturating_add(step);
-                self.clamp_live_indices();
-                self.reposition_live_selection();
-            }
-            UiMode::Data => {
-                self.data_index = self.data_index.saturating_add(30);
-            }
-            _ => {}
+    fn live_page_step(&self) -> usize {
+        let window = self.live_window_rows.max(1);
+        // Page by almost a full viewport while keeping a tiny context overlap.
+        if window <= 3 {
+            1
+        } else {
+            window.saturating_sub(2)
         }
     }
 
     fn open_selected_event(&mut self) {
         let selected = match self.mode {
-            UiMode::Live => self.visible_live_events().get(self.live_event_index).cloned().cloned(),
+            UiMode::Live => self
+                .visible_live_events()
+                .get(self.live_event_index)
+                .cloned()
+                .cloned(),
             UiMode::Periods => self
                 .visible_period_events()
                 .get(self.period_event_index)
@@ -827,7 +998,8 @@ impl App {
 
             // During the transition out of follow mode, do not auto-scroll toward center.
             // Let user movement naturally move the selected row to center, then lock it there.
-            if self.live_view_start == target_start && target_start > 0 && target_start < max_start {
+            if self.live_view_start == target_start && target_start > 0 && target_start < max_start
+            {
                 self.live_edge_until_center = false;
             }
         } else {
@@ -858,7 +1030,9 @@ impl App {
                 }
                 let name = tp.name.clone().unwrap_or_default().to_lowercase();
                 let default = format!("type-{}", &type_id[..8]).to_lowercase();
-                type_id.to_lowercase().contains(&query) || name.contains(&query) || default.contains(&query)
+                type_id.to_lowercase().contains(&query)
+                    || name.contains(&query)
+                    || default.contains(&query)
             })
             .map(|(type_id, _)| type_id.clone())
             .collect()
@@ -893,7 +1067,10 @@ impl App {
             self.period_event_index = 0;
             self.live_event_index = 0;
             self.refresh_live_position();
-            self.status = format!("Applied type filter: {}", self.model.type_display_name(type_id));
+            self.status = format!(
+                "Applied type filter: {}",
+                self.model.type_display_name(type_id)
+            );
         }
     }
 
@@ -905,17 +1082,6 @@ impl App {
         if let Some(type_id) = visible.get(self.type_index) {
             let type_id = type_id.clone();
             self.model.toggle_known_unrelated_type(&type_id);
-        }
-    }
-
-    fn toggle_known_unrelated_pair(&mut self) {
-        if self.mode != UiMode::Live {
-            return;
-        }
-        if let Some(c) = self.model.correlations.get(self.corr_index) {
-            let label = c.label.clone();
-            let type_id = c.type_id.clone();
-            self.model.toggle_known_unrelated_pair(&label, &type_id);
         }
     }
 }
@@ -953,4 +1119,120 @@ fn unix_ts() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+fn normalize_navigation_code(key: KeyEvent) -> KeyCode {
+    match key.code {
+        // Some terminals encode fn+arrows with modifier variants instead of PageUp/PageDown.
+        KeyCode::Up
+            if key.modifiers.intersects(
+                KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::SUPER | KeyModifiers::META,
+            ) =>
+        {
+            KeyCode::PageUp
+        }
+        KeyCode::Down
+            if key.modifiers.intersects(
+                KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::SUPER | KeyModifiers::META,
+            ) =>
+        {
+            KeyCode::PageDown
+        }
+        _ => key.code,
+    }
+}
+
+fn setup_stream_watcher(
+    stream_path: &Path,
+) -> Result<(RecommendedWatcher, Receiver<notify::Result<notify::Event>>)> {
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = RecommendedWatcher::new(
+        move |res| {
+            let _ = tx.send(res);
+        },
+        Config::default(),
+    )?;
+
+    let target = if stream_path.exists() {
+        stream_path.to_path_buf()
+    } else {
+        nearest_existing_ancestor(stream_path)
+    };
+    watcher.watch(&target, RecursiveMode::NonRecursive)?;
+    Ok((watcher, rx))
+}
+
+fn nearest_existing_ancestor(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if ancestor.exists() {
+            return ancestor.to_path_buf();
+        }
+    }
+    PathBuf::from(".")
+}
+
+fn should_poll_from_watch_event(ev: &notify::Event, stream_path: &Path) -> bool {
+    let stream_name = stream_path.file_name();
+    let stream_parent = stream_path.parent();
+    let touches_stream = ev.paths.is_empty()
+        || ev.paths.iter().any(|p| {
+            if p == stream_path {
+                return true;
+            }
+            if p.file_name() != stream_name {
+                return false;
+            }
+            match (p.parent(), stream_parent) {
+                (Some(p_parent), Some(s_parent)) => p_parent == s_parent,
+                _ => false,
+            }
+        });
+    if !touches_stream {
+        return false;
+    }
+
+    match ev.kind {
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any => {
+            true
+        }
+        EventKind::Access(_) | EventKind::Other => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_navigation_code;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn leaves_home_and_end_unchanged() {
+        assert_eq!(
+            normalize_navigation_code(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            KeyCode::Home
+        );
+        assert_eq!(
+            normalize_navigation_code(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            KeyCode::End
+        );
+    }
+
+    #[test]
+    fn normalizes_modified_arrows_to_page_navigation() {
+        assert_eq!(
+            normalize_navigation_code(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+            KeyCode::PageUp
+        );
+        assert_eq!(
+            normalize_navigation_code(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)),
+            KeyCode::PageDown
+        );
+        assert_eq!(
+            normalize_navigation_code(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)),
+            KeyCode::PageUp
+        );
+        assert_eq!(
+            normalize_navigation_code(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER)),
+            KeyCode::PageDown
+        );
+    }
 }
