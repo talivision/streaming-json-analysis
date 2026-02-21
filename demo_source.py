@@ -30,6 +30,7 @@ import asyncio
 import json
 import os
 import random
+import signal
 import shutil
 import sys
 import termios
@@ -267,23 +268,48 @@ class KeyboardController:
             await self.stop_event.wait()
             return
 
-        while not self.stop_event.is_set():
-            ch = await asyncio.to_thread(sys.stdin.read, 1)
-            if not ch:
-                continue
-            if ch == "\x03":  # Ctrl+C in cbreak mode
-                self.stop_event.set()
-                break
-            key = ch.lower()
-            if key == "q":
-                self.stop_event.set()
-                break
-            if key == "?":
-                print_key_help()
-                continue
-            action = KEY_TO_ACTION.get(key)
-            if action:
-                source.trigger(action)
+        loop = asyncio.get_running_loop()
+        input_queue: asyncio.Queue[str] = asyncio.Queue()
+
+        def on_stdin_ready():
+            if self._fd is None:
+                return
+            ch = os.read(self._fd, 1).decode(errors="ignore")
+            if ch:
+                input_queue.put_nowait(ch)
+
+        loop.add_reader(self._fd, on_stdin_ready)
+        try:
+            while not self.stop_event.is_set():
+                get_ch_task = asyncio.create_task(input_queue.get())
+                stop_task = asyncio.create_task(self.stop_event.wait())
+                done, pending = await asyncio.wait(
+                    {get_ch_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+
+                if stop_task in done:
+                    break
+
+                ch = get_ch_task.result()
+                if ch == "\x03":
+                    self.stop_event.set()
+                    break
+                key = ch.lower()
+                if key == "q":
+                    self.stop_event.set()
+                    break
+                if key == "?":
+                    print_key_help()
+                    continue
+                action = KEY_TO_ACTION.get(key)
+                if action:
+                    source.trigger(action)
+        finally:
+            loop.remove_reader(self._fd)
 
 
 def setup_output_dir():
@@ -323,6 +349,14 @@ async def main():
     print_key_help()
     print("Streaming objects...")
 
+    loop = asyncio.get_running_loop()
+    has_sigint_handler = False
+    try:
+        loop.add_signal_handler(signal.SIGINT, stop_event.set)
+        has_sigint_handler = True
+    except NotImplementedError:
+        has_sigint_handler = False
+
     try:
         with KeyboardController(stop_event) as keyboard:
             bg_task = asyncio.create_task(source.run_background(stop_event))
@@ -332,6 +366,8 @@ async def main():
                 t.cancel()
             await asyncio.gather(kb_task, bg_task, return_exceptions=True)
     finally:
+        if has_sigint_handler:
+            loop.remove_signal_handler(signal.SIGINT)
         source.close()
 
 
