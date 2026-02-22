@@ -69,6 +69,7 @@ pub struct App {
     pub types_filter: String,
     pub type_index: usize,
     pub path_index: usize,
+    pub types_path_focus: bool,
     pub data_index: usize,
     pub periods_index: usize,
     pub period_event_index: usize,
@@ -81,6 +82,7 @@ pub struct App {
     pub live_value_focus: bool,
     pub live_resume_follow_on_key_exit: bool,
     pub return_to_live_object_on_types_esc: bool,
+    pub return_to_types_on_live_esc: bool,
     pub live_key_index: usize,
     pub show_help_overlay: bool,
 
@@ -114,6 +116,7 @@ impl App {
             types_filter: String::new(),
             type_index: 0,
             path_index: 0,
+            types_path_focus: false,
             data_index: 0,
             periods_index: 0,
             period_event_index: 0,
@@ -126,6 +129,7 @@ impl App {
             live_value_focus: false,
             live_resume_follow_on_key_exit: false,
             return_to_live_object_on_types_esc: false,
+            return_to_types_on_live_esc: false,
             live_key_index: 0,
             show_help_overlay: false,
 
@@ -350,28 +354,49 @@ impl App {
             KeyCode::Char('1') => {
                 self.mode = UiMode::Live;
                 self.return_to_live_object_on_types_esc = false;
+                self.return_to_types_on_live_esc = false;
+                self.types_path_focus = false;
                 self.clamp_live_key_selection();
             }
             KeyCode::Char('2') => {
                 self.mode = UiMode::Periods;
                 self.return_to_live_object_on_types_esc = false;
+                self.return_to_types_on_live_esc = false;
+                self.types_path_focus = false;
                 self.exit_live_key_focus();
             }
             KeyCode::Char('3') => {
                 self.mode = UiMode::Types;
                 self.return_to_live_object_on_types_esc = false;
+                self.return_to_types_on_live_esc = false;
+                self.types_path_focus = false;
                 self.exit_live_key_focus();
             }
             KeyCode::Char('4') => {
                 self.mode = UiMode::Data;
                 self.return_to_live_object_on_types_esc = false;
+                self.return_to_types_on_live_esc = false;
+                self.types_path_focus = false;
                 self.exit_live_key_focus();
+            }
+            KeyCode::Esc if self.mode == UiMode::Live && self.return_to_types_on_live_esc => {
+                self.mode = UiMode::Types;
+                self.return_to_types_on_live_esc = false;
+                self.event_filters.type_filter.clear();
+                self.stashed_event_filters = None;
+                self.refresh_live_position();
+                self.live_key_focus = false;
+                self.live_value_focus = false;
+                self.types_path_focus = false;
+                self.status = "Returned to Types (type filter cleared)".to_string();
             }
             KeyCode::Esc
                 if self.mode == UiMode::Types && self.return_to_live_object_on_types_esc =>
             {
                 self.mode = UiMode::Live;
                 self.return_to_live_object_on_types_esc = false;
+                self.return_to_types_on_live_esc = false;
+                self.types_path_focus = false;
                 self.live_key_focus = true;
                 self.live_value_focus = false;
                 self.clamp_live_indices();
@@ -479,6 +504,7 @@ impl App {
                 }
             }
             KeyCode::Enter if self.mode == UiMode::Live => self.toggle_live_key_focus(),
+            KeyCode::Enter if self.mode == UiMode::Types => self.enter_types_path_focus(),
             KeyCode::Enter => self.open_selected_event(),
             KeyCode::Char(' ') => self.toggle_current_path(),
             KeyCode::Char('u') => self.toggle_known_unrelated(),
@@ -519,8 +545,10 @@ impl App {
                 if let Some(ins) = self.inspector.as_ref() {
                     if let Some(idx) = self.model.find_type_index(&ins.event.type_id) {
                         self.mode = UiMode::Types;
+                        self.return_to_types_on_live_esc = false;
                         self.type_index = idx;
                         self.path_index = 0;
+                        self.types_path_focus = false;
                         self.status = format!(
                             "Jumped to type {}",
                             self.model.type_display_name(&ins.event.type_id)
@@ -564,6 +592,8 @@ impl App {
                     InputMode::TypesFilter => {
                         self.types_filter = self.input_buffer.trim().to_string();
                         self.type_index = 0;
+                        self.path_index = 0;
+                        self.types_path_focus = false;
                     }
                     InputMode::RenameType => {
                         let visible = self.visible_types();
@@ -766,45 +796,61 @@ impl App {
     }
 
     fn navigate_types(&mut self, intent: NavIntent) {
-        let n = self.visible_types().len();
+        let visible = self.visible_types();
+        let n = visible.len();
         if n == 0 {
             self.type_index = 0;
             self.path_index = 0;
+            self.types_path_focus = false;
             return;
         }
+        let selected_type = visible.get(self.type_index);
+        let path_count = selected_type
+            .and_then(|type_id| self.model.types.get(type_id))
+            .map(|tp| tp.considered_paths.len())
+            .unwrap_or(0);
         match intent {
             NavIntent::LineUp => {
-                if self.type_index > 0 {
+                if self.types_path_focus {
+                    self.path_index = self.path_index.saturating_sub(1);
+                } else if self.type_index > 0 {
                     self.type_index -= 1;
                     self.path_index = 0;
                 }
             }
             NavIntent::LineDown => {
-                if self.type_index + 1 < n {
+                if self.types_path_focus {
+                    if self.path_index + 1 < path_count {
+                        self.path_index += 1;
+                    }
+                } else if self.type_index + 1 < n {
                     self.type_index += 1;
                     self.path_index = 0;
                 }
             }
             NavIntent::Home => {
-                self.type_index = 0;
-                self.path_index = 0;
+                if self.types_path_focus {
+                    self.path_index = 0;
+                } else {
+                    self.type_index = 0;
+                    self.path_index = 0;
+                }
             }
             NavIntent::End => {
-                self.type_index = n.saturating_sub(1);
-                self.path_index = 0;
+                if self.types_path_focus {
+                    self.path_index = path_count.saturating_sub(1);
+                } else {
+                    self.type_index = n.saturating_sub(1);
+                    self.path_index = 0;
+                }
             }
             NavIntent::Left => {
-                self.path_index = self.path_index.saturating_sub(1);
+                if self.types_path_focus {
+                    self.types_path_focus = false;
+                }
             }
             NavIntent::Right => {
-                let visible = self.visible_types();
-                if let Some(type_id) = visible.get(self.type_index) {
-                    if let Some(tp) = self.model.types.get(type_id) {
-                        if self.path_index + 1 < tp.considered_paths.len() {
-                            self.path_index += 1;
-                        }
-                    }
-                }
+                self.enter_types_path_focus();
             }
             NavIntent::PageUp | NavIntent::PageDown => {}
         }
@@ -989,8 +1035,10 @@ impl App {
         if let Some(idx) = self.model.find_type_index(&type_id) {
             let type_name = self.model.type_display_name(&type_id);
             self.mode = UiMode::Types;
+            self.return_to_types_on_live_esc = false;
             self.type_index = idx;
             self.path_index = 0;
+            self.types_path_focus = false;
             self.live_key_focus = false;
             self.live_value_focus = false;
             self.return_to_live_object_on_types_esc = true;
@@ -1250,7 +1298,7 @@ impl App {
     }
 
     fn toggle_current_path(&mut self) {
-        if self.mode != UiMode::Types {
+        if self.mode != UiMode::Types || !self.types_path_focus {
             return;
         }
         let visible = self.visible_types();
@@ -1273,16 +1321,39 @@ impl App {
         if let Some(type_id) = visible.get(self.type_index) {
             self.stashed_event_filters = None;
             self.event_filters.type_filter = self.model.canonical_type_name(type_id);
-            self.mode = UiMode::Data;
-            self.data_index = 0;
+            self.mode = UiMode::Live;
+            self.return_to_types_on_live_esc = true;
             self.period_event_index = 0;
             self.live_event_index = 0;
+            self.types_path_focus = false;
             self.refresh_live_position();
             self.status = format!(
-                "Applied type filter: {}",
+                "Applied type filter in Live: {} (Esc to return)",
                 self.model.type_display_name(type_id)
             );
         }
+    }
+
+    fn enter_types_path_focus(&mut self) {
+        if self.mode != UiMode::Types {
+            return;
+        }
+        let visible = self.visible_types();
+        let Some(type_id) = visible.get(self.type_index) else {
+            self.types_path_focus = false;
+            return;
+        };
+        let Some(tp) = self.model.types.get(type_id) else {
+            self.types_path_focus = false;
+            return;
+        };
+        if tp.considered_paths.is_empty() {
+            self.types_path_focus = false;
+            self.status = "Selected type has no paths".to_string();
+            return;
+        }
+        self.types_path_focus = true;
+        self.path_index = self.path_index.min(tp.considered_paths.len().saturating_sub(1));
     }
 
     fn toggle_known_unrelated(&mut self) {

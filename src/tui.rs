@@ -258,6 +258,57 @@ fn live_json_title(app: &App, pane_width: u16) -> Line<'static> {
     }
 }
 
+fn type_details_title(app: &App, pane_width: u16) -> Line<'static> {
+    let hotkey = |label: &str| {
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    if !app.types_path_focus {
+        if pane_width < 64 {
+            return Line::from(vec![
+                Span::raw("Type Details / Paths ("),
+                hotkey("t"),
+                Span::raw(", "),
+                hotkey("u"),
+                Span::raw(")"),
+            ]);
+        }
+        return Line::from(vec![
+            Span::raw("Type Details / Paths ("),
+            hotkey("t"),
+            Span::raw(" filter to live, "),
+            hotkey("u"),
+            Span::raw(" toggle unrelated)"),
+        ]);
+    }
+    let narrow = pane_width < 64;
+    if narrow {
+        Line::from(vec![
+            Span::raw("Type Details / Paths ("),
+            hotkey("space"),
+            Span::raw(", "),
+            hotkey("t"),
+            Span::raw(", "),
+            hotkey("u"),
+            Span::raw(")"),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw("Type Details / Paths ("),
+            hotkey("space"),
+            Span::raw(" toggle path, "),
+            hotkey("t"),
+            Span::raw(" filter to live, "),
+            hotkey("u"),
+            Span::raw(" toggle unrelated)"),
+        ])
+    }
+}
+
 fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -274,7 +325,11 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     for (idx, (type_id, tp)) in visible.iter().enumerate() {
         let mut style = Style::default();
         if idx == app.type_index {
-            style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+            style = if app.types_path_focus {
+                style.fg(Color::Gray)
+            } else {
+                style.fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            };
         }
         if tp.known_unrelated {
             style = style.fg(Color::DarkGray);
@@ -291,12 +346,16 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
             style,
         )])));
     }
+    let type_title = format!(
+        "Types ({})  [enter/right details, t filter, / search]",
+        if app.types_path_focus {
+            "details focus"
+        } else {
+            "list focus"
+        }
+    );
     frame.render_widget(
-        List::new(type_items).block(
-            Block::default()
-                .title("Types (filtered)")
-                .borders(Borders::ALL),
-        ),
+        List::new(type_items).block(Block::default().title(type_title).borders(Borders::ALL)),
         cols[0],
     );
 
@@ -308,36 +367,35 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(format!("id: {}", type_id)));
-        lines.push(Line::from(format!(
-            "paths considered: {}",
-            tp.considered_paths.len()
-        )));
-        lines.push(Line::from(
-            "Legend: [AUTO ON] [AUTO OFF] [FORCED ON] [FORCED OFF]",
-        ));
-        lines.push(Line::from("space cycles: auto -> forced off/on -> auto"));
         lines.push(Line::from(""));
 
         for (idx, (path, on)) in tp.considered_paths.iter().enumerate() {
-            let sel = if idx == app.path_index { ">" } else { " " };
+            let selected = idx == app.path_index;
+            let sel = if selected { ">" } else { " " };
             let override_mode = tp.path_overrides.get(path.as_str()).copied();
             let (marker, color) = match (override_mode, *on) {
-                (Some(PathOverride::ForcedOn), _) => ("[FORCED ON]", Color::LightGreen),
-                (Some(PathOverride::ForcedOff), _) => ("[FORCED OFF]", Color::LightRed),
-                (None, true) => ("[AUTO ON]", Color::Green),
-                (None, false) => ("[AUTO OFF]", Color::DarkGray),
+                (Some(PathOverride::ForcedOn), _) => ("[MANUAL INCLUDE]", Color::LightGreen),
+                (Some(PathOverride::ForcedOff), _) => ("[MANUAL EXCLUDE]", Color::LightRed),
+                (None, true) => ("[AUTO INCLUDE]", Color::Green),
+                (None, false) => ("[AUTO EXCLUDE]", Color::DarkGray),
             };
             let mode = if override_mode.is_some() {
-                "user override"
+                "manual"
             } else {
                 "auto"
+            };
+            let path_style = if selected && app.types_path_focus {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
             };
             lines.push(Line::from(vec![
                 Span::raw(format!("{} ", sel)),
                 Span::styled(marker, Style::default().fg(color)),
                 Span::raw(" "),
-                Span::raw(format!("{} ({})", path, mode)),
+                Span::styled(format!("{} ({})", path, mode), path_style),
             ]));
         }
 
@@ -351,7 +409,11 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: true })
-            .block(Block::default().title("Type Details").borders(Borders::ALL)),
+            .block(
+                Block::default()
+                    .title(type_details_title(app, cols[1].width))
+                    .borders(Borders::ALL),
+            ),
         cols[1],
     );
 }
@@ -524,6 +586,12 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         truncate_text(&app.event_filters.exact_filter, 20)
     };
+    let unrelated_count = app.model.types.values().filter(|tp| tp.known_unrelated).count();
+    let unrelated = if unrelated_count == 0 {
+        "off".to_string()
+    } else {
+        format!("{}", unrelated_count)
+    };
 
     let mut row = vec![Span::raw(" ")];
     let mut push_value = |label: &str, value: String, active: bool, idx: usize| {
@@ -547,9 +615,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let labels = if show_long_names {
-        ["k/key", "t/type", "/fuzzy", "e/exact"]
+        ["k/key", "t/type", "/fuzzy", "e/exact", "u/unrelated"]
     } else {
-        ["k", "t", "/", "e"]
+        ["k", "t", "/", "e", "u"]
     };
     push_value(labels[0], key, !app.event_filters.key_filter.is_empty(), 0);
     push_value(labels[1], typ, !app.event_filters.type_filter.is_empty(), 1);
@@ -565,6 +633,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         !app.event_filters.exact_filter.is_empty(),
         3,
     );
+    push_value(labels[4], unrelated, unrelated_count > 0, 4);
     row.push(Span::raw("  "));
     row.push(Span::styled("state:", Style::default().fg(Color::Gray)));
     if app.filters_suspended() {
@@ -639,9 +708,11 @@ fn draw_full_help(frame: &mut Frame<'_>) {
         Line::from(""),
         Line::from("Types"),
         Line::from("  / filter types by id or name"),
-        Line::from("  t apply selected type as event filter and jump to Data"),
+        Line::from("  t apply selected type as event filter and jump to Live"),
+        Line::from("  after t: esc returns to Types"),
         Line::from("  r rename selected type"),
-        Line::from("  left/right choose path, space cycles AUTO/FORCED state"),
+        Line::from("  enter/right focus paths, left return to type list"),
+        Line::from("  with path focus: up/down choose path, space toggle include/exclude"),
         Line::from("  u mark type known unrelated"),
         Line::from(""),
         Line::from("Data"),

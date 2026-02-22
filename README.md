@@ -112,9 +112,11 @@ Periods mode:
 Types mode:
 
 - `up/down`: select type
-- `t`: apply selected type as event filter and jump to Data mode
-- `left/right`: select uniqueness path
-- `space`: toggle path on/off for uniqueness analysis
+- `t`: apply selected type as event filter and jump to Live mode
+- after `t`, `esc` in Live returns to Types
+- `enter` or `right`: focus uniqueness paths for selected type
+- `left`: return from path focus to type list
+- while path-focused: `up/down` select path, `space` toggle include/exclude
 - `u`: mark selected type as known unrelated
 - `/`: filter type list
 - `r`: rename selected type
