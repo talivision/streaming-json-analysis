@@ -1068,19 +1068,22 @@ fn render_event_line(
     } else {
         Style::default().fg(Color::Cyan)
     };
-    let show_metrics = e.in_action_period;
-    let show_uniq = e.live_uniq_score;
-    let show_rate = e.live_rate_score;
-    let (rate_text, value_text, tail_len) = if show_metrics {
-        let rate_live_text = format!("{:>5}", format_score(e.live_rate_score));
-        let value_live_text = format!("{:>5}", format_score(e.live_uniq_score));
-        // Tail is: "  " + "R:" + rate + "  " + "V:" + value
-        let tail_len =
-            2 + 2 + rate_live_text.chars().count() + 2 + 2 + value_live_text.chars().count();
-        (Some(rate_live_text), Some(value_live_text), tail_len)
+    // Build the metrics block text first so tail_len comes from the actual rendered string,
+    // not from manually summed constants that can drift out of sync with the spans below.
+    let metrics = if e.in_action_period {
+        let rate_str = format!("{:>5}", format_score(e.live_rate_score));
+        let value_str = format!("{:>5}", format_score(e.live_uniq_score));
+        let surprise_str = format!("{:>5}", format_score(e.live_surprise_score));
+        let rendered = format!("  R:{}  V:{}  S:{}", rate_str, value_str, surprise_str);
+        Some((rate_str, value_str, surprise_str, rendered))
     } else {
-        (None, None, 0)
+        None
     };
+    let tail_len = metrics
+        .as_ref()
+        .map(|(_, _, _, rendered)| rendered.chars().count())
+        .unwrap_or(0);
+
     let fixed_prefix = 2 + 1 + 3 + name.chars().count() + 1;
     let mut obj_budget = row_width.saturating_sub(fixed_prefix + tail_len);
     obj_budget = obj_budget.min(48);
@@ -1093,16 +1096,6 @@ fn render_event_line(
     let spacer_len = row_width.saturating_sub(line_len);
     let spacer = " ".repeat(spacer_len);
 
-    let rate_color = if show_metrics {
-        rate_anomaly_color(anomaly_norm(show_rate))
-    } else {
-        Color::DarkGray
-    };
-    let value_color = if show_metrics {
-        value_anomaly_color(anomaly_norm(show_uniq))
-    } else {
-        Color::DarkGray
-    };
     let mut spans = vec![
         action_marker,
         Span::raw(" "),
@@ -1110,15 +1103,21 @@ fn render_event_line(
         Span::styled(format!("{} ", name), name_style),
         Span::styled(short, style),
     ];
-    if let (Some(rate_text), Some(value_text)) = (rate_text, value_text) {
+    if let Some((rate_str, value_str, surprise_str, _)) = metrics {
+        let rate_color = rate_anomaly_color(anomaly_norm(e.live_rate_score));
+        let value_color = value_anomaly_color(anomaly_norm(e.live_uniq_score));
+        let surprise_color = surprise_anomaly_color(anomaly_norm(e.live_surprise_score));
         spans.extend([
             Span::raw(spacer),
             Span::raw("  "),
             Span::styled("R:", Style::default().fg(Color::Gray)),
-            Span::styled(rate_text, Style::default().fg(rate_color)),
+            Span::styled(rate_str, Style::default().fg(rate_color)),
             Span::raw("  "),
             Span::styled("V:", Style::default().fg(Color::Gray)),
-            Span::styled(value_text, Style::default().fg(value_color)),
+            Span::styled(value_str, Style::default().fg(value_color)),
+            Span::raw("  "),
+            Span::styled("S:", Style::default().fg(Color::Gray)),
+            Span::styled(surprise_str, Style::default().fg(surprise_color)),
         ]);
     }
     Line::from(spans)
@@ -1171,6 +1170,11 @@ fn value_anomaly_color(norm: f64) -> Color {
 
 fn rate_anomaly_color(norm: f64) -> Color {
     let c = lerp_rgb((145, 145, 145), (0, 160, 255), norm);
+    Color::Rgb(c.0, c.1, c.2)
+}
+
+fn surprise_anomaly_color(norm: f64) -> Color {
+    let c = lerp_rgb((145, 145, 145), (30, 200, 100), norm);
     Color::Rgb(c.0, c.1, c.2)
 }
 
