@@ -15,7 +15,9 @@ fn temp_stream_path() -> PathBuf {
         .as_nanos();
     let seq = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    std::env::temp_dir().join(format!("json_analyzer_stream_reader_{pid}_{nanos}_{seq}.jsonl"))
+    std::env::temp_dir().join(format!(
+        "json_analyzer_stream_reader_{pid}_{nanos}_{seq}.jsonl"
+    ))
 }
 
 #[test]

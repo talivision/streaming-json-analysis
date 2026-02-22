@@ -790,12 +790,11 @@ fn render_json_value_lines(
         _ => {
             let value_text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
             let tail = if is_last { "" } else { "," };
-            out.push(Line::from(format!(
-                "{}{}{}",
-                "  ".repeat(indent),
-                value_text,
-                tail
-            )));
+            out.push(Line::from(vec![
+                Span::raw("  ".repeat(indent)),
+                Span::styled(value_text, json_value_style(value)),
+                Span::styled(tail, json_punctuation_style()),
+            ]));
         }
     }
 }
@@ -813,7 +812,7 @@ fn render_json_keyed_value_line(
 ) {
     let selected = selected_path == Some(path);
     let filtered = !active_key_filter.is_empty() && active_key_filter == path;
-    let key_style = if selected {
+    let key_override = if selected {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -823,10 +822,8 @@ fn render_json_keyed_value_line(
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
     };
-    let open_style = if selected {
+    let punctuation_override = if selected {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
@@ -838,14 +835,26 @@ fn render_json_keyed_value_line(
 
     let mut prefix = vec![Span::raw("  ".repeat(indent))];
     if let Some(k) = key {
-        prefix.push(Span::styled(format!("\"{}\"", k), key_style));
-        prefix.push(Span::raw(": "));
+        let key_style = if selected || filtered {
+            key_override
+        } else {
+            json_key_base_style()
+        };
+        prefix.push(Span::styled(format!("\"{k}\""), key_style));
+        prefix.push(Span::styled(": ", json_punctuation_style()));
     }
 
     match value {
         serde_json::Value::Object(map) => {
             let mut open = prefix;
-            open.push(Span::styled("{", open_style));
+            open.push(Span::styled(
+                "{",
+                if selected || filtered {
+                    punctuation_override
+                } else {
+                    json_punctuation_style()
+                },
+            ));
             out.push(Line::from(open));
             let len = map.len();
             for (idx, (k, child)) in map.iter().enumerate() {
@@ -865,12 +874,26 @@ fn render_json_keyed_value_line(
             let tail = if is_last { "}" } else { "}," };
             out.push(Line::from(vec![
                 Span::raw("  ".repeat(indent)),
-                Span::styled(tail, open_style),
+                Span::styled(
+                    tail,
+                    if selected || filtered {
+                        punctuation_override
+                    } else {
+                        json_punctuation_style()
+                    },
+                ),
             ]));
         }
         serde_json::Value::Array(arr) => {
             let mut open = prefix;
-            open.push(Span::styled("[", open_style));
+            open.push(Span::styled(
+                "[",
+                if selected || filtered {
+                    punctuation_override
+                } else {
+                    json_punctuation_style()
+                },
+            ));
             out.push(Line::from(open));
             for (idx, child) in arr.iter().enumerate() {
                 let child_path = format!("{}[]", path);
@@ -889,13 +912,20 @@ fn render_json_keyed_value_line(
             let tail = if is_last { "]" } else { "]," };
             out.push(Line::from(vec![
                 Span::raw("  ".repeat(indent)),
-                Span::styled(tail, open_style),
+                Span::styled(
+                    tail,
+                    if selected || filtered {
+                        punctuation_override
+                    } else {
+                        json_punctuation_style()
+                    },
+                ),
             ]));
         }
         _ => {
             let mut line = prefix;
             let value_text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
-            let value_style = if selected && value_focus {
+            let value_override = if selected && value_focus {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -904,15 +934,35 @@ fn render_json_keyed_value_line(
             } else if filtered {
                 Style::default().fg(Color::LightGreen)
             } else {
-                Style::default()
+                json_value_style(value)
             };
-            line.push(Span::styled(value_text, value_style));
+            line.push(Span::styled(value_text, value_override));
             if !is_last {
-                line.push(Span::raw(","));
+                line.push(Span::styled(",", json_punctuation_style()));
             }
             out.push(Line::from(line));
         }
     }
+}
+
+fn json_key_base_style() -> Style {
+    Style::default().fg(Color::Cyan)
+}
+
+fn json_value_style(value: &serde_json::Value) -> Style {
+    match value {
+        serde_json::Value::String(_) => Style::default().fg(Color::Green),
+        serde_json::Value::Number(_) => Style::default().fg(Color::Rgb(255, 165, 0)),
+        serde_json::Value::Bool(_) => Style::default().fg(Color::LightRed),
+        serde_json::Value::Null => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+        _ => Style::default(),
+    }
+}
+
+fn json_punctuation_style() -> Style {
+    Style::default().fg(Color::Gray)
 }
 
 fn render_event_line(
