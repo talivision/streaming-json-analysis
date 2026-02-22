@@ -8,7 +8,6 @@ const ACTION_BOUNDARY_EPS: f64 = 0.000_001;
 const MIN_ACTION_RATE_DURATION_SECS: f64 = 1.0;
 const VALUE_ANOMALY_RARE_FREQ: f64 = 0.25;
 const VALUE_ANOMALY_CURVE: f64 = 0.6;
-const SURPRISE_MAX_BITS: f64 = 25.0;
 
 #[derive(Debug, Clone)]
 pub struct EventRecord {
@@ -20,7 +19,6 @@ pub struct EventRecord {
     pub in_action_period: bool,
     pub live_rate_score: f64,
     pub live_uniq_score: f64,
-    pub live_surprise_score: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,7 +183,7 @@ impl AnalyzerModel {
         let active_period_id = self.active_period().map(|p| p.id);
         let in_action_period = active_period_id.is_some();
 
-        let (uniq, surprise) = {
+        let uniq = {
             let entry = self
                 .types
                 .entry(type_id.clone())
@@ -224,7 +222,6 @@ impl AnalyzerModel {
             in_action_period,
             live_rate_score: rate,
             live_uniq_score: uniq,
-            live_surprise_score: surprise,
         });
         while self.events.len() > MAX_EVENTS {
             self.events.pop_front();
@@ -239,14 +236,12 @@ impl AnalyzerModel {
             };
             let rate = self.recomputed_rate_for(&e.type_id, period_id);
             let uniq = self.recomputed_uniq_for(&e.type_id, &e.obj);
-            let surprise = self.recomputed_surprise_for(&e.type_id, &e.obj);
-            updates.push((idx, rate, uniq, surprise));
+            updates.push((idx, rate, uniq));
         }
-        for (idx, rate, uniq, surprise) in updates {
+        for (idx, rate, uniq) in updates {
             if let Some(e) = self.events.get_mut(idx) {
                 e.live_rate_score = rate;
                 e.live_uniq_score = uniq;
-                e.live_surprise_score = surprise;
             }
         }
     }
@@ -340,43 +335,6 @@ impl AnalyzerModel {
             }
         }
         max_score
-    }
-
-    fn recomputed_surprise_for(&self, type_id: &str, obj: &Value) -> f64 {
-        let Some(tp) = self.types.get(type_id) else {
-            return 0.0;
-        };
-        let mut scalar_paths = Vec::new();
-        collect_scalar_paths(obj, "", &mut scalar_paths);
-
-        let mut sum_surprise = 0.0;
-        for (path, token) in scalar_paths {
-            let Some(stats) = tp.path_stats.get(path.as_str()) else {
-                continue;
-            };
-            let auto = auto_consider_path(path.as_str(), stats);
-            let considered = match tp.path_overrides.get(path.as_str()).copied() {
-                Some(PathOverride::ForcedOn) => true,
-                Some(PathOverride::ForcedOff) => false,
-                None => tp
-                    .considered_paths
-                    .get(path.as_str())
-                    .copied()
-                    .unwrap_or(auto),
-            };
-            if !considered || stats.total <= 6 {
-                continue;
-            }
-            let baseline_stats = tp.baseline_path_stats.get(path.as_str());
-            let surprisal = if let Some(bstats) = baseline_stats {
-                let prev = bstats.values.get(token.as_str()).copied().unwrap_or(0);
-                compute_surprisal(prev, bstats.total)
-            } else {
-                compute_surprisal(0, 0)
-            };
-            sum_surprise += surprisal;
-        }
-        (sum_surprise / SURPRISE_MAX_BITS).clamp(0.0, 1.0)
     }
 
     pub fn toggle_type_path(&mut self, type_id: &str, path: &str) {
@@ -545,17 +503,11 @@ fn value_frequency_anomaly(prev: u64, total: u64) -> f64 {
     (1.0 - scaled.powf(VALUE_ANOMALY_CURVE)).clamp(0.0, 1.0)
 }
 
-fn compute_surprisal(prev: u64, total: u64) -> f64 {
-    let p = (prev + 1) as f64 / (total + 2) as f64; // Laplace smoothing
-    -p.log2()
-}
-
-fn update_uniqueness(tp: &mut TypeProfile, obj: &Value, in_action_period: bool) -> (f64, f64) {
+fn update_uniqueness(tp: &mut TypeProfile, obj: &Value, in_action_period: bool) -> f64 {
     let mut scalar_paths = Vec::new();
     collect_scalar_paths(obj, "", &mut scalar_paths);
 
     let mut max_score = 0.0;
-    let mut sum_surprise = 0.0;
     for (path, token) in scalar_paths {
         let stats = tp.path_stats.entry(path.clone()).or_default();
         let prev = stats.values.get(&token).copied().unwrap_or(0);
@@ -571,27 +523,20 @@ fn update_uniqueness(tp: &mut TypeProfile, obj: &Value, in_action_period: bool) 
         };
 
         if *considered && total > 6.0 {
-            let (s, surprisal) = if in_action_period {
+            let s = if in_action_period {
                 let baseline_stats = tp.baseline_path_stats.get(path.as_str());
                 if let Some(bstats) = baseline_stats {
                     let baseline_prev = bstats.values.get(token.as_str()).copied().unwrap_or(0);
-                    (
-                        value_frequency_anomaly(baseline_prev, bstats.total),
-                        compute_surprisal(baseline_prev, bstats.total),
-                    )
+                    value_frequency_anomaly(baseline_prev, bstats.total)
                 } else {
-                    (1.0, compute_surprisal(0, 0))
+                    1.0
                 }
             } else {
-                (
-                    value_frequency_anomaly(prev, stats.total),
-                    compute_surprisal(prev, stats.total),
-                )
+                value_frequency_anomaly(prev, stats.total)
             };
             if s > max_score {
                 max_score = s;
             }
-            sum_surprise += surprisal;
         }
 
         stats.total += 1;
@@ -612,7 +557,7 @@ fn update_uniqueness(tp: &mut TypeProfile, obj: &Value, in_action_period: bool) 
         }
     }
 
-    (max_score, (sum_surprise / SURPRISE_MAX_BITS).clamp(0.0, 1.0))
+    max_score
 }
 
 fn is_volatile_path(path: &str) -> bool {

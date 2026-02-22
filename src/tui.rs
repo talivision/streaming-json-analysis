@@ -1073,15 +1073,14 @@ fn render_event_line(
     let metrics = if e.in_action_period {
         let rate_str = format!("{:>5}", format_score(e.live_rate_score));
         let value_str = format!("{:>5}", format_score(e.live_uniq_score));
-        let surprise_str = format!("{:>5}", format_score(e.live_surprise_score));
-        let rendered = format!("  R:{}  V:{}  S:{}", rate_str, value_str, surprise_str);
-        Some((rate_str, value_str, surprise_str, rendered))
+        let rendered = format!("  R:{}  V:{}", rate_str, value_str);
+        Some((rate_str, value_str, rendered))
     } else {
         None
     };
     let tail_len = metrics
         .as_ref()
-        .map(|(_, _, _, rendered)| rendered.chars().count())
+        .map(|(_, _, rendered)| rendered.chars().count())
         .unwrap_or(0);
 
     let fixed_prefix = 2 + 1 + 3 + name.chars().count() + 1;
@@ -1103,10 +1102,9 @@ fn render_event_line(
         Span::styled(format!("{} ", name), name_style),
         Span::styled(short, style),
     ];
-    if let Some((rate_str, value_str, surprise_str, _)) = metrics {
+    if let Some((rate_str, value_str, _)) = metrics {
         let rate_color = rate_anomaly_color(anomaly_norm(e.live_rate_score));
         let value_color = value_anomaly_color(anomaly_norm(e.live_uniq_score));
-        let surprise_color = surprise_anomaly_color(anomaly_norm(e.live_surprise_score));
         spans.extend([
             Span::raw(spacer),
             Span::raw("  "),
@@ -1115,9 +1113,6 @@ fn render_event_line(
             Span::raw("  "),
             Span::styled("V:", Style::default().fg(Color::Gray)),
             Span::styled(value_str, Style::default().fg(value_color)),
-            Span::raw("  "),
-            Span::styled("S:", Style::default().fg(Color::Gray)),
-            Span::styled(surprise_str, Style::default().fg(surprise_color)),
         ]);
     }
     Line::from(spans)
@@ -1170,11 +1165,6 @@ fn value_anomaly_color(norm: f64) -> Color {
 
 fn rate_anomaly_color(norm: f64) -> Color {
     let c = lerp_rgb((145, 145, 145), (0, 160, 255), norm);
-    Color::Rgb(c.0, c.1, c.2)
-}
-
-fn surprise_anomaly_color(norm: f64) -> Color {
-    let c = lerp_rgb((145, 145, 145), (30, 200, 100), norm);
     Color::Rgb(c.0, c.1, c.2)
 }
 
