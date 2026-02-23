@@ -14,6 +14,14 @@ impl StreamReader {
         Self { path, offset: 0 }
     }
 
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
     pub fn poll(&mut self) -> Result<Vec<Value>> {
         if !self.path.exists() {
             self.offset = 0;

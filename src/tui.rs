@@ -481,6 +481,15 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(format!("{}: ", title), Style::default().fg(Color::Yellow)),
             Span::raw(app.input_buffer.clone()),
         ]));
+    } else if let Some(hint) = app.startup_hint() {
+        let max_hint = inner_width.saturating_sub(8).max(16);
+        text.push(Line::from(vec![
+            Span::styled("hint: ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                truncate_text(hint, max_hint),
+                Style::default().fg(Color::LightGreen),
+            ),
+        ]));
     } else {
         let mut row = Vec::new();
         let action_on = app.model.active_period().is_some();

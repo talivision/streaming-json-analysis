@@ -1,4 +1,5 @@
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -21,7 +22,7 @@ pub struct EventRecord {
     pub live_uniq_score: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActionPeriod {
     pub id: u64,
     pub label: String,
@@ -113,6 +114,7 @@ impl FilterField {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct AnalyzerModel {
     pub types: IndexMap<String, TypeProfile>,
     pub events: VecDeque<EventRecord>,
@@ -376,6 +378,39 @@ impl AnalyzerModel {
             } else {
                 tp.name = Some(cleaned.to_string());
             }
+        }
+    }
+
+    pub fn renamed_types(&self) -> Vec<(String, String)> {
+        self.types
+            .iter()
+            .filter_map(|(type_id, tp)| tp.name.clone().map(|name| (type_id.clone(), name)))
+            .collect()
+    }
+
+    pub fn apply_renames(&mut self, renames: &[(String, String)]) {
+        for (type_id, name) in renames {
+            self.rename_type(type_id, name.clone());
+        }
+    }
+
+    pub fn set_periods(&mut self, periods: Vec<ActionPeriod>) {
+        let mut sorted = periods;
+        sorted.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.id.cmp(&b.id)));
+        self.periods = sorted;
+        self.next_period_id = self.periods.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+        self.period_rate_states.clear();
+        for p in &self.periods {
+            self.period_rate_states.entry(p.id).or_default();
+        }
+        for event in self.events.iter_mut() {
+            let pid = self
+                .periods
+                .iter()
+                .find(|p| event.ts >= p.start && p.end.map(|end| event.ts <= end).unwrap_or(true))
+                .map(|p| p.id);
+            event.action_period_id = pid;
+            event.in_action_period = pid.is_some();
         }
     }
 

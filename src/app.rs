@@ -2,6 +2,7 @@ use crate::domain::{
     value_at_path, value_token, AnalyzerModel, DataFilters, EventRecord, FilterField,
 };
 use crate::io::StreamReader;
+use crate::persistence::{load_state, save_state, RestoredState};
 use crate::tui::{draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
 use crossterm::event::{
@@ -93,6 +94,8 @@ pub struct App {
     reader: StreamReader,
     offline_loaded: bool,
     offline_fallback_ts: f64,
+    pending_restore: Option<RestoredState>,
+    startup_hint: Option<String>,
 }
 
 impl App {
@@ -107,7 +110,7 @@ impl App {
             }
         }
 
-        Self {
+        let mut app = Self {
             model: AnalyzerModel::new(),
             mode: UiMode::Live,
             input_mode: InputMode::None,
@@ -147,7 +150,11 @@ impl App {
             reader: StreamReader::new(stream_path),
             offline_loaded: false,
             offline_fallback_ts: unix_ts(),
-        }
+            pending_restore: None,
+            startup_hint: None,
+        };
+        app.restore_persisted_state();
+        app
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -239,6 +246,9 @@ impl App {
             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         }
         terminal.show_cursor()?;
+        if let Err(err) = self.persist_state() {
+            eprintln!("warning: failed to persist session state: {err}");
+        }
         loop_result
     }
 
@@ -262,6 +272,7 @@ impl App {
                     let ts = self.resolve_event_ts(&e, batch_now, idx)?;
                     self.model.ingest(e, ts);
                 }
+                self.apply_persisted_overrides_if_ready();
 
                 if n > 0 {
                     self.status = format!("Ingested {} events", n);
@@ -282,7 +293,7 @@ impl App {
                         self.clamp_live_indices();
                         self.ensure_live_selection_visible();
                     }
-                } else if self.offline && !self.offline_loaded {
+                } else if self.offline && !self.offline_loaded && self.model.total_objects() == 0 {
                     self.status = "Offline mode: no events found".to_string();
                 }
 
@@ -314,7 +325,55 @@ impl App {
         ))
     }
 
+    fn restore_persisted_state(&mut self) {
+        match load_state(self.reader.path()) {
+            Ok(Some(saved)) => {
+                let msg = format!(
+                    "Restored session: {} periods, {} renames",
+                    saved.periods.len(),
+                    saved.renames.len()
+                );
+                self.pending_restore = Some(saved);
+                self.status = msg.clone();
+                self.startup_hint = Some(msg);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.status = format!("State restore skipped: {err}");
+                self.startup_hint = Some(self.status.clone());
+            }
+        }
+    }
+
+    fn apply_persisted_overrides_if_ready(&mut self) {
+        if self.pending_restore.is_none() || self.model.total_objects() == 0 {
+            return;
+        }
+        let saved = self.pending_restore.take().unwrap();
+        if !saved.current_label.trim().is_empty() {
+            self.model.current_label = saved.current_label;
+        }
+        if !saved.renames.is_empty() {
+            self.model.apply_renames(&saved.renames);
+        }
+        if !saved.periods.is_empty() {
+            self.model.set_periods(saved.periods);
+            self.model.refresh_live_anomaly_scores();
+        }
+    }
+
+    fn persist_state(&self) -> Result<()> {
+        save_state(
+            self.reader.path(),
+            self.reader.offset(),
+            &self.model.periods,
+            &self.model.renamed_types(),
+            &self.model.current_label,
+        )
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        self.startup_hint = None;
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
@@ -1295,6 +1354,10 @@ impl App {
             })
             .map(|(type_id, _)| type_id.clone())
             .collect()
+    }
+
+    pub fn startup_hint(&self) -> Option<&str> {
+        self.startup_hint.as_deref()
     }
 
     fn toggle_current_path(&mut self) {
