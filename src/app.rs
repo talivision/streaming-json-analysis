@@ -1,5 +1,6 @@
 use crate::domain::{
-    value_at_path, value_token, AnalyzerModel, DataFilters, EventRecord, FilterField,
+    classify_event, value_at_path, value_token, AnalyzerModel, DataFilters, EventRecord,
+    FilterField,
 };
 use crate::io::StreamReader;
 use crate::persistence::{load_state, save_state, RestoredState};
@@ -24,7 +25,6 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LIVE_WINDOW_DEFAULT: usize = 120;
-const DEFAULT_STREAM_PATH: &str = "/tmp/json_demo/stream.jsonl";
 const LIVE_RECOMPUTE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const UI_FRAME_SLEEP: Duration = Duration::from_millis(16);
@@ -74,6 +74,7 @@ pub struct App {
     pub data_index: usize,
     pub periods_index: usize,
     pub period_event_index: usize,
+    pub periods_event_focus: bool,
     pub live_event_index: usize, // absolute index in full live rows
     pub live_view_start: usize,
     pub live_window_rows: usize,
@@ -92,6 +93,9 @@ pub struct App {
     pub inspector: Option<ObjectInspector>,
     stashed_event_filters: Option<DataFilters>,
     reader: StreamReader,
+    baseline_reader: Option<StreamReader>,
+    baseline_events: Vec<EventRecord>,
+    baseline_loaded: bool,
     offline_loaded: bool,
     offline_fallback_ts: f64,
     pending_restore: Option<RestoredState>,
@@ -99,17 +103,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
-        let mut stream_path = PathBuf::from(DEFAULT_STREAM_PATH);
-        let mut offline = false;
-        for arg in std::env::args().skip(1) {
-            if arg == "--offline" {
-                offline = true;
-            } else if !arg.starts_with('-') {
-                stream_path = PathBuf::from(arg);
-            }
-        }
-
+    pub fn new(stream_path: PathBuf, baseline_path: Option<PathBuf>, offline: bool) -> Self {
         let mut app = Self {
             model: AnalyzerModel::new(),
             mode: UiMode::Live,
@@ -123,6 +117,7 @@ impl App {
             data_index: 0,
             periods_index: 0,
             period_event_index: 0,
+            periods_event_focus: false,
             live_event_index: 0,
             live_view_start: 0,
             live_window_rows: LIVE_WINDOW_DEFAULT,
@@ -148,6 +143,9 @@ impl App {
             inspector: None,
             stashed_event_filters: None,
             reader: StreamReader::new(stream_path),
+            baseline_reader: baseline_path.map(StreamReader::new),
+            baseline_events: Vec::new(),
+            baseline_loaded: false,
             offline_loaded: false,
             offline_fallback_ts: unix_ts(),
             pending_restore: None,
@@ -183,6 +181,10 @@ impl App {
         let loop_result = (|| -> Result<()> {
             loop {
                 let loop_started_at = Instant::now();
+
+                if !self.baseline_loaded {
+                    self.ingest_baseline_corpus()?;
+                }
 
                 let mut ingested_any = false;
                 if !self.offline || !self.offline_loaded {
@@ -309,6 +311,42 @@ impl App {
         }
     }
 
+    fn ingest_baseline_corpus(&mut self) -> Result<()> {
+        let Some(reader) = self.baseline_reader.as_mut() else {
+            self.baseline_loaded = true;
+            return Ok(());
+        };
+
+        let events = reader.poll()?;
+        let seed_ts = unix_ts();
+        for (idx, obj) in events.into_iter().enumerate() {
+            let ts = match parse_event_timestamp_millis(&obj)? {
+                Some(ts) => ts,
+                None => seed_ts + (idx as f64 * 0.001),
+            };
+            self.model.ingest_baseline(obj.clone(), ts);
+            let (type_id, keys) = classify_event(&obj);
+            self.baseline_events.push(EventRecord {
+                ts,
+                type_id,
+                obj,
+                keys,
+                action_period_id: None,
+                in_action_period: false,
+                live_rate_score: 0.0,
+                live_uniq_score: 0.0,
+            });
+        }
+
+        self.baseline_loaded = true;
+        self.status = format!(
+            "Baseline loaded: {} events from {}",
+            self.baseline_events.len(),
+            reader.path().display()
+        );
+        Ok(())
+    }
+
     fn resolve_event_ts(&mut self, obj: &Value, batch_now: f64, idx: usize) -> Result<f64> {
         match parse_event_timestamp_millis(obj)? {
             Some(ts) => return Ok(ts),
@@ -333,6 +371,12 @@ impl App {
                     saved.periods.len(),
                     saved.renames.len()
                 );
+                if !saved.current_label.trim().is_empty() {
+                    self.model.current_label = saved.current_label.clone();
+                }
+                if !saved.periods.is_empty() {
+                    self.model.set_periods(saved.periods.clone());
+                }
                 self.pending_restore = Some(saved);
                 self.status = msg.clone();
                 self.startup_hint = Some(msg);
@@ -350,15 +394,8 @@ impl App {
             return;
         }
         let saved = self.pending_restore.take().unwrap();
-        if !saved.current_label.trim().is_empty() {
-            self.model.current_label = saved.current_label;
-        }
         if !saved.renames.is_empty() {
             self.model.apply_renames(&saved.renames);
-        }
-        if !saved.periods.is_empty() {
-            self.model.set_periods(saved.periods);
-            self.model.refresh_live_anomaly_scores();
         }
     }
 
@@ -415,6 +452,7 @@ impl App {
                 self.return_to_live_object_on_types_esc = false;
                 self.return_to_types_on_live_esc = false;
                 self.types_path_focus = false;
+                self.periods_event_focus = false;
                 self.clamp_live_key_selection();
             }
             KeyCode::Char('2') => {
@@ -422,6 +460,7 @@ impl App {
                 self.return_to_live_object_on_types_esc = false;
                 self.return_to_types_on_live_esc = false;
                 self.types_path_focus = false;
+                self.periods_event_focus = false;
                 self.exit_live_key_focus();
             }
             KeyCode::Char('3') => {
@@ -429,6 +468,7 @@ impl App {
                 self.return_to_live_object_on_types_esc = false;
                 self.return_to_types_on_live_esc = false;
                 self.types_path_focus = false;
+                self.periods_event_focus = false;
                 self.exit_live_key_focus();
             }
             KeyCode::Char('4') => {
@@ -436,6 +476,7 @@ impl App {
                 self.return_to_live_object_on_types_esc = false;
                 self.return_to_types_on_live_esc = false;
                 self.types_path_focus = false;
+                self.periods_event_focus = false;
                 self.exit_live_key_focus();
             }
             KeyCode::Esc if self.mode == UiMode::Live && self.return_to_types_on_live_esc => {
@@ -447,6 +488,7 @@ impl App {
                 self.live_key_focus = false;
                 self.live_value_focus = false;
                 self.types_path_focus = false;
+                self.periods_event_focus = false;
                 self.status = "Returned to Types (type filter cleared)".to_string();
             }
             KeyCode::Esc
@@ -461,6 +503,7 @@ impl App {
                 self.clamp_live_indices();
                 self.ensure_live_selection_visible();
                 self.clamp_live_key_selection();
+                self.periods_event_focus = false;
                 self.status = "Returned to selected JSON".to_string();
             }
             KeyCode::Char('m') => {
@@ -564,6 +607,10 @@ impl App {
             }
             KeyCode::Enter if self.mode == UiMode::Live => self.toggle_live_key_focus(),
             KeyCode::Enter if self.mode == UiMode::Types => self.enter_types_path_focus(),
+            KeyCode::Enter if self.mode == UiMode::Periods && self.periods_event_focus => {
+                self.open_selected_event()
+            }
+            KeyCode::Enter if self.mode == UiMode::Periods => self.enter_period_event_focus(),
             KeyCode::Enter => self.open_selected_event(),
             KeyCode::Char(' ') => self.toggle_current_path(),
             KeyCode::Char('u') => self.toggle_known_unrelated(),
@@ -816,17 +863,55 @@ impl App {
     }
 
     fn navigate_periods(&mut self, intent: NavIntent) {
+        let periods = self.model.closed_periods();
+        if periods.is_empty() {
+            self.periods_index = 0;
+            self.period_event_index = 0;
+            self.periods_event_focus = false;
+            return;
+        }
+        self.periods_index = self.periods_index.min(periods.len().saturating_sub(1));
+
+        if self.periods_event_focus {
+            let n = self.visible_period_events().len();
+            if n == 0 {
+                self.period_event_index = 0;
+                self.periods_event_focus = false;
+                return;
+            }
+            self.period_event_index = self.period_event_index.min(n.saturating_sub(1));
+            match intent {
+                NavIntent::LineUp => {
+                    self.period_event_index = self.period_event_index.saturating_sub(1);
+                }
+                NavIntent::LineDown => {
+                    if self.period_event_index + 1 < n {
+                        self.period_event_index += 1;
+                    }
+                }
+                NavIntent::Home => {
+                    self.period_event_index = 0;
+                }
+                NavIntent::End => {
+                    self.period_event_index = n.saturating_sub(1);
+                }
+                NavIntent::Left => {
+                    self.periods_event_focus = false;
+                }
+                NavIntent::Right => {}
+                NavIntent::PageUp | NavIntent::PageDown => {}
+            }
+            return;
+        }
+
         match intent {
             NavIntent::LineUp => {
                 if self.periods_index > 0 {
                     self.periods_index -= 1;
                     self.period_event_index = 0;
-                } else if self.period_event_index > 0 {
-                    self.period_event_index -= 1;
                 }
             }
             NavIntent::LineDown => {
-                let periods = self.model.closed_periods();
                 if self.periods_index + 1 < periods.len() {
                     self.periods_index += 1;
                     self.period_event_index = 0;
@@ -837,17 +922,15 @@ impl App {
                 self.period_event_index = 0;
             }
             NavIntent::End => {
-                let periods = self.model.closed_periods();
                 self.periods_index = periods.len().saturating_sub(1);
                 self.period_event_index = 0;
             }
-            NavIntent::Left => {
-                self.period_event_index = self.period_event_index.saturating_sub(1);
-            }
+            NavIntent::Left => {}
             NavIntent::Right => {
                 let n = self.visible_period_events().len();
-                if self.period_event_index + 1 < n {
-                    self.period_event_index += 1;
+                if n > 0 {
+                    self.periods_event_focus = true;
+                    self.period_event_index = self.period_event_index.min(n.saturating_sub(1));
                 }
             }
             NavIntent::PageUp | NavIntent::PageDown => {}
@@ -916,7 +999,7 @@ impl App {
     }
 
     fn navigate_data(&mut self, intent: NavIntent) {
-        let total = self.model.filtered_events(&self.event_filters).len();
+        let total = self.visible_baseline_events().len();
         let page_step = 30usize;
         self.data_index = match intent {
             NavIntent::LineUp => self.data_index.saturating_sub(1),
@@ -1032,12 +1115,13 @@ impl App {
                 let n = self.visible_period_events().len();
                 if n == 0 {
                     self.period_event_index = 0;
+                    self.periods_event_focus = false;
                 } else {
                     self.period_event_index = self.period_event_index.min(n.saturating_sub(1));
                 }
             }
             UiMode::Data => {
-                let n = self.model.filtered_events(&self.event_filters).len();
+                let n = self.visible_baseline_events().len();
                 if n == 0 {
                     self.data_index = 0;
                 } else {
@@ -1128,8 +1212,7 @@ impl App {
                 .cloned()
                 .cloned(),
             UiMode::Data => self
-                .model
-                .filtered_events(&self.event_filters)
+                .visible_baseline_events()
                 .get(self.data_index)
                 .cloned()
                 .cloned(),
@@ -1152,6 +1235,11 @@ impl App {
         let mut events = self.model.filtered_events(&self.event_filters);
         events.reverse();
         events
+    }
+
+    pub fn visible_baseline_events(&self) -> Vec<&EventRecord> {
+        self.model
+            .filtered_event_slice(&self.baseline_events, &self.event_filters)
     }
 
     fn live_anchor_at(&self, index: usize) -> Option<LiveAnchor> {
@@ -1416,7 +1504,24 @@ impl App {
             return;
         }
         self.types_path_focus = true;
-        self.path_index = self.path_index.min(tp.considered_paths.len().saturating_sub(1));
+        self.path_index = self
+            .path_index
+            .min(tp.considered_paths.len().saturating_sub(1));
+    }
+
+    fn enter_period_event_focus(&mut self) {
+        if self.mode != UiMode::Periods {
+            return;
+        }
+        let n = self.visible_period_events().len();
+        if n == 0 {
+            self.periods_event_focus = false;
+            self.period_event_index = 0;
+            self.status = "Selected period has no events".to_string();
+            return;
+        }
+        self.periods_event_focus = true;
+        self.period_event_index = self.period_event_index.min(n.saturating_sub(1));
     }
 
     fn toggle_known_unrelated(&mut self) {
@@ -1550,7 +1655,11 @@ mod tests {
 
     #[test]
     fn resolve_event_ts_requires_timestamp_in_live_mode_but_not_offline() {
-        let mut app = App::new();
+        let mut app = App::new(
+            std::path::PathBuf::from("/tmp/json_demo/stream.jsonl"),
+            None,
+            false,
+        );
         app.offline = false;
         let err = app
             .resolve_event_ts(&json!({"event":"login"}), 2000.0, 0)

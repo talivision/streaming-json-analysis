@@ -123,6 +123,7 @@ pub struct AnalyzerModel {
 
     baseline_elapsed_secs: f64,
     baseline_counts: HashMap<String, u64>,
+    baseline_last_ts: Option<f64>,
     period_rate_states: HashMap<u64, PeriodRateState>,
     last_rate_ts: Option<f64>,
     last_event_ts: Option<f64>,
@@ -138,6 +139,7 @@ impl AnalyzerModel {
             current_label: "action".to_string(),
             baseline_elapsed_secs: 0.0,
             baseline_counts: HashMap::new(),
+            baseline_last_ts: None,
             period_rate_states: HashMap::new(),
             last_rate_ts: None,
             last_event_ts: None,
@@ -182,8 +184,8 @@ impl AnalyzerModel {
         let shape = extract_shape(&obj);
         let type_id = structural_hash(&shape);
         let keys = collect_all_paths(&obj);
-        let active_period_id = self.active_period().map(|p| p.id);
-        let in_action_period = active_period_id.is_some();
+        let period_id = self.period_id_for_ts(ts);
+        let in_action_period = period_id.is_some();
 
         let uniq = {
             let entry = self
@@ -209,7 +211,7 @@ impl AnalyzerModel {
             }
             update_uniqueness(entry, &obj, in_action_period)
         };
-        let rate = self.update_rate_scores(&type_id, active_period_id);
+        let rate = self.update_rate_scores(&type_id, period_id);
         if let Some(entry) = self.types.get_mut(&type_id) {
             entry.latest_rate = rate;
             entry.latest_uniq = uniq;
@@ -220,13 +222,53 @@ impl AnalyzerModel {
             type_id,
             obj,
             keys,
-            action_period_id: active_period_id,
+            action_period_id: period_id,
             in_action_period,
             live_rate_score: rate,
             live_uniq_score: uniq,
         });
         while self.events.len() > MAX_EVENTS {
             self.events.pop_front();
+        }
+    }
+
+    pub fn ingest_baseline(&mut self, obj: Value, ts: f64) {
+        if let Some(last_ts) = self.baseline_last_ts {
+            self.baseline_elapsed_secs += (ts - last_ts).max(0.0);
+        }
+        self.baseline_last_ts = Some(ts);
+
+        let shape = extract_shape(&obj);
+        let type_id = structural_hash(&shape);
+        *self.baseline_counts.entry(type_id.clone()).or_insert(0) += 1;
+
+        let uniq = {
+            let entry = self
+                .types
+                .entry(type_id.clone())
+                .or_insert_with(|| TypeProfile {
+                    type_id: type_id.clone(),
+                    name: None,
+                    count: 0,
+                    example: obj.clone(),
+                    considered_paths: IndexMap::new(),
+                    path_overrides: IndexMap::new(),
+                    path_stats: IndexMap::new(),
+                    baseline_path_stats: IndexMap::new(),
+                    known_unrelated: false,
+                    latest_rate: 0.0,
+                    latest_uniq: 0.0,
+                });
+
+            entry.count += 1;
+            if entry.count == 1 {
+                entry.example = obj.clone();
+            }
+            update_uniqueness(entry, &obj, false)
+        };
+
+        if let Some(entry) = self.types.get_mut(&type_id) {
+            entry.latest_uniq = uniq;
         }
     }
 
@@ -274,16 +316,44 @@ impl AnalyzerModel {
             self.last_rate_ts = Some(now_ts);
             return;
         };
-        let elapsed = (now_ts - last_ts).max(0.0);
-        if elapsed == 0.0 {
+        if now_ts <= last_ts {
             return;
         }
-        if let Some(pid) = self.active_period().map(|p| p.id) {
-            self.period_rate_states.entry(pid).or_default().elapsed_secs += elapsed;
-        } else {
-            self.baseline_elapsed_secs += elapsed;
-        }
+        self.distribute_elapsed(last_ts, now_ts);
         self.last_rate_ts = Some(now_ts);
+    }
+
+    fn period_id_for_ts(&self, ts: f64) -> Option<u64> {
+        self.periods
+            .iter()
+            .find(|p| ts >= p.start && p.end.map(|end| ts <= end).unwrap_or(true))
+            .map(|p| p.id)
+    }
+
+    fn distribute_elapsed(&mut self, from_ts: f64, to_ts: f64) {
+        let mut cursor = from_ts;
+        while cursor < to_ts {
+            let next_boundary = self
+                .periods
+                .iter()
+                .flat_map(|p| [Some(p.start), p.end])
+                .flatten()
+                .filter(|boundary| *boundary > cursor)
+                .min_by(|a, b| a.total_cmp(b))
+                .unwrap_or(to_ts);
+            let seg_end = next_boundary.min(to_ts);
+            if seg_end <= cursor {
+                break;
+            }
+            let mid = (cursor + seg_end) * 0.5;
+            let seg_elapsed = seg_end - cursor;
+            if let Some(pid) = self.period_id_for_ts(mid) {
+                self.period_rate_states.entry(pid).or_default().elapsed_secs += seg_elapsed;
+            } else {
+                self.baseline_elapsed_secs += seg_elapsed;
+            }
+            cursor = seg_end;
+        }
     }
 
     fn recomputed_rate_for(&self, type_id: &str, period_id: u64) -> f64 {
@@ -517,6 +587,66 @@ impl AnalyzerModel {
         out
     }
 
+    pub fn filtered_event_slice<'a>(
+        &'a self,
+        events: &'a [EventRecord],
+        filters: &'a DataFilters,
+    ) -> Vec<&'a EventRecord> {
+        let mut out = Vec::new();
+        let type_query = filters.type_filter.to_lowercase();
+        let parsed_exact: Option<(String, String)> = if !filters.exact_filter.is_empty() {
+            parse_exact_filter(&filters.exact_filter).map(|(k, v)| (k.to_string(), v))
+        } else {
+            None
+        };
+
+        for e in events.iter().rev() {
+            if self
+                .types
+                .get(e.type_id.as_str())
+                .map(|tp| tp.known_unrelated)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if !filters.type_filter.is_empty() {
+                let canonical = self.canonical_type_name(&e.type_id).to_lowercase();
+                if !canonical.contains(&type_query) {
+                    continue;
+                }
+            }
+            if !filters.key_filter.is_empty() {
+                let wanted: Vec<&str> = filters
+                    .key_filter
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !wanted.iter().all(|k| e.keys.iter().any(|ek| ek == k)) {
+                    continue;
+                }
+            }
+            if !filters.fuzzy_filter.is_empty() {
+                let s = serde_json::to_string(&e.obj)
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if !fuzzy_match(&s, &filters.fuzzy_filter.to_lowercase()) {
+                    continue;
+                }
+            }
+            if let Some((ref k, ref v)) = parsed_exact {
+                let found = value_at_path(&e.obj, k)
+                    .map(|actual| exact_value_matches(actual, v))
+                    .unwrap_or(false);
+                if !found {
+                    continue;
+                }
+            }
+            out.push(e);
+        }
+        out
+    }
+
     pub fn closed_periods(&self) -> Vec<&ActionPeriod> {
         self.periods.iter().filter(|p| p.end.is_some()).collect()
     }
@@ -676,6 +806,13 @@ fn collect_scalar_paths(v: &Value, path: &str, out: &mut Vec<(String, String)>) 
             out.push((path.to_string(), value_token(v)));
         }
     }
+}
+
+pub fn classify_event(obj: &Value) -> (String, Vec<String>) {
+    let shape = extract_shape(obj);
+    let type_id = structural_hash(&shape);
+    let keys = collect_all_paths(obj);
+    (type_id, keys)
 }
 
 pub fn value_token(v: &Value) -> String {

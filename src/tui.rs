@@ -56,7 +56,7 @@ pub fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn draw_tabs(frame: &mut Frame<'_>, area: Rect, mode: UiMode) {
-    let titles = ["1 Live", "2 Periods", "3 Types", "4 Data"];
+    let titles = ["1 Live", "2 Periods", "3 Types", "4 Baseline"];
     let selected = match mode {
         UiMode::Live => 0,
         UiMode::Periods => 1,
@@ -177,19 +177,27 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
     let periods = app.model.closed_periods();
     let mut p_items = Vec::new();
     for (idx, p) in periods.iter().enumerate() {
-        let sel = if idx == app.periods_index { ">" } else { " " };
+        let mut style = Style::default();
+        if idx == app.periods_index {
+            style = if app.periods_event_focus {
+                style.fg(Color::Gray)
+            } else {
+                style.fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            };
+        }
         let dur = p.end.unwrap_or(p.start) - p.start;
-        p_items.push(ListItem::new(format!(
-            "{} #{} {} ({:.2}s)",
-            sel, p.id, p.label, dur
-        )));
+        p_items.push(ListItem::new(Line::from(vec![Span::styled(
+            format!("#{} {} ({:.2}s)", p.id, p.label, dur),
+            style,
+        )])));
     }
+    let periods_title = if app.periods_event_focus {
+        "All Action Periods (list focus)"
+    } else {
+        "All Action Periods (active)"
+    };
     frame.render_widget(
-        List::new(p_items).block(
-            Block::default()
-                .title("All Action Periods")
-                .borders(Borders::ALL),
-        ),
+        List::new(p_items).block(Block::default().title(periods_title).borders(Borders::ALL)),
         cols[0],
     );
 
@@ -199,14 +207,22 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
     if let Some(period) = periods.get(app.periods_index) {
         let start = period.start;
         let end = period.end.unwrap_or(period.start);
-        for (idx, e) in app
+        let events = app
             .model
-            .filtered_events_in_range(&app.event_filters, Some((start, end)))
-            .iter()
-            .take(max_period_rows)
-            .enumerate()
-        {
-            let selected = idx == app.period_event_index;
+            .filtered_events_in_range(&app.event_filters, Some((start, end)));
+        let total = events.len();
+        let window = max_period_rows.max(1);
+        let start_idx = if total <= window {
+            0
+        } else {
+            let half = window / 2;
+            app.period_event_index
+                .saturating_sub(half)
+                .min(total.saturating_sub(window))
+        };
+        for (vis_idx, e) in events.iter().skip(start_idx).take(window).enumerate() {
+            let idx = start_idx + vis_idx;
+            let selected = idx == app.period_event_index && app.periods_event_focus;
             rows.push(ListItem::new(render_event_line(
                 app,
                 e,
@@ -216,12 +232,13 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
             )));
         }
     }
+    let events_title = if app.periods_event_focus {
+        "Events in Selected Period (active)"
+    } else {
+        "Events in Selected Period (right/enter to focus)"
+    };
     frame.render_widget(
-        List::new(rows).block(
-            Block::default()
-                .title("Events in Selected Period")
-                .borders(Borders::ALL),
-        ),
+        List::new(rows).block(Block::default().title(events_title).borders(Borders::ALL)),
         cols[1],
     );
 }
@@ -419,7 +436,7 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f64) {
-    let rows = app.model.filtered_events(&app.event_filters);
+    let rows = app.visible_baseline_events();
     let start = app.data_index.min(rows.len().saturating_sub(1));
     // 2 border rows + 2 header lines; remaining rows are for events
     let max_event_rows = (area.height as usize).saturating_sub(4);
@@ -459,7 +476,7 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f64) 
             .wrap(Wrap { trim: true })
             .block(
                 Block::default()
-                    .title("Data Explorer")
+                    .title("Baseline Explorer")
                     .borders(Borders::ALL),
             ),
         area,
@@ -595,7 +612,12 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         truncate_text(&app.event_filters.exact_filter, 20)
     };
-    let unrelated_count = app.model.types.values().filter(|tp| tp.known_unrelated).count();
+    let unrelated_count = app
+        .model
+        .types
+        .values()
+        .filter(|tp| tp.known_unrelated)
+        .count();
     let unrelated = if unrelated_count == 0 {
         "off".to_string()
     } else {
@@ -697,7 +719,7 @@ fn draw_full_help(frame: &mut Frame<'_>) {
 
     let body = vec![
         Line::from("Global"),
-        Line::from("  q quit | h/? help | 1 Live | 2 Periods | 3 Types | 4 Data"),
+        Line::from("  q quit | h/? help | 1 Live | 2 Periods | 3 Types | 4 Baseline"),
         Line::from(""),
         Line::from("Live"),
         Line::from("  m toggle action period"),
@@ -712,8 +734,8 @@ fn draw_full_help(frame: &mut Frame<'_>) {
         Line::from(""),
         Line::from("Periods"),
         Line::from("  up/down choose period"),
-        Line::from("  left/right choose event in selected period"),
-        Line::from("  enter inspect selected event"),
+        Line::from("  enter/right focus events for selected period"),
+        Line::from("  with event focus: up/down choose event, enter inspect, left return"),
         Line::from(""),
         Line::from("Types"),
         Line::from("  / filter types by id or name"),
@@ -724,7 +746,7 @@ fn draw_full_help(frame: &mut Frame<'_>) {
         Line::from("  with path focus: up/down choose path, space toggle include/exclude"),
         Line::from("  u mark type known unrelated"),
         Line::from(""),
-        Line::from("Data"),
+        Line::from("Baseline"),
         Line::from("  up/down scroll | enter inspect"),
         Line::from("  k keys filter, t type filter, / fuzzy filter, e exact path=value"),
     ];

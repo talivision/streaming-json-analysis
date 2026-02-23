@@ -47,6 +47,12 @@ Or pass a stream path:
 cargo run --release -- /path/to/stream.jsonl
 ```
 
+Optionally preload a known-clean baseline corpus:
+
+```bash
+cargo run --release -- /path/to/stream.jsonl --baseline /path/to/clean-baseline.jsonl
+```
+
 Live mode requires each JSON object to include root `_timestamp` as epoch milliseconds
 (13-digit integer, e.g. `1739952000123`).
 If missing, the analyzer exits fast with an unsupported-input error.
@@ -80,11 +86,11 @@ In the source terminal, use single-key triggers:
 ## Keybindings
 
 - `q`: quit
-- `1/2/3/4`: switch modes (`Live`, `Periods`, `Types`, `Data`)
+- `1/2/3/4`: switch modes (`Live`, `Periods`, `Types`, `Baseline`)
 - `m`: start/stop action period
 - `n`: set current action label
 
-Event-list modes (`Periods`, `Data`):
+Event-list modes (`Periods`, `Baseline`):
 
 - `enter`: open object inspector
 - `g`: toggle rate boundary display (`point` / `interval`)
@@ -107,7 +113,8 @@ Live mode:
 Periods mode:
 
 - `up/down`: move between action periods
-- `left/right`: move through events for the selected period
+- `enter` or `right`: focus events for the selected period
+- while event-focused: `up/down` select event, `enter` open object inspector, `left` return to period list
 
 Types mode:
 
