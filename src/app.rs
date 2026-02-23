@@ -448,37 +448,12 @@ impl App {
                 self.show_help_overlay = !self.show_help_overlay;
             }
             KeyCode::Char('1') => {
-                self.mode = UiMode::Live;
-                self.return_to_live_object_on_types_esc = false;
-                self.return_to_types_on_live_esc = false;
-                self.types_path_focus = false;
-                self.periods_event_focus = false;
+                self.set_ui_mode(UiMode::Live);
                 self.clamp_live_key_selection();
             }
-            KeyCode::Char('2') => {
-                self.mode = UiMode::Periods;
-                self.return_to_live_object_on_types_esc = false;
-                self.return_to_types_on_live_esc = false;
-                self.types_path_focus = false;
-                self.periods_event_focus = false;
-                self.exit_live_key_focus();
-            }
-            KeyCode::Char('3') => {
-                self.mode = UiMode::Types;
-                self.return_to_live_object_on_types_esc = false;
-                self.return_to_types_on_live_esc = false;
-                self.types_path_focus = false;
-                self.periods_event_focus = false;
-                self.exit_live_key_focus();
-            }
-            KeyCode::Char('4') => {
-                self.mode = UiMode::Data;
-                self.return_to_live_object_on_types_esc = false;
-                self.return_to_types_on_live_esc = false;
-                self.types_path_focus = false;
-                self.periods_event_focus = false;
-                self.exit_live_key_focus();
-            }
+            KeyCode::Char('2') => self.set_ui_mode(UiMode::Periods),
+            KeyCode::Char('3') => self.set_ui_mode(UiMode::Types),
+            KeyCode::Char('4') => self.set_ui_mode(UiMode::Data),
             KeyCode::Esc if self.mode == UiMode::Live && self.return_to_types_on_live_esc => {
                 self.mode = UiMode::Types;
                 self.return_to_types_on_live_esc = false;
@@ -1036,6 +1011,15 @@ impl App {
         self.live_key_index = self.live_key_index.min(key_count.saturating_sub(1));
     }
 
+    fn set_ui_mode(&mut self, mode: UiMode) {
+        self.mode = mode;
+        self.return_to_live_object_on_types_esc = false;
+        self.return_to_types_on_live_esc = false;
+        self.types_path_focus = false;
+        self.periods_event_focus = false;
+        self.exit_live_key_focus();
+    }
+
     fn toggle_live_key_focus(&mut self) {
         if self.mode != UiMode::Live {
             return;
@@ -1086,19 +1070,7 @@ impl App {
         }
     }
 
-    fn apply_key_filter_in_place(&mut self, path: &str) {
-        let selected_anchor = if self.mode == UiMode::Live {
-            self.live_anchor_at(self.live_event_index)
-        } else {
-            None
-        };
-        if self.event_filters.key_filter == path {
-            self.event_filters.key_filter.clear();
-            self.status = format!("Removed key filter: {}", path);
-        } else {
-            self.event_filters.key_filter = path.to_string();
-            self.status = format!("Applied key filter: {}", path);
-        }
+    fn after_filter_change(&mut self, selected_anchor: Option<LiveAnchor>) {
         self.stashed_event_filters = None;
         match self.mode {
             UiMode::Live => {
@@ -1132,6 +1104,22 @@ impl App {
         }
     }
 
+    fn apply_key_filter_in_place(&mut self, path: &str) {
+        let selected_anchor = if self.mode == UiMode::Live {
+            self.live_anchor_at(self.live_event_index)
+        } else {
+            None
+        };
+        if self.event_filters.key_filter == path {
+            self.event_filters.key_filter.clear();
+            self.status = format!("Removed key filter: {}", path);
+        } else {
+            self.event_filters.key_filter = path.to_string();
+            self.status = format!("Applied key filter: {}", path);
+        }
+        self.after_filter_change(selected_anchor);
+    }
+
     fn apply_live_selected_value_filter(&mut self) {
         let selected_anchor = self.live_anchor_at(self.live_event_index);
         let keys = self.live_selected_key_paths();
@@ -1150,15 +1138,7 @@ impl App {
             self.event_filters.exact_filter = exact.clone();
             self.status = format!("Applied exact filter: {}", exact);
         }
-        self.stashed_event_filters = None;
-        self.refresh_live_position();
-        if let Some(anchor) = selected_anchor.as_ref() {
-            if let Some(idx) = self.find_live_index(anchor) {
-                self.live_event_index = idx;
-                self.ensure_live_selection_visible();
-            }
-        }
-        self.clamp_live_key_selection();
+        self.after_filter_change(selected_anchor);
     }
 
     fn selected_live_value_token(&self) -> Option<String> {
@@ -1595,6 +1575,7 @@ fn normalize_navigation_code(key: KeyEvent) -> KeyCode {
 #[cfg(test)]
 mod tests {
     use super::{normalize_navigation_code, parse_event_timestamp_millis, App};
+    use crate::tui::UiMode;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
 
@@ -1678,5 +1659,112 @@ mod tests {
             .expect("offline fallback timestamp increments");
         assert_eq!(first, 1000.001);
         assert_eq!(second, 1000.002);
+    }
+
+    fn test_app() -> App {
+        App::new(std::path::PathBuf::from("/tmp/test_app.jsonl"), None, false)
+    }
+
+    #[test]
+    fn clamp_live_indices_n_bounds_event_and_view_start() {
+        let mut app = test_app();
+        app.live_window_rows = 10;
+        app.live_event_index = 100;
+        app.live_view_start = 100;
+        app.clamp_live_indices_n(20);
+        // both indices clamped to max valid index
+        assert_eq!(app.live_event_index, 19);
+        // view_start: min(100, 19) = 19, then 19+10 > 20, so 20-10 = 10
+        assert_eq!(app.live_view_start, 10);
+    }
+
+    #[test]
+    fn clamp_live_indices_n_handles_zero_total() {
+        let mut app = test_app();
+        app.live_event_index = 5;
+        app.live_view_start = 5;
+        app.clamp_live_indices_n(0);
+        assert_eq!(app.live_event_index, 0);
+        assert_eq!(app.live_view_start, 0);
+    }
+
+    #[test]
+    fn ensure_live_selection_visible_n_scrolls_view_to_show_selection() {
+        let mut app = test_app();
+        app.live_window_rows = 10;
+
+        // Selection above view start: view should scroll up
+        app.live_event_index = 3;
+        app.live_view_start = 10;
+        app.ensure_live_selection_visible_n(50);
+        assert_eq!(app.live_view_start, 3);
+
+        // Selection below visible window: view should scroll down
+        app.live_event_index = 25;
+        app.live_view_start = 10;
+        app.ensure_live_selection_visible_n(50);
+        assert_eq!(app.live_view_start, 16); // 25 + 1 - 10 = 16
+    }
+
+    #[test]
+    fn center_live_selection_in_view_n_places_selection_at_midpoint() {
+        let mut app = test_app();
+        app.live_window_rows = 10;
+        app.live_event_index = 25;
+        app.center_live_selection_in_view_n(50);
+        // half = 5, desired_start = 25 - 5 = 20, max_start = 50 - 10 = 40
+        assert_eq!(app.live_view_start, 20);
+    }
+
+    #[test]
+    fn center_live_selection_in_view_n_clamps_near_start() {
+        let mut app = test_app();
+        app.live_window_rows = 10;
+        app.live_event_index = 2;
+        app.center_live_selection_in_view_n(50);
+        // desired_start = 2 - 5 = saturates to 0
+        assert_eq!(app.live_view_start, 0);
+    }
+
+    #[test]
+    fn reposition_live_selection_n_centers_when_flag_is_clear() {
+        let mut app = test_app();
+        app.live_window_rows = 10;
+        app.live_event_index = 25;
+        app.live_edge_until_center = false;
+        app.reposition_live_selection_n(50);
+        assert_eq!(app.live_view_start, 20); // centered
+    }
+
+    #[test]
+    fn reposition_live_selection_n_uses_ensure_visible_when_flag_is_set() {
+        let mut app = test_app();
+        app.live_window_rows = 10;
+        app.live_event_index = 3;
+        app.live_view_start = 10;
+        app.live_edge_until_center = true;
+        app.reposition_live_selection_n(50);
+        // ensure_visible: selection (3) < view_start (10) → view_start set to 3
+        assert_eq!(app.live_view_start, 3);
+        // flag remains set (target_start=0, view_start=3, they differ)
+        assert!(app.live_edge_until_center);
+    }
+
+    #[test]
+    fn set_ui_mode_resets_all_focus_flags() {
+        let mut app = test_app();
+        app.return_to_live_object_on_types_esc = true;
+        app.return_to_types_on_live_esc = true;
+        app.types_path_focus = true;
+        app.periods_event_focus = true;
+        app.live_key_focus = true;
+
+        app.set_ui_mode(UiMode::Types);
+
+        assert!(!app.return_to_live_object_on_types_esc);
+        assert!(!app.return_to_types_on_live_esc);
+        assert!(!app.types_path_focus);
+        assert!(!app.periods_event_focus);
+        assert!(!app.live_key_focus);
     }
 }

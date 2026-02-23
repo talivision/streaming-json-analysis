@@ -243,62 +243,53 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
     );
 }
 
+fn styled_hotkey(label: &str) -> Span<'static> {
+    Span::styled(
+        label.to_string(),
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )
+}
+
 fn live_json_title(app: &App, pane_width: u16) -> Line<'static> {
     if !app.live_key_focus {
         return Line::from("selected JSON");
     }
     let narrow = pane_width < 56;
-    let hotkey = |label: &str| {
-        Span::styled(
-            label.to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-    };
     if narrow {
         Line::from(vec![
             Span::raw("selected JSON ("),
-            hotkey("↵"),
+            styled_hotkey("↵"),
             Span::raw(", "),
-            hotkey("t"),
+            styled_hotkey("t"),
             Span::raw(")"),
         ])
     } else {
         Line::from(vec![
             Span::raw("selected JSON ("),
-            hotkey("↵"),
+            styled_hotkey("↵"),
             Span::raw(" apply filter, "),
-            hotkey("t"),
+            styled_hotkey("t"),
             Span::raw(" jump type)"),
         ])
     }
 }
 
 fn type_details_title(app: &App, pane_width: u16) -> Line<'static> {
-    let hotkey = |label: &str| {
-        Span::styled(
-            label.to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-    };
     if !app.types_path_focus {
         if pane_width < 64 {
             return Line::from(vec![
                 Span::raw("Type Details / Paths ("),
-                hotkey("t"),
+                styled_hotkey("t"),
                 Span::raw(", "),
-                hotkey("u"),
+                styled_hotkey("u"),
                 Span::raw(")"),
             ]);
         }
         return Line::from(vec![
             Span::raw("Type Details / Paths ("),
-            hotkey("t"),
+            styled_hotkey("t"),
             Span::raw(" filter to live, "),
-            hotkey("u"),
+            styled_hotkey("u"),
             Span::raw(" toggle unrelated)"),
         ]);
     }
@@ -306,21 +297,21 @@ fn type_details_title(app: &App, pane_width: u16) -> Line<'static> {
     if narrow {
         Line::from(vec![
             Span::raw("Type Details / Paths ("),
-            hotkey("space"),
+            styled_hotkey("space"),
             Span::raw(", "),
-            hotkey("t"),
+            styled_hotkey("t"),
             Span::raw(", "),
-            hotkey("u"),
+            styled_hotkey("u"),
             Span::raw(")"),
         ])
     } else {
         Line::from(vec![
             Span::raw("Type Details / Paths ("),
-            hotkey("space"),
+            styled_hotkey("space"),
             Span::raw(" toggle path, "),
-            hotkey("t"),
+            styled_hotkey("t"),
             Span::raw(" filter to live, "),
-            hotkey("u"),
+            styled_hotkey("u"),
             Span::raw(" toggle unrelated)"),
         ])
     }
@@ -584,15 +575,19 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+fn display_filter(value: &str) -> String {
+    if value.is_empty() {
+        "off".to_string()
+    } else {
+        truncate_text(value, 20)
+    }
+}
+
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let width = area.width.saturating_sub(2) as usize;
     let filters_active = app.event_filters.active_count();
     let show_long_names = width >= 100;
-    let key = if app.event_filters.key_filter.is_empty() {
-        "off".to_string()
-    } else {
-        truncate_text(&app.event_filters.key_filter, 20)
-    };
+    let key = display_filter(&app.event_filters.key_filter);
     let typ = if app.event_filters.type_filter.is_empty() {
         "off".to_string()
     } else {
@@ -602,16 +597,8 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             20,
         )
     };
-    let fuzzy = if app.event_filters.fuzzy_filter.is_empty() {
-        "off".to_string()
-    } else {
-        truncate_text(&app.event_filters.fuzzy_filter, 20)
-    };
-    let exact = if app.event_filters.exact_filter.is_empty() {
-        "off".to_string()
-    } else {
-        truncate_text(&app.event_filters.exact_filter, 20)
-    };
+    let fuzzy = display_filter(&app.event_filters.fuzzy_filter);
+    let exact = display_filter(&app.event_filters.exact_filter);
     let unrelated_count = app
         .model
         .types
@@ -901,6 +888,39 @@ fn render_json_value_lines(
     }
 }
 
+fn push_open_bracket(
+    mut prefix: Vec<Span<'static>>,
+    bracket: &'static str,
+    sel_or_filt: bool,
+    punctuation_override: Style,
+    out: &mut Vec<Line<'static>>,
+) {
+    prefix.push(Span::styled(
+        bracket,
+        if sel_or_filt { punctuation_override } else { json_punctuation_style() },
+    ));
+    out.push(Line::from(prefix));
+}
+
+fn push_close_bracket(
+    indent: usize,
+    open: char,
+    is_last: bool,
+    sel_or_filt: bool,
+    punctuation_override: Style,
+    out: &mut Vec<Line<'static>>,
+) {
+    let tail = if is_last {
+        format!("{}", open)
+    } else {
+        format!("{},", open)
+    };
+    out.push(Line::from(vec![
+        Span::raw("  ".repeat(indent)),
+        Span::styled(tail, if sel_or_filt { punctuation_override } else { json_punctuation_style() }),
+    ]));
+}
+
 fn render_json_keyed_value_line(
     key: Option<&str>,
     value: &serde_json::Value,
@@ -946,18 +966,10 @@ fn render_json_keyed_value_line(
         prefix.push(Span::styled(": ", json_punctuation_style()));
     }
 
+    let sel_or_filt = selected || filtered;
     match value {
         serde_json::Value::Object(map) => {
-            let mut open = prefix;
-            open.push(Span::styled(
-                "{",
-                if selected || filtered {
-                    punctuation_override
-                } else {
-                    json_punctuation_style()
-                },
-            ));
-            out.push(Line::from(open));
+            push_open_bracket(prefix, "{", sel_or_filt, punctuation_override, out);
             let len = map.len();
             for (idx, (k, child)) in map.iter().enumerate() {
                 let key_path = format!("{}.{}", path, k);
@@ -973,30 +985,10 @@ fn render_json_keyed_value_line(
                     out,
                 );
             }
-            let tail = if is_last { "}" } else { "}," };
-            out.push(Line::from(vec![
-                Span::raw("  ".repeat(indent)),
-                Span::styled(
-                    tail,
-                    if selected || filtered {
-                        punctuation_override
-                    } else {
-                        json_punctuation_style()
-                    },
-                ),
-            ]));
+            push_close_bracket(indent, '}', is_last, sel_or_filt, punctuation_override, out);
         }
         serde_json::Value::Array(arr) => {
-            let mut open = prefix;
-            open.push(Span::styled(
-                "[",
-                if selected || filtered {
-                    punctuation_override
-                } else {
-                    json_punctuation_style()
-                },
-            ));
-            out.push(Line::from(open));
+            push_open_bracket(prefix, "[", sel_or_filt, punctuation_override, out);
             for (idx, child) in arr.iter().enumerate() {
                 let child_path = format!("{}[]", path);
                 render_json_keyed_value_line(
@@ -1011,18 +1003,7 @@ fn render_json_keyed_value_line(
                     out,
                 );
             }
-            let tail = if is_last { "]" } else { "]," };
-            out.push(Line::from(vec![
-                Span::raw("  ".repeat(indent)),
-                Span::styled(
-                    tail,
-                    if selected || filtered {
-                        punctuation_override
-                    } else {
-                        json_punctuation_style()
-                    },
-                ),
-            ]));
+            push_close_bracket(indent, ']', is_last, sel_or_filt, punctuation_override, out);
         }
         _ => {
             let mut line = prefix;

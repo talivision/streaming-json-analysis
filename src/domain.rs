@@ -74,20 +74,15 @@ pub struct DataFilters {
 
 impl DataFilters {
     pub fn active_count(&self) -> usize {
-        let mut n = 0;
-        if !self.key_filter.is_empty() {
-            n += 1;
-        }
-        if !self.type_filter.is_empty() {
-            n += 1;
-        }
-        if !self.fuzzy_filter.is_empty() {
-            n += 1;
-        }
-        if !self.exact_filter.is_empty() {
-            n += 1;
-        }
-        n
+        [
+            &self.key_filter,
+            &self.type_filter,
+            &self.fuzzy_filter,
+            &self.exact_filter,
+        ]
+        .iter()
+        .filter(|f| !f.is_empty())
+        .count()
     }
 
     pub fn has_active(&self) -> bool {
@@ -178,6 +173,22 @@ impl AnalyzerModel {
         true
     }
 
+    fn get_or_create_type_profile(&mut self, type_id: &str, obj: &Value) -> &mut TypeProfile {
+        self.types.entry(type_id.to_string()).or_insert_with(|| TypeProfile {
+            type_id: type_id.to_string(),
+            name: None,
+            count: 0,
+            example: obj.clone(),
+            considered_paths: IndexMap::new(),
+            path_overrides: IndexMap::new(),
+            path_stats: IndexMap::new(),
+            baseline_path_stats: IndexMap::new(),
+            known_unrelated: false,
+            latest_rate: 0.0,
+            latest_uniq: 0.0,
+        })
+    }
+
     pub fn ingest(&mut self, obj: Value, ts: f64) {
         self.account_rate_elapsed(ts);
         self.last_event_ts = Some(ts);
@@ -188,23 +199,7 @@ impl AnalyzerModel {
         let in_action_period = period_id.is_some();
 
         let uniq = {
-            let entry = self
-                .types
-                .entry(type_id.clone())
-                .or_insert_with(|| TypeProfile {
-                    type_id: type_id.clone(),
-                    name: None,
-                    count: 0,
-                    example: obj.clone(),
-                    considered_paths: IndexMap::new(),
-                    path_overrides: IndexMap::new(),
-                    path_stats: IndexMap::new(),
-                    baseline_path_stats: IndexMap::new(),
-                    known_unrelated: false,
-                    latest_rate: 0.0,
-                    latest_uniq: 0.0,
-                });
-
+            let entry = self.get_or_create_type_profile(&type_id, &obj);
             entry.count += 1;
             if entry.count == 1 {
                 entry.example = obj.clone();
@@ -243,23 +238,7 @@ impl AnalyzerModel {
         *self.baseline_counts.entry(type_id.clone()).or_insert(0) += 1;
 
         let uniq = {
-            let entry = self
-                .types
-                .entry(type_id.clone())
-                .or_insert_with(|| TypeProfile {
-                    type_id: type_id.clone(),
-                    name: None,
-                    count: 0,
-                    example: obj.clone(),
-                    considered_paths: IndexMap::new(),
-                    path_overrides: IndexMap::new(),
-                    path_stats: IndexMap::new(),
-                    baseline_path_stats: IndexMap::new(),
-                    known_unrelated: false,
-                    latest_rate: 0.0,
-                    latest_uniq: 0.0,
-                });
-
+            let entry = self.get_or_create_type_profile(&type_id, &obj);
             entry.count += 1;
             if entry.count == 1 {
                 entry.example = obj.clone();
@@ -527,6 +506,23 @@ impl AnalyzerModel {
         filters: &'a DataFilters,
         range: Option<(f64, f64)>,
     ) -> Vec<&'a EventRecord> {
+        self.filter_events_from_iter(self.events.iter().rev(), filters, range)
+    }
+
+    pub fn filtered_event_slice<'a>(
+        &'a self,
+        events: &'a [EventRecord],
+        filters: &'a DataFilters,
+    ) -> Vec<&'a EventRecord> {
+        self.filter_events_from_iter(events.iter().rev(), filters, None)
+    }
+
+    fn filter_events_from_iter<'a>(
+        &'a self,
+        iter: impl Iterator<Item = &'a EventRecord>,
+        filters: &DataFilters,
+        range: Option<(f64, f64)>,
+    ) -> Vec<&'a EventRecord> {
         let mut out = Vec::new();
         let type_query = filters.type_filter.to_lowercase();
         // Parse once outside the loop instead of per-event.
@@ -535,7 +531,7 @@ impl AnalyzerModel {
         } else {
             None
         };
-        for e in self.events.iter().rev() {
+        for e in iter {
             if self
                 .types
                 .get(e.type_id.as_str())
@@ -548,66 +544,6 @@ impl AnalyzerModel {
                 if e.ts < start || e.ts > end {
                     continue;
                 }
-            }
-            if !filters.type_filter.is_empty() {
-                let canonical = self.canonical_type_name(&e.type_id).to_lowercase();
-                if !canonical.contains(&type_query) {
-                    continue;
-                }
-            }
-            if !filters.key_filter.is_empty() {
-                let wanted: Vec<&str> = filters
-                    .key_filter
-                    .split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if !wanted.iter().all(|k| e.keys.iter().any(|ek| ek == k)) {
-                    continue;
-                }
-            }
-            if !filters.fuzzy_filter.is_empty() {
-                let s = serde_json::to_string(&e.obj)
-                    .unwrap_or_default()
-                    .to_lowercase();
-                if !fuzzy_match(&s, &filters.fuzzy_filter.to_lowercase()) {
-                    continue;
-                }
-            }
-            if let Some((ref k, ref v)) = parsed_exact {
-                let found = value_at_path(&e.obj, k)
-                    .map(|actual| exact_value_matches(actual, v))
-                    .unwrap_or(false);
-                if !found {
-                    continue;
-                }
-            }
-            out.push(e);
-        }
-        out
-    }
-
-    pub fn filtered_event_slice<'a>(
-        &'a self,
-        events: &'a [EventRecord],
-        filters: &'a DataFilters,
-    ) -> Vec<&'a EventRecord> {
-        let mut out = Vec::new();
-        let type_query = filters.type_filter.to_lowercase();
-        let parsed_exact: Option<(String, String)> = if !filters.exact_filter.is_empty() {
-            parse_exact_filter(&filters.exact_filter).map(|(k, v)| (k.to_string(), v))
-        } else {
-            None
-        };
-
-        for e in events.iter().rev() {
-            if self
-                .types
-                .get(e.type_id.as_str())
-                .map(|tp| tp.known_unrelated)
-                .unwrap_or(false)
-            {
-                continue;
             }
             if !filters.type_filter.is_empty() {
                 let canonical = self.canonical_type_name(&e.type_id).to_lowercase();
@@ -784,15 +720,19 @@ fn auto_consider_path(path: &str, stats: &PathStats) -> bool {
     true
 }
 
+fn child_path(parent: &str, key: &str) -> String {
+    if parent.is_empty() {
+        key.to_string()
+    } else {
+        format!("{}.{}", parent, key)
+    }
+}
+
 fn collect_scalar_paths(v: &Value, path: &str, out: &mut Vec<(String, String)>) {
     match v {
         Value::Object(map) => {
             for (k, child) in map {
-                let p = if path.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{}.{}", path, k)
-                };
+                let p = child_path(path, k);
                 collect_scalar_paths(child, &p, out);
             }
         }
@@ -932,11 +872,7 @@ fn collect_paths(v: &Value, path: &str, out: &mut Vec<String>) {
     match v {
         Value::Object(map) => {
             for (k, child) in map {
-                let p = if path.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{}.{}", path, k)
-                };
+                let p = child_path(path, k);
                 out.push(p.clone());
                 collect_paths(child, &p, out);
             }
