@@ -85,7 +85,7 @@ In the source terminal, use single-key triggers:
 
 ## Keybindings
 
-- `q`: quit
+- `q`: quit (press twice within 2s)
 - `1/2/3/4`: switch modes (`Live`, `Periods`, `Types`, `Baseline`)
 - `m`: start/stop action period
 - `n`: set current action label

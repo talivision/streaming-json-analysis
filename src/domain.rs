@@ -71,7 +71,7 @@ struct PeriodRateState {
     first_event_ts: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DataFilters {
     pub key_filter: String,
     pub type_filter: String,

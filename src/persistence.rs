@@ -1,4 +1,4 @@
-use crate::domain::ActionPeriod;
+use crate::domain::{ActionPeriod, DataFilters};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,6 +14,9 @@ pub struct RestoredState {
     pub periods: Vec<ActionPeriod>,
     pub renames: Vec<(String, String)>,
     pub current_label: String,
+    pub event_filters: DataFilters,
+    pub stashed_event_filters: Option<DataFilters>,
+    pub types_filter: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -25,6 +28,9 @@ struct PersistedState {
     periods: Vec<ActionPeriod>,
     renames: Vec<TypeRename>,
     current_label: String,
+    event_filters: DataFilters,
+    stashed_event_filters: Option<DataFilters>,
+    types_filter: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -64,6 +70,9 @@ pub fn load_state(stream_path: &Path) -> Result<Option<RestoredState>> {
                 .map(|r| (r.type_id, r.name))
                 .collect(),
             current_label: state.current_label,
+            event_filters: state.event_filters,
+            stashed_event_filters: state.stashed_event_filters,
+            types_filter: state.types_filter,
         }));
     }
 
@@ -85,6 +94,9 @@ pub fn load_state(stream_path: &Path) -> Result<Option<RestoredState>> {
             .map(|r| (r.type_id, r.name))
             .collect(),
         current_label: state.current_label,
+        event_filters: state.event_filters,
+        stashed_event_filters: state.stashed_event_filters,
+        types_filter: state.types_filter,
     }))
 }
 
@@ -94,6 +106,9 @@ pub fn save_state(
     periods: &[ActionPeriod],
     renames: &[(String, String)],
     current_label: &str,
+    event_filters: &DataFilters,
+    stashed_event_filters: Option<&DataFilters>,
+    types_filter: &str,
 ) -> Result<()> {
     let state_path = state_path_for_stream(stream_path)?;
     if let Some(parent) = state_path.parent() {
@@ -115,6 +130,9 @@ pub fn save_state(
             })
             .collect(),
         current_label: current_label.to_string(),
+        event_filters: event_filters.clone(),
+        stashed_event_filters: stashed_event_filters.cloned(),
+        types_filter: types_filter.to_string(),
     };
     let payload = serde_json::to_vec(&state).context("failed to serialize persisted state")?;
 

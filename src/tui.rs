@@ -820,7 +820,7 @@ fn draw_full_help(frame: &mut Frame<'_>) {
 
     let body = vec![
         Line::from("Global"),
-        Line::from("  q quit | h/? help | 1 Live | 2 Periods | 3 Types | 4 Baseline"),
+        Line::from("  q quit (press twice) | h/? help | 1 Live | 2 Periods | 3 Types | 4 Baseline"),
         Line::from(""),
         Line::from("Live"),
         Line::from("  m toggle action period"),

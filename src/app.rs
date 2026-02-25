@@ -19,6 +19,7 @@ use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 use rayon::prelude::*;
 use serde_json::Value;
+use std::env;
 use std::fs;
 use std::io::stdout;
 use std::path::PathBuf;
@@ -30,6 +31,7 @@ const LIVE_WINDOW_DEFAULT: usize = 120;
 const LIVE_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const UI_FRAME_SLEEP: Duration = Duration::from_millis(16);
 const UI_BURST_SLEEP: Duration = Duration::from_millis(1);
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 
 pub struct ObjectInspector {
     pub event: EventRecord,
@@ -115,6 +117,7 @@ pub struct App {
     initial_load_complete: bool,
     pending_live_recompute: bool,
     show_status_debug: bool,
+    quit_pending_until: Option<Instant>,
 }
 
 impl App {
@@ -182,6 +185,7 @@ impl App {
             initial_load_complete,
             pending_live_recompute: false,
             show_status_debug,
+            quit_pending_until: None,
         };
         app.restore_persisted_state();
         app.update_loading_status();
@@ -462,6 +466,11 @@ impl App {
                 if !saved.current_label.trim().is_empty() {
                     self.model.current_label = saved.current_label.clone();
                 }
+                self.event_filters = saved.event_filters.clone();
+                self.stashed_event_filters = saved.stashed_event_filters.clone();
+                self.types_filter = saved.types_filter.clone();
+                self.mark_live_cache_dirty();
+                self.refresh_live_position();
                 if !saved.periods.is_empty() {
                     self.model.set_periods(saved.periods.clone());
                     self.pending_live_recompute = true;
@@ -495,6 +504,9 @@ impl App {
             &self.model.periods,
             &self.model.renamed_types(),
             &self.model.current_label,
+            &self.event_filters,
+            self.stashed_event_filters.as_ref(),
+            &self.types_filter,
         )
     }
 
@@ -533,7 +545,18 @@ impl App {
         }
 
         match code {
-            KeyCode::Char('q') => return true,
+            KeyCode::Char('q') => {
+                let now = Instant::now();
+                if self
+                    .quit_pending_until
+                    .is_some_and(|deadline| deadline >= now)
+                {
+                    return true;
+                }
+                self.quit_pending_until = Some(now + QUIT_CONFIRM_WINDOW);
+                self.status = "Press q again within 2s to quit".to_string();
+                return false;
+            }
             KeyCode::Esc if self.mode == UiMode::Live && self.live_key_focus => {
                 self.exit_live_key_focus();
             }
@@ -699,6 +722,7 @@ impl App {
             KeyCode::Char('u') => self.toggle_known_unrelated(),
             _ => {}
         }
+        self.quit_pending_until = None;
         false
     }
 
@@ -1856,16 +1880,87 @@ impl App {
 }
 
 fn progress_bar(progress: f64, width: usize) -> String {
+    if supports_unicode_blocks() {
+        return progress_bar_unicode(progress, width);
+    }
+    progress_bar_ascii(progress, width)
+}
+
+fn progress_bar_unicode(progress: f64, width: usize) -> String {
+    const PARTIALS: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
     let clamped = progress.clamp(0.0, 1.0);
-    let filled = (clamped * width as f64).round() as usize;
-    let filled = filled.min(width);
+    let exact = clamped * width as f64;
+    let mut full = exact.floor() as usize;
+    let partial_steps = ((exact - full as f64) * 8.0).floor() as usize;
     let mut s = String::with_capacity(width + 2);
     s.push('[');
-    for i in 0..width {
-        s.push(if i < filled { '#' } else { '-' });
+    if full >= width {
+        for _ in 0..width {
+            s.push('█');
+        }
+    } else {
+        for _ in 0..full {
+            s.push('█');
+        }
+        if partial_steps > 0 {
+            s.push(PARTIALS[partial_steps.min(8)]);
+            full += 1;
+        }
+        for _ in full..width {
+            s.push(' ');
+        }
     }
     s.push(']');
     s
+}
+
+fn progress_bar_ascii(progress: f64, width: usize) -> String {
+    let clamped = progress.clamp(0.0, 1.0);
+    let filled = (clamped * width as f64).floor() as usize;
+    let filled = filled.min(width);
+    let mut s = String::with_capacity(width + 2);
+    s.push('[');
+    if filled == width {
+        for _ in 0..width {
+            s.push('=');
+        }
+    } else {
+        for i in 0..width {
+            if i < filled {
+                s.push('=');
+            } else if i == filled {
+                s.push('>');
+            } else {
+                s.push(' ');
+            }
+        }
+    }
+    s.push(']');
+    s
+}
+
+fn supports_unicode_blocks() -> bool {
+    if env::var("JSON_TUI_ASCII")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if env::var("JSON_TUI_UNICODE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Ok(v) = env::var(key) {
+            let lower = v.to_ascii_lowercase();
+            if lower.contains("utf-8") || lower.contains("utf8") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn parse_event_timestamp_millis(obj: &Value) -> Result<Option<f64>> {
