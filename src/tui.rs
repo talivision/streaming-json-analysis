@@ -169,7 +169,7 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
     } else {
         Text::from("No event selected")
     };
-    let title = live_json_title(app, cols[1].width);
+    let title = selected_json_title(app.live_key_focus, cols[1].width);
     let preview = Paragraph::new(preview_text)
         .wrap(Wrap { trim: false })
         .block(Block::default().title(title).borders(Borders::ALL));
@@ -203,13 +203,8 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
             style,
         )])));
     }
-    let periods_title = if app.periods_focus == PeriodsFocus::Periods {
-        "Action Periods (active)"
-    } else {
-        "Action Periods"
-    };
     frame.render_widget(
-        List::new(p_items).block(Block::default().title(periods_title).borders(Borders::ALL)),
+        List::new(p_items).block(Block::default().title("Action Periods").borders(Borders::ALL)),
         cols[0],
     );
 
@@ -246,13 +241,8 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         }
         selected_event = events.get(app.period_event_index).copied();
     }
-    let events_title = if app.periods_focus == PeriodsFocus::Events {
-        "Events (active)"
-    } else {
-        "Events"
-    };
     frame.render_widget(
-        List::new(rows).block(Block::default().title(events_title).borders(Borders::ALL)),
+        List::new(rows).block(Block::default().title("Events").borders(Borders::ALL)),
         cols[1],
     );
 
@@ -269,9 +259,15 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
             .types
             .get(&sel.type_id)
             .map(|tp| &tp.considered_paths);
+        let key_paths = app.period_selected_key_paths();
+        let selected_path = if app.periods_focus == PeriodsFocus::Json {
+            key_paths.get(app.period_json_key_index)
+        } else {
+            None
+        };
         lines.extend(render_json_keypicker(
             &sel.obj,
-            None,
+            selected_path,
             app.periods_focus == PeriodsFocus::Json,
             false,
             &app.event_filters.key_filter,
@@ -281,15 +277,17 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
     } else {
         Text::from("No event selected")
     };
-    let json_title = if app.periods_focus == PeriodsFocus::Json {
-        "Selected JSON (active)"
-    } else {
-        "Selected JSON"
-    };
     frame.render_widget(
         Paragraph::new(preview_text)
             .wrap(Wrap { trim: false })
-            .block(Block::default().title(json_title).borders(Borders::ALL)),
+            .block(
+                Block::default()
+                    .title(selected_json_title(
+                        app.periods_focus == PeriodsFocus::Json,
+                        cols[2].width,
+                    ))
+                    .borders(Borders::ALL),
+            ),
         cols[2],
     );
 }
@@ -301,8 +299,8 @@ fn styled_hotkey(label: &str) -> Span<'static> {
     )
 }
 
-fn live_json_title(app: &App, pane_width: u16) -> Line<'static> {
-    if !app.live_key_focus {
+fn selected_json_title(is_key_focus: bool, pane_width: u16) -> Line<'static> {
+    if !is_key_focus {
         return Line::from("selected JSON");
     }
     let narrow = pane_width < 56;

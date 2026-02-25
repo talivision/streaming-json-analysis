@@ -81,6 +81,7 @@ pub struct App {
     pub data_index: usize,
     pub periods_index: usize,
     pub period_event_index: usize,
+    pub period_json_key_index: usize,
     pub periods_focus: PeriodsFocus,
     pub live_event_index: usize, // absolute index in full live rows
     pub live_view_start: usize,
@@ -140,6 +141,7 @@ impl App {
             data_index: 0,
             periods_index: 0,
             period_event_index: 0,
+            period_json_key_index: 0,
             periods_focus: PeriodsFocus::Periods,
             live_event_index: 0,
             live_view_start: 0,
@@ -207,6 +209,7 @@ impl App {
 
         let backend = CrosstermBackend::new(out);
         let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|f| draw_ui(f, self))?;
 
         let mut last_poll = Instant::now() - LIVE_FALLBACK_POLL_INTERVAL;
 
@@ -303,7 +306,13 @@ impl App {
 
     fn ingest_new_events(&mut self) -> Result<bool> {
         self.rebuild_live_cache_if_needed();
-        match self.reader.poll() {
+        let use_snapshot_parallel = self.offline || self.loading_locked();
+        let events_result = if use_snapshot_parallel {
+            self.reader.poll_snapshot_parallel()
+        } else {
+            self.reader.poll()
+        };
+        match events_result {
             Ok(events) => {
                 let selected_anchor = if self.mode == UiMode::Live && !self.live_follow {
                     self.live_anchor_at(self.live_event_index)
@@ -598,6 +607,11 @@ impl App {
                 self.input_mode = InputMode::Label;
                 self.input_buffer = self.model.current_label.clone();
             }
+            KeyCode::Char('k')
+                if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Json =>
+            {
+                self.apply_period_selected_key_filter();
+            }
             KeyCode::Char('k') if self.mode == UiMode::Live && self.live_key_focus => {
                 self.apply_live_selected_key_filter();
             }
@@ -611,6 +625,11 @@ impl App {
             }
             KeyCode::Char('t') if self.mode == UiMode::Live && self.live_key_focus => {
                 self.jump_to_live_selected_event_type()
+            }
+            KeyCode::Char('t')
+                if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Json =>
+            {
+                self.jump_to_period_selected_event_type()
             }
             KeyCode::Char('t') if self.mode != UiMode::Types => {
                 self.start_event_filter_input(FilterField::Type)
@@ -656,6 +675,11 @@ impl App {
                 } else {
                     self.apply_live_selected_key_filter();
                 }
+            }
+            KeyCode::Enter
+                if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Json =>
+            {
+                self.apply_period_selected_key_filter();
             }
             KeyCode::Enter if self.mode == UiMode::Live => self.toggle_live_key_focus(),
             KeyCode::Enter if self.mode == UiMode::Types => self.enter_types_path_focus(),
@@ -916,22 +940,25 @@ impl App {
     }
 
     fn navigate_periods(&mut self, intent: NavIntent) {
-        let periods = self.model.closed_periods();
-        if periods.is_empty() {
+        let periods_len = self.model.closed_periods().len();
+        if periods_len == 0 {
             self.periods_index = 0;
             self.period_event_index = 0;
+            self.period_json_key_index = 0;
             self.periods_focus = PeriodsFocus::Periods;
             return;
         }
-        self.periods_index = self.periods_index.min(periods.len().saturating_sub(1));
+        self.periods_index = self.periods_index.min(periods_len.saturating_sub(1));
         let event_count = self.visible_period_events().len();
         if event_count == 0 {
             self.period_event_index = 0;
+            self.period_json_key_index = 0;
             if self.periods_focus != PeriodsFocus::Periods {
                 self.periods_focus = PeriodsFocus::Periods;
             }
         } else {
             self.period_event_index = self.period_event_index.min(event_count.saturating_sub(1));
+            self.clamp_period_key_selection();
         }
 
         match intent {
@@ -950,22 +977,35 @@ impl App {
                     if self.periods_index > 0 {
                         self.periods_index -= 1;
                         self.period_event_index = 0;
+                        self.period_json_key_index = 0;
                     }
                 }
-                PeriodsFocus::Events | PeriodsFocus::Json => {
+                PeriodsFocus::Events => {
                     self.period_event_index = self.period_event_index.saturating_sub(1);
+                    self.period_json_key_index = 0;
+                }
+                PeriodsFocus::Json => {
+                    self.period_json_key_index = self.period_json_key_index.saturating_sub(1);
                 }
             },
             NavIntent::LineDown => match self.periods_focus {
                 PeriodsFocus::Periods => {
-                    if self.periods_index + 1 < periods.len() {
+                    if self.periods_index + 1 < periods_len {
                         self.periods_index += 1;
                         self.period_event_index = 0;
+                        self.period_json_key_index = 0;
                     }
                 }
-                PeriodsFocus::Events | PeriodsFocus::Json => {
+                PeriodsFocus::Events => {
                     if event_count > 0 && self.period_event_index + 1 < event_count {
                         self.period_event_index += 1;
+                    }
+                    self.period_json_key_index = 0;
+                }
+                PeriodsFocus::Json => {
+                    let keys = self.period_selected_key_paths();
+                    if self.period_json_key_index + 1 < keys.len() {
+                        self.period_json_key_index += 1;
                     }
                 }
             },
@@ -973,24 +1013,38 @@ impl App {
                 PeriodsFocus::Periods => {
                     self.periods_index = 0;
                     self.period_event_index = 0;
+                    self.period_json_key_index = 0;
                 }
-                PeriodsFocus::Events | PeriodsFocus::Json => {
+                PeriodsFocus::Events => {
                     self.period_event_index = 0;
+                    self.period_json_key_index = 0;
+                }
+                PeriodsFocus::Json => {
+                    self.period_json_key_index = 0;
                 }
             },
             NavIntent::End => match self.periods_focus {
                 PeriodsFocus::Periods => {
-                    self.periods_index = periods.len().saturating_sub(1);
+                    self.periods_index = periods_len.saturating_sub(1);
                     self.period_event_index = 0;
+                    self.period_json_key_index = 0;
                 }
-                PeriodsFocus::Events | PeriodsFocus::Json => {
+                PeriodsFocus::Events => {
                     if event_count > 0 {
                         self.period_event_index = event_count.saturating_sub(1);
+                    }
+                    self.period_json_key_index = 0;
+                }
+                PeriodsFocus::Json => {
+                    let keys = self.period_selected_key_paths();
+                    if !keys.is_empty() {
+                        self.period_json_key_index = keys.len().saturating_sub(1);
                     }
                 }
             },
             NavIntent::PageUp | NavIntent::PageDown => {}
         }
+        self.clamp_period_key_selection();
     }
 
     fn navigate_types(&mut self, intent: NavIntent) {
@@ -1135,6 +1189,15 @@ impl App {
         }
     }
 
+    fn apply_period_selected_key_filter(&mut self) {
+        let keys = self.period_selected_key_paths();
+        if let Some(path) = keys.get(self.period_json_key_index) {
+            self.apply_key_filter_in_place(path);
+        } else {
+            self.status = "Selected event has no keys".to_string();
+        }
+    }
+
     fn exit_live_key_focus(&mut self) {
         let was_focus = self.live_key_focus;
         self.live_key_focus = false;
@@ -1245,6 +1308,25 @@ impl App {
             self.live_key_focus = false;
             self.live_value_focus = false;
             self.return_to_live_object_on_types_esc = true;
+            self.status = format!("Jumped to type {}", type_name);
+        }
+    }
+
+    fn jump_to_period_selected_event_type(&mut self) {
+        let Some(event) = self.selected_period_event() else {
+            return;
+        };
+        let type_id = event.type_id.clone();
+        if let Some(idx) = self.model.find_type_index(&type_id) {
+            let type_name = self.model.type_display_name(&type_id);
+            self.mode = UiMode::Types;
+            self.return_to_types_on_live_esc = false;
+            self.type_index = idx;
+            self.path_index = 0;
+            self.types_path_focus = false;
+            self.live_key_focus = false;
+            self.live_value_focus = false;
+            self.return_to_live_object_on_types_esc = false;
             self.status = format!("Jumped to type {}", type_name);
         }
     }
@@ -1547,6 +1629,14 @@ impl App {
             .copied()
     }
 
+    pub fn period_selected_key_paths(&self) -> Vec<String> {
+        let Some(event) = self.selected_period_event() else {
+            return Vec::new();
+        };
+        let (_name, keys) = classify_event(&event.obj);
+        keys
+    }
+
     fn toggle_current_path(&mut self) {
         if self.mode != UiMode::Types || !self.types_path_focus {
             return;
@@ -1627,6 +1717,18 @@ impl App {
             PeriodsFocus::Json => PeriodsFocus::Json,
         };
         self.period_event_index = self.period_event_index.min(n.saturating_sub(1));
+        self.clamp_period_key_selection();
+    }
+
+    fn clamp_period_key_selection(&mut self) {
+        let key_count = self.period_selected_key_paths().len();
+        if key_count == 0 {
+            self.period_json_key_index = 0;
+            return;
+        }
+        self.period_json_key_index = self
+            .period_json_key_index
+            .min(key_count.saturating_sub(1));
     }
 
     fn toggle_known_unrelated(&mut self) {
