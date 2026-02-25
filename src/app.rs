@@ -1,6 +1,6 @@
 use crate::domain::{
-    prepare_event, value_at_path, value_token, AnalyzerModel, DataFilters, EventRecord,
-    FilterField, PreparedEvent,
+    prepare_event, value_at_path, value_token, ActionPeriod, AnalyzerModel, DataFilters,
+    EventRecord, FilterField, PreparedEvent,
 };
 use crate::io::StreamReader;
 use crate::persistence::{load_state, save_state, RestoredState};
@@ -31,6 +31,7 @@ const LIVE_WINDOW_DEFAULT: usize = 120;
 const LIVE_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const UI_FRAME_SLEEP: Duration = Duration::from_millis(16);
 const UI_BURST_SLEEP: Duration = Duration::from_millis(1);
+const MENU_PAGE_STEP: usize = 30;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 
 pub struct ObjectInspector {
@@ -41,6 +42,7 @@ pub struct ObjectInspector {
 
 pub struct LiveRenderData<'a> {
     pub rows: Vec<&'a EventRecord>,
+    pub row_indices: Vec<usize>,
     pub selected_visible: Option<usize>,
     pub selected: Option<&'a EventRecord>,
     pub total: usize,
@@ -118,6 +120,7 @@ pub struct App {
     pending_live_recompute: bool,
     show_status_debug: bool,
     quit_pending_until: Option<Instant>,
+    pending_delete_period_id: Option<u64>,
 }
 
 impl App {
@@ -186,6 +189,7 @@ impl App {
             pending_live_recompute: false,
             show_status_debug,
             quit_pending_until: None,
+            pending_delete_period_id: None,
         };
         app.restore_persisted_state();
         app.update_loading_status();
@@ -386,10 +390,16 @@ impl App {
                     self.offline_loaded =
                         progress.total_bytes == 0 || progress.loaded_bytes >= progress.total_bytes;
                 }
+                if let Some(prompt) = self.delete_confirmation_status() {
+                    self.status = prompt;
+                }
                 Ok(n > 0)
             }
             Err(err) => {
                 self.status = format!("Stream read error: {err}");
+                if let Some(prompt) = self.delete_confirmation_status() {
+                    self.status = prompt;
+                }
                 Ok(false)
             }
         }
@@ -512,6 +522,19 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.startup_hint = None;
+        if self.pending_delete_period_id.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_pending_period_delete();
+                    return false;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cancel_pending_period_delete();
+                    return false;
+                }
+                _ => {}
+            }
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
@@ -521,6 +544,16 @@ impl App {
             self.update_loading_status();
             return false;
         }
+        let code = normalize_navigation_code(key);
+
+        if self.input_mode != InputMode::None {
+            return self.handle_input(code);
+        }
+
+        if self.inspector.is_some() {
+            return self.handle_inspector(code);
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('U'))
         {
@@ -532,16 +565,6 @@ impl App {
         {
             self.handle_navigation_intent(NavIntent::PageDown);
             return false;
-        }
-
-        let code = normalize_navigation_code(key);
-
-        if self.input_mode != InputMode::None {
-            return self.handle_input(code);
-        }
-
-        if self.inspector.is_some() {
-            return self.handle_inspector(code);
         }
 
         match code {
@@ -645,6 +668,23 @@ impl App {
             {
                 self.apply_period_selected_key_filter();
             }
+            KeyCode::Char('i')
+                if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Periods =>
+            {
+                self.input_mode = InputMode::InsertPeriodRange;
+                self.input_buffer.clear();
+            }
+            KeyCode::Char('e')
+                if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Periods =>
+            {
+                self.input_mode = InputMode::EditPeriodRange;
+                self.input_buffer = self.selected_period_row_range_input().unwrap_or_default();
+            }
+            KeyCode::Char('d')
+                if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Periods =>
+            {
+                self.start_delete_selected_period_confirmation();
+            }
             KeyCode::Char('k') if self.mode == UiMode::Live && self.live_key_focus => {
                 self.apply_live_selected_key_filter();
             }
@@ -743,6 +783,27 @@ impl App {
                     }
                 }
             }
+            KeyCode::PageUp => {
+                if let Some(ins) = self.inspector.as_mut() {
+                    ins.key_index = ins.key_index.saturating_sub(MENU_PAGE_STEP);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(ins) = self.inspector.as_mut() {
+                    ins.key_index =
+                        (ins.key_index + MENU_PAGE_STEP).min(ins.key_paths.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Home => {
+                if let Some(ins) = self.inspector.as_mut() {
+                    ins.key_index = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(ins) = self.inspector.as_mut() {
+                    ins.key_index = ins.key_paths.len().saturating_sub(1);
+                }
+            }
             KeyCode::Char('k') => {
                 if let Some(path) = self
                     .inspector
@@ -815,6 +876,32 @@ impl App {
                             let type_id = type_id.clone();
                             self.model.rename_type(&type_id, self.input_buffer.clone());
                             self.mark_live_cache_dirty();
+                        }
+                    }
+                    InputMode::InsertPeriodRange => {
+                        let input = self.input_buffer.trim().to_string();
+                        match self.parse_inclusive_event_range(&input) {
+                            Ok((start_idx, end_idx)) => {
+                                if let Err(err) =
+                                    self.insert_period_from_event_range(start_idx, end_idx)
+                                {
+                                    self.status = err;
+                                }
+                            }
+                            Err(err) => self.status = err,
+                        }
+                    }
+                    InputMode::EditPeriodRange => {
+                        let input = self.input_buffer.trim().to_string();
+                        match self.parse_inclusive_event_range(&input) {
+                            Ok((start_idx, end_idx)) => {
+                                if let Err(err) =
+                                    self.edit_selected_period_from_event_range(start_idx, end_idx)
+                                {
+                                    self.status = err;
+                                }
+                            }
+                            Err(err) => self.status = err,
                         }
                     }
                     InputMode::None => {}
@@ -907,8 +994,28 @@ impl App {
                     }
                     return;
                 }
-                NavIntent::PageUp | NavIntent::PageDown | NavIntent::Home | NavIntent::End => {
-                    self.exit_live_key_focus();
+                NavIntent::PageUp => {
+                    self.live_key_index = self.live_key_index.saturating_sub(MENU_PAGE_STEP);
+                    self.live_value_focus = false;
+                    return;
+                }
+                NavIntent::PageDown => {
+                    let keys = self.live_selected_key_paths();
+                    self.live_key_index =
+                        (self.live_key_index + MENU_PAGE_STEP).min(keys.len().saturating_sub(1));
+                    self.live_value_focus = false;
+                    return;
+                }
+                NavIntent::Home => {
+                    self.live_key_index = 0;
+                    self.live_value_focus = false;
+                    return;
+                }
+                NavIntent::End => {
+                    let keys = self.live_selected_key_paths();
+                    self.live_key_index = keys.len().saturating_sub(1);
+                    self.live_value_focus = false;
+                    return;
                 }
             }
         }
@@ -1076,7 +1183,48 @@ impl App {
                     }
                 }
             },
-            NavIntent::PageUp | NavIntent::PageDown => {}
+            NavIntent::PageUp => match self.periods_focus {
+                PeriodsFocus::Periods => {
+                    if self.periods_index > 0 {
+                        self.periods_index = self.periods_index.saturating_sub(MENU_PAGE_STEP);
+                        self.period_event_index = 0;
+                        self.period_json_key_index = 0;
+                    }
+                }
+                PeriodsFocus::Events => {
+                    self.period_event_index =
+                        self.period_event_index.saturating_sub(MENU_PAGE_STEP);
+                    self.period_json_key_index = 0;
+                }
+                PeriodsFocus::Json => {
+                    self.period_json_key_index =
+                        self.period_json_key_index.saturating_sub(MENU_PAGE_STEP);
+                }
+            },
+            NavIntent::PageDown => match self.periods_focus {
+                PeriodsFocus::Periods => {
+                    if self.periods_index + 1 < periods_len {
+                        self.periods_index = (self.periods_index + MENU_PAGE_STEP)
+                            .min(periods_len.saturating_sub(1));
+                        self.period_event_index = 0;
+                        self.period_json_key_index = 0;
+                    }
+                }
+                PeriodsFocus::Events => {
+                    if event_count > 0 {
+                        self.period_event_index = (self.period_event_index + MENU_PAGE_STEP)
+                            .min(event_count.saturating_sub(1));
+                    }
+                    self.period_json_key_index = 0;
+                }
+                PeriodsFocus::Json => {
+                    let keys = self.period_selected_key_paths();
+                    if !keys.is_empty() {
+                        self.period_json_key_index = (self.period_json_key_index + MENU_PAGE_STEP)
+                            .min(keys.len().saturating_sub(1));
+                    }
+                }
+            },
         }
         self.clamp_period_key_selection();
     }
@@ -1138,13 +1286,31 @@ impl App {
             NavIntent::Right => {
                 self.enter_types_path_focus();
             }
-            NavIntent::PageUp | NavIntent::PageDown => {}
+            NavIntent::PageUp => {
+                if self.types_path_focus {
+                    self.path_index = self.path_index.saturating_sub(MENU_PAGE_STEP);
+                } else {
+                    self.type_index = self.type_index.saturating_sub(MENU_PAGE_STEP);
+                    self.path_index = 0;
+                }
+            }
+            NavIntent::PageDown => {
+                if self.types_path_focus {
+                    if path_count > 0 {
+                        self.path_index =
+                            (self.path_index + MENU_PAGE_STEP).min(path_count.saturating_sub(1));
+                    }
+                } else {
+                    self.type_index = (self.type_index + MENU_PAGE_STEP).min(n.saturating_sub(1));
+                    self.path_index = 0;
+                }
+            }
         }
     }
 
     fn navigate_data(&mut self, intent: NavIntent) {
         let total = self.visible_baseline_events().len();
-        let page_step = 30usize;
+        let page_step = MENU_PAGE_STEP;
         self.data_index = match intent {
             NavIntent::LineUp => self.data_index.saturating_sub(1),
             NavIntent::LineDown => (self.data_index + 1).min(total.saturating_sub(1)),
@@ -1375,6 +1541,231 @@ impl App {
         }
     }
 
+    fn parse_inclusive_event_range(
+        &self,
+        text: &str,
+    ) -> std::result::Result<(usize, usize), String> {
+        let total = self.model.total_objects();
+        if total == 0 {
+            return Err("Cannot edit periods before events are loaded".to_string());
+        }
+        let compact = text.replace(' ', "");
+        let (a, b) = if let Some((lhs, rhs)) = compact.split_once('-') {
+            (lhs, rhs)
+        } else if let Some((lhs, rhs)) = compact.split_once("..") {
+            (lhs, rhs)
+        } else if let Some((lhs, rhs)) = compact.split_once(',') {
+            (lhs, rhs)
+        } else {
+            return Err("Range format: start-end (1-based, inclusive)".to_string());
+        };
+        let start = parse_usize_1based(a)?;
+        let end = parse_usize_1based(b)?;
+        if start == 0 || end == 0 {
+            return Err("Indices must be >= 1".to_string());
+        }
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        if end > total {
+            return Err(format!("Range out of bounds: max event index is {}", total));
+        }
+        Ok((start, end))
+    }
+
+    fn event_range_to_timestamps(
+        &self,
+        start_idx_1based: usize,
+        end_idx_1based: usize,
+    ) -> std::result::Result<(f64, f64), String> {
+        let start_zero = start_idx_1based.saturating_sub(1);
+        let end_zero = end_idx_1based.saturating_sub(1);
+        let Some(start_event) = self.model.events.get(start_zero) else {
+            return Err(format!("Start index {} is out of bounds", start_idx_1based));
+        };
+        let Some(end_event) = self.model.events.get(end_zero) else {
+            return Err(format!("End index {} is out of bounds", end_idx_1based));
+        };
+        Ok((start_event.ts, end_event.ts))
+    }
+
+    fn apply_periods_update(&mut self, periods: Vec<ActionPeriod>) {
+        self.model.set_periods(periods);
+        self.pending_live_recompute = true;
+        self.mark_live_cache_dirty();
+        if self.mode == UiMode::Live {
+            self.refresh_live_position();
+        }
+    }
+
+    fn set_period_selection_by_id(&mut self, period_id: u64) {
+        let periods = self.model.closed_periods();
+        if let Some(idx) = periods.iter().position(|p| p.id == period_id) {
+            self.periods_index = idx;
+        } else if periods.is_empty() {
+            self.periods_index = 0;
+        } else {
+            self.periods_index = self.periods_index.min(periods.len().saturating_sub(1));
+        }
+    }
+
+    fn insert_period_from_event_range(
+        &mut self,
+        start_idx_1based: usize,
+        end_idx_1based: usize,
+    ) -> std::result::Result<(), String> {
+        let (start_ts, end_ts) =
+            self.event_range_to_timestamps(start_idx_1based, end_idx_1based)?;
+        let mut periods = self.model.periods.clone();
+        let next_id = periods.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+        periods.push(ActionPeriod {
+            id: next_id,
+            label: self.model.current_label.clone(),
+            start: start_ts,
+            end: Some(end_ts),
+        });
+        self.apply_periods_update(periods);
+        self.set_period_selection_by_id(next_id);
+        self.period_event_index = 0;
+        self.period_json_key_index = 0;
+        self.pending_delete_period_id = None;
+        self.status = format!(
+            "Inserted period [{}] from events {}-{}",
+            next_id, start_idx_1based, end_idx_1based
+        );
+        Ok(())
+    }
+
+    fn edit_selected_period_from_event_range(
+        &mut self,
+        start_idx_1based: usize,
+        end_idx_1based: usize,
+    ) -> std::result::Result<(), String> {
+        let periods = self.model.closed_periods();
+        let Some(selected) = periods.get(self.periods_index) else {
+            return Err("No closed period selected to edit".to_string());
+        };
+        let selected_id = selected.id;
+        let (start_ts, end_ts) =
+            self.event_range_to_timestamps(start_idx_1based, end_idx_1based)?;
+        let mut updated = self.model.periods.clone();
+        let Some(target) = updated.iter_mut().find(|p| p.id == selected_id) else {
+            return Err("Selected period could not be found".to_string());
+        };
+        target.start = start_ts;
+        target.end = Some(end_ts);
+        self.apply_periods_update(updated);
+        self.set_period_selection_by_id(selected_id);
+        self.period_event_index = 0;
+        self.period_json_key_index = 0;
+        self.pending_delete_period_id = None;
+        self.status = format!(
+            "Edited period [{}] to events {}-{}",
+            selected_id, start_idx_1based, end_idx_1based
+        );
+        Ok(())
+    }
+
+    fn delete_period_by_id(&mut self, remove_id: u64) -> std::result::Result<(), String> {
+        let periods = self.model.closed_periods();
+        if periods.is_empty() {
+            return Err("No closed periods to delete".to_string());
+        }
+        let Some(zero_idx) = periods.iter().position(|p| p.id == remove_id) else {
+            return Err("Selected period could not be found".to_string());
+        };
+        let mut updated = self.model.periods.clone();
+        updated.retain(|p| p.id != remove_id);
+        self.apply_periods_update(updated);
+        let closed_after = self.model.closed_periods().len();
+        if closed_after == 0 {
+            self.periods_index = 0;
+        } else {
+            self.periods_index = zero_idx.min(closed_after.saturating_sub(1));
+        }
+        self.period_event_index = 0;
+        self.period_json_key_index = 0;
+        self.pending_delete_period_id = None;
+        self.status = format!("Deleted period id {}", remove_id);
+        Ok(())
+    }
+
+    fn start_delete_selected_period_confirmation(&mut self) {
+        let periods = self.model.closed_periods();
+        let Some(selected) = periods.get(self.periods_index) else {
+            self.status = "No closed period selected to delete".to_string();
+            return;
+        };
+        self.pending_delete_period_id = Some(selected.id);
+        self.status = format!(
+            "Delete period [{}] #{} '{}' ? Press y to confirm or n to cancel",
+            self.periods_index + 1,
+            selected.id,
+            selected.label
+        );
+    }
+
+    fn delete_confirmation_status(&self) -> Option<String> {
+        let period_id = self.pending_delete_period_id?;
+        let periods = self.model.closed_periods();
+        if let Some((idx, period)) = periods.iter().enumerate().find(|(_, p)| p.id == period_id) {
+            return Some(format!(
+                "Delete period [{}] #{} '{}' ? Press y to confirm or n to cancel",
+                idx + 1,
+                period.id,
+                period.label
+            ));
+        }
+        Some(format!(
+            "Delete period #{} ? Press y to confirm or n to cancel",
+            period_id
+        ))
+    }
+
+    fn confirm_pending_period_delete(&mut self) {
+        let Some(period_id) = self.pending_delete_period_id else {
+            return;
+        };
+        if let Err(err) = self.delete_period_by_id(period_id) {
+            self.pending_delete_period_id = None;
+            self.status = err;
+        }
+    }
+
+    fn cancel_pending_period_delete(&mut self) {
+        self.pending_delete_period_id = None;
+        self.status = "Delete cancelled".to_string();
+    }
+
+    pub fn period_row_range_for(&self, period: &ActionPeriod) -> Option<(usize, usize)> {
+        let end = period.end?;
+        let mut first_row: Option<usize> = None;
+        let mut last_row: Option<usize> = None;
+        for (idx, event) in self.model.events.iter().enumerate() {
+            if event.ts < period.start || event.ts > end {
+                continue;
+            }
+            let row = idx.saturating_add(1);
+            if first_row.is_none() {
+                first_row = Some(row);
+            }
+            last_row = Some(row);
+        }
+        match (first_row, last_row) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        }
+    }
+
+    fn selected_period_row_range_input(&self) -> Option<String> {
+        let periods = self.model.closed_periods();
+        let period = periods.get(self.periods_index)?;
+        self.period_row_range_for(period)
+            .map(|(a, b)| format!("{a}-{b}"))
+    }
+
     fn open_selected_event(&mut self) {
         self.rebuild_live_cache_if_needed();
         let selected = match self.mode {
@@ -1465,6 +1856,7 @@ impl App {
         if total == 0 {
             return LiveRenderData {
                 rows: Vec::new(),
+                row_indices: Vec::new(),
                 selected_visible: None,
                 selected: None,
                 total: 0,
@@ -1485,10 +1877,14 @@ impl App {
             start = total.saturating_sub(window);
         }
         let end = (start + window).min(total);
-        let rows: Vec<&EventRecord> = self.live_visible_indices[start..end]
-            .iter()
-            .filter_map(|idx| self.model.events.get(*idx))
-            .collect();
+        let mut rows: Vec<&EventRecord> = Vec::new();
+        let mut row_indices: Vec<usize> = Vec::new();
+        for &event_idx in &self.live_visible_indices[start..end] {
+            if let Some(event) = self.model.events.get(event_idx) {
+                rows.push(event);
+                row_indices.push(event_idx.saturating_add(1));
+            }
+        }
         let selected = self.live_event_at_visible_index(self.live_event_index);
         let selected_visible = if self.live_event_index >= start && self.live_event_index < end {
             Some(self.live_event_index - start)
@@ -1497,6 +1893,7 @@ impl App {
         };
         LiveRenderData {
             rows,
+            row_indices,
             selected_visible,
             selected,
             total,
@@ -1656,7 +2053,7 @@ impl App {
     }
 
     pub fn should_show_status_line(&self) -> bool {
-        self.show_status_debug || self.loading_locked()
+        self.show_status_debug || self.loading_locked() || self.pending_delete_period_id.is_some()
     }
 
     pub fn selected_period_event(&self) -> Option<&EventRecord> {
@@ -2019,12 +2416,20 @@ fn normalize_navigation_code(key: KeyEvent) -> KeyCode {
     }
 }
 
+fn parse_usize_1based(raw: &str) -> std::result::Result<usize, String> {
+    raw.parse::<usize>()
+        .map_err(|_| format!("Invalid number: {raw}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{normalize_navigation_code, parse_event_timestamp_millis, App, PeriodsFocus};
+    use super::{
+        normalize_navigation_code, parse_event_timestamp_millis, App, NavIntent, PeriodsFocus,
+        MENU_PAGE_STEP,
+    };
     use crate::tui::UiMode;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn leaves_home_and_end_unchanged() {
@@ -2219,5 +2624,42 @@ mod tests {
         assert!(!app.types_path_focus);
         assert_eq!(app.periods_focus, PeriodsFocus::Periods);
         assert!(!app.live_key_focus);
+    }
+
+    #[test]
+    fn navigate_types_supports_page_up_down_for_type_list() {
+        let mut app = test_app();
+        for i in 0..80 {
+            let mut map = serde_json::Map::new();
+            map.insert(format!("k{}", i), json!(i));
+            app.model.ingest(Value::Object(map), i as f64);
+        }
+        app.type_index = 0;
+        app.types_path_focus = false;
+
+        app.navigate_types(NavIntent::PageDown);
+        assert_eq!(app.type_index, MENU_PAGE_STEP);
+
+        app.navigate_types(NavIntent::PageUp);
+        assert_eq!(app.type_index, 0);
+    }
+
+    #[test]
+    fn navigate_types_supports_page_up_down_for_path_list() {
+        let mut app = test_app();
+        let mut map = serde_json::Map::new();
+        for i in 0..80 {
+            map.insert(format!("k{}", i), json!(i));
+        }
+        app.model.ingest(Value::Object(map), 1.0);
+        app.type_index = 0;
+        app.types_path_focus = true;
+        app.path_index = 0;
+
+        app.navigate_types(NavIntent::PageDown);
+        assert_eq!(app.path_index, MENU_PAGE_STEP);
+
+        app.navigate_types(NavIntent::PageUp);
+        assert_eq!(app.path_index, 0);
     }
 }

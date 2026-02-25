@@ -7,6 +7,11 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
+struct JsonRender {
+    lines: Vec<Line<'static>>,
+    selected_line: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiMode {
     Live,
@@ -22,6 +27,8 @@ pub enum InputMode {
     EventFilter(FilterField),
     TypesFilter,
     RenameType,
+    InsertPeriodRange,
+    EditPeriodRange,
 }
 
 pub fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
@@ -98,9 +105,11 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
     let stream_inner_width = cols[0].width.saturating_sub(2) as usize;
     for (idx, e) in live.rows.iter().enumerate() {
         let selected = Some(idx) == selected_visible;
+        let row_index = live.row_indices.get(idx).copied();
         items.push(ListItem::new(render_event_line(
             app,
             e,
+            row_index,
             selected,
             stream_inner_width,
             max_type_count,
@@ -117,7 +126,7 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
     let stream = List::new(items).block(Block::default().title(live_title).borders(Borders::ALL));
     frame.render_widget(stream, cols[0]);
 
-    let preview_text = if let Some(sel) = live.selected {
+    let (preview_text, preview_scroll) = if let Some(sel) = live.selected {
         let mut lines = vec![Line::from(Span::styled(
             app.model.type_display_name(&sel.type_id),
             Style::default()
@@ -157,20 +166,23 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
             .types
             .get(&sel.type_id)
             .map(|tp| &tp.considered_paths);
-        lines.extend(render_json_keypicker(
+        let rendered = render_json_keypicker(
             &sel.obj,
             selected_path,
             app.live_key_focus,
             app.live_value_focus,
             &app.event_filters.key_filter,
             considered_paths,
-        ));
-        Text::from(lines)
+        );
+        let scroll = selected_json_scroll(rendered.selected_line, cols[1].height);
+        lines.extend(rendered.lines);
+        (Text::from(lines), scroll)
     } else {
-        Text::from("No event selected")
+        (Text::from("No event selected"), 0)
     };
     let title = selected_json_title(app.live_key_focus, cols[1].width);
     let preview = Paragraph::new(preview_text)
+        .scroll((preview_scroll, 0))
         .wrap(Wrap { trim: false })
         .block(Block::default().title(title).borders(Borders::ALL));
     frame.render_widget(preview, cols[1]);
@@ -198,15 +210,26 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
             };
         }
         let dur = p.end.unwrap_or(p.start) - p.start;
+        let row_range = app
+            .period_row_range_for(p)
+            .map(|(a, b)| format!("{a}-{b}"))
+            .unwrap_or_else(|| "-".to_string());
         p_items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!("#{} {} ({:.2}s)", p.id, p.label, dur),
+            format!(
+                "[{}] #{} {} ({:.2}s) rows {}",
+                idx + 1,
+                p.id,
+                p.label,
+                dur,
+                row_range
+            ),
             style,
         )])));
     }
     frame.render_widget(
         List::new(p_items).block(
             Block::default()
-                .title("Action Periods")
+                .title(action_periods_title(cols[0].width))
                 .borders(Borders::ALL),
         ),
         cols[0],
@@ -238,6 +261,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
             rows.push(ListItem::new(render_event_line(
                 app,
                 e,
+                None,
                 selected,
                 events_inner_width,
                 max_type_count,
@@ -250,7 +274,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         cols[1],
     );
 
-    let preview_text = if let Some(sel) = selected_event {
+    let (preview_text, preview_scroll) = if let Some(sel) = selected_event {
         let mut lines = vec![Line::from(Span::styled(
             app.model.type_display_name(&sel.type_id),
             Style::default()
@@ -269,20 +293,23 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         } else {
             None
         };
-        lines.extend(render_json_keypicker(
+        let rendered = render_json_keypicker(
             &sel.obj,
             selected_path,
             app.periods_focus == PeriodsFocus::Json,
             false,
             &app.event_filters.key_filter,
             considered_paths,
-        ));
-        Text::from(lines)
+        );
+        let scroll = selected_json_scroll(rendered.selected_line, cols[2].height);
+        lines.extend(rendered.lines);
+        (Text::from(lines), scroll)
     } else {
-        Text::from("No event selected")
+        (Text::from("No event selected"), 0)
     };
     frame.render_widget(
         Paragraph::new(preview_text)
+            .scroll((preview_scroll, 0))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
@@ -303,6 +330,43 @@ fn styled_hotkey(label: &str) -> Span<'static> {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )
+}
+
+fn action_periods_title(pane_width: u16) -> Line<'static> {
+    if pane_width < 24 {
+        return Line::from("Periods");
+    }
+    if pane_width < 36 {
+        return Line::from(vec![
+            Span::raw("Periods ("),
+            styled_hotkey("i"),
+            Span::raw("/"),
+            styled_hotkey("e"),
+            Span::raw("/"),
+            styled_hotkey("d"),
+            Span::raw(")"),
+        ]);
+    }
+    if pane_width < 56 {
+        return Line::from(vec![
+            Span::raw("Periods ("),
+            styled_hotkey("i"),
+            Span::raw(" add, "),
+            styled_hotkey("e"),
+            Span::raw(" edit, "),
+            styled_hotkey("d"),
+            Span::raw(" del?)"),
+        ]);
+    }
+    Line::from(vec![
+        Span::raw("Action Periods ("),
+        styled_hotkey("i"),
+        Span::raw(" insert start-end, "),
+        styled_hotkey("e"),
+        Span::raw(" edit selected, "),
+        styled_hotkey("d"),
+        Span::raw(" delete selected)"),
+    ])
 }
 
 fn selected_json_title(is_key_focus: bool, pane_width: u16) -> Line<'static> {
@@ -561,6 +625,7 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f64) 
         lines.push(render_event_line(
             app,
             e,
+            None,
             selected,
             data_inner_width,
             max_type_count,
@@ -589,6 +654,12 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             InputMode::EventFilter(field) => field.title(),
             InputMode::TypesFilter => "type list filter",
             InputMode::RenameType => "rename type",
+            InputMode::InsertPeriodRange => {
+                "insert period in format <row_start>-<row_end> (e.g. 234-268)"
+            }
+            InputMode::EditPeriodRange => {
+                "edit period in format <row_start>-<row_end> (e.g. 234-268)"
+            }
         };
         text.push(Line::from(vec![
             Span::styled(format!("{}: ", title), Style::default().fg(Color::Yellow)),
@@ -837,6 +908,7 @@ fn draw_full_help(frame: &mut Frame<'_>) {
         Line::from("  3 panes: periods | events | selected JSON"),
         Line::from("  enter/right move focus right, left move focus left"),
         Line::from("  up/down choose row in active pane"),
+        Line::from("  with periods focus: i insert start-end, e edit selected, d delete selected (asks confirm)"),
         Line::from(""),
         Line::from("Types"),
         Line::from("  / filter types by id or name"),
@@ -894,7 +966,7 @@ fn draw_inspector(frame: &mut Frame<'_>, inspector: &ObjectInspector, app: &App)
     );
 
     let selected_path = inspector.key_paths.get(inspector.key_index);
-    let lines = render_json_keypicker(
+    let rendered = render_json_keypicker(
         &inspector.event.obj,
         selected_path,
         true,
@@ -905,8 +977,10 @@ fn draw_inspector(frame: &mut Frame<'_>, inspector: &ObjectInspector, app: &App)
             .get(&inspector.event.type_id)
             .map(|tp| &tp.considered_paths),
     );
+    let scroll = selected_json_scroll(rendered.selected_line, rows[1].height);
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
+        Paragraph::new(Text::from(rendered.lines))
+            .scroll((scroll, 0))
             .wrap(Wrap { trim: false })
             .block(Block::default().title("Object").borders(Borders::ALL)),
         rows[1],
@@ -920,8 +994,9 @@ fn render_json_keypicker(
     value_focus: bool,
     active_key_filter: &str,
     considered_paths: Option<&IndexMap<String, bool>>,
-) -> Vec<Line<'static>> {
+) -> JsonRender {
     let mut lines = Vec::new();
+    let mut selected_line = None;
     render_json_value_lines(
         value,
         "",
@@ -932,8 +1007,12 @@ fn render_json_keypicker(
         active_key_filter,
         considered_paths,
         &mut lines,
+        &mut selected_line,
     );
-    lines
+    JsonRender {
+        lines,
+        selected_line,
+    }
 }
 
 fn render_json_value_lines(
@@ -946,6 +1025,7 @@ fn render_json_value_lines(
     active_key_filter: &str,
     considered_paths: Option<&IndexMap<String, bool>>,
     out: &mut Vec<Line<'static>>,
+    selected_line: &mut Option<usize>,
 ) {
     match value {
         serde_json::Value::Object(map) => {
@@ -969,6 +1049,7 @@ fn render_json_value_lines(
                     active_key_filter,
                     considered_paths,
                     out,
+                    selected_line,
                 );
             }
             let tail = if is_last { "}" } else { "}," };
@@ -994,6 +1075,7 @@ fn render_json_value_lines(
                     active_key_filter,
                     considered_paths,
                     out,
+                    selected_line,
                 );
             }
             let tail = if is_last { "]" } else { "]," };
@@ -1066,6 +1148,7 @@ fn render_json_keyed_value_line(
     active_key_filter: &str,
     considered_paths: Option<&IndexMap<String, bool>>,
     out: &mut Vec<Line<'static>>,
+    selected_line: &mut Option<usize>,
 ) {
     let selected = selected_path == Some(path);
     let filtered = !active_key_filter.is_empty() && active_key_filter == path;
@@ -1110,6 +1193,9 @@ fn render_json_keyed_value_line(
     let sel_or_filt = selected || filtered;
     match value {
         serde_json::Value::Object(map) => {
+            if selected && selected_line.is_none() {
+                *selected_line = Some(out.len());
+            }
             push_open_bracket(prefix, "{", sel_or_filt, punctuation_override, out);
             let len = map.len();
             for (idx, (k, child)) in map.iter().enumerate() {
@@ -1125,11 +1211,15 @@ fn render_json_keyed_value_line(
                     active_key_filter,
                     considered_paths,
                     out,
+                    selected_line,
                 );
             }
             push_close_bracket(indent, '}', is_last, sel_or_filt, punctuation_override, out);
         }
         serde_json::Value::Array(arr) => {
+            if selected && selected_line.is_none() {
+                *selected_line = Some(out.len());
+            }
             push_open_bracket(prefix, "[", sel_or_filt, punctuation_override, out);
             for (idx, child) in arr.iter().enumerate() {
                 let child_path = format!("{}[]", path);
@@ -1144,11 +1234,15 @@ fn render_json_keyed_value_line(
                     active_key_filter,
                     considered_paths,
                     out,
+                    selected_line,
                 );
             }
             push_close_bracket(indent, ']', is_last, sel_or_filt, punctuation_override, out);
         }
         _ => {
+            if selected && selected_line.is_none() {
+                *selected_line = Some(out.len());
+            }
             let mut line = prefix;
             let value_text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
             let value_override = if selected && value_focus {
@@ -1173,6 +1267,18 @@ fn render_json_keyed_value_line(
             out.push(Line::from(line));
         }
     }
+}
+
+fn selected_json_scroll(selected_line: Option<usize>, pane_height: u16) -> u16 {
+    let view_rows = pane_height.saturating_sub(2) as usize;
+    if view_rows == 0 {
+        return 0;
+    }
+    let Some(line) = selected_line else {
+        return 0;
+    };
+    let half = view_rows / 2;
+    line.saturating_sub(half).min(u16::MAX as usize) as u16
 }
 
 fn is_path_normalized_out(considered_paths: Option<&IndexMap<String, bool>>, path: &str) -> bool {
@@ -1213,6 +1319,7 @@ fn json_punctuation_style() -> Style {
 fn render_event_line(
     app: &App,
     e: &EventRecord,
+    row_index: Option<usize>,
     selected: bool,
     row_width: usize,
     max_type_count: f64,
@@ -1251,7 +1358,10 @@ fn render_event_line(
         .map(|(_, _, rendered)| rendered.chars().count())
         .unwrap_or(0);
 
-    let fixed_prefix = 2 + 1 + 3 + ts.chars().count() + 1;
+    let row_label = row_index
+        .map(|idx| format!("#{} ", idx))
+        .unwrap_or_default();
+    let fixed_prefix = 2 + 1 + 3 + row_label.chars().count() + ts.chars().count() + 1;
     let name_budget = row_width.saturating_sub(fixed_prefix + tail_len).max(4);
     let short_name = truncate_text(&name, name_budget);
     let line_len = fixed_prefix + short_name.chars().count() + tail_len;
@@ -1262,6 +1372,7 @@ fn render_event_line(
         action_marker,
         Span::raw(" "),
         Span::raw(format!("{} ", sel)),
+        Span::styled(row_label, Style::default().fg(Color::Gray)),
         Span::styled(ts, Style::default().fg(Color::Gray)),
         Span::raw(" "),
         Span::styled(short_name, name_style),
