@@ -21,6 +21,10 @@ struct Args {
     /// run without persisting baseline updates
     #[argh(switch)]
     offline: bool,
+
+    /// show internal status line details continuously
+    #[argh(switch)]
+    debug_status: bool,
 }
 
 fn main() -> Result<()> {
@@ -31,6 +35,6 @@ fn main() -> Result<()> {
         (None, None) => bail!("a path is required: provide <path> or --jsonl <path>"),
     };
 
-    let mut app = App::new(jsonl_path, args.baseline, args.offline);
+    let mut app = App::new(jsonl_path, args.baseline, args.offline, args.debug_status);
     app.run()
 }

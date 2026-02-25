@@ -4,7 +4,6 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 
-const MAX_EVENTS: usize = 80_000;
 const ACTION_BOUNDARY_EPS: f64 = 0.000_001;
 const MIN_ACTION_RATE_DURATION_SECS: f64 = 1.0;
 const VALUE_ANOMALY_RARE_FREQ: f64 = 0.25;
@@ -222,9 +221,6 @@ impl AnalyzerModel {
             live_rate_score: rate,
             live_uniq_score: uniq,
         });
-        while self.events.len() > MAX_EVENTS {
-            self.events.pop_front();
-        }
     }
 
     pub fn ingest_baseline(&mut self, obj: Value, ts: f64) {
@@ -506,7 +502,84 @@ impl AnalyzerModel {
         filters: &'a DataFilters,
         range: Option<(f64, f64)>,
     ) -> Vec<&'a EventRecord> {
-        self.filter_events_from_iter(self.events.iter().rev(), filters, range)
+        let indices = self.filtered_event_indices(filters, range);
+        indices
+            .into_iter()
+            .rev()
+            .filter_map(|idx| self.events.get(idx))
+            .collect()
+    }
+
+    pub fn filtered_event_indices(
+        &self,
+        filters: &DataFilters,
+        range: Option<(f64, f64)>,
+    ) -> Vec<usize> {
+        let mut out = Vec::new();
+        let type_query = filters.type_filter.to_lowercase();
+        let fuzzy_query = filters.fuzzy_filter.to_lowercase();
+        let wanted_keys: Vec<&str> = if filters.key_filter.is_empty() {
+            Vec::new()
+        } else {
+            filters
+                .key_filter
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let parsed_exact: Option<(String, String)> = if !filters.exact_filter.is_empty() {
+            parse_exact_filter(&filters.exact_filter).map(|(k, v)| (k.to_string(), v))
+        } else {
+            None
+        };
+
+        for (idx, e) in self.events.iter().enumerate() {
+            if self
+                .types
+                .get(e.type_id.as_str())
+                .map(|tp| tp.known_unrelated)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if let Some((start, end)) = range {
+                if e.ts < start || e.ts > end {
+                    continue;
+                }
+            }
+            if !type_query.is_empty() {
+                let canonical = self.canonical_type_name(&e.type_id).to_lowercase();
+                if !canonical.contains(&type_query) {
+                    continue;
+                }
+            }
+            if !wanted_keys.is_empty()
+                && !wanted_keys
+                    .iter()
+                    .all(|k| e.keys.iter().any(|event_key| event_key == k))
+            {
+                continue;
+            }
+            if !fuzzy_query.is_empty() {
+                let obj = serde_json::to_string(&e.obj)
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if !fuzzy_match(&obj, &fuzzy_query) {
+                    continue;
+                }
+            }
+            if let Some((ref k, ref v)) = parsed_exact {
+                let found = value_at_path(&e.obj, k)
+                    .map(|actual| exact_value_matches(actual, v))
+                    .unwrap_or(false);
+                if !found {
+                    continue;
+                }
+            }
+            out.push(idx);
+        }
+        out
     }
 
     pub fn filtered_event_slice<'a>(

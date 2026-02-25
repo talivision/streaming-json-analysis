@@ -1,5 +1,6 @@
-use crate::app::{App, ObjectInspector};
+use crate::app::{App, ObjectInspector, PeriodsFocus};
 use crate::domain::{EventRecord, FilterField, PathOverride};
+use indexmap::IndexMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -81,11 +82,12 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, mode: UiMode) {
 fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f64) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
 
     let list_rows = cols[0].height.saturating_sub(2) as usize;
     app.set_live_window_rows(list_rows);
+    app.ensure_live_cache();
     let live = app.live_render_data_for_window(list_rows);
     let selected_visible = if live.rows.is_empty() {
         None
@@ -150,12 +152,18 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
         } else {
             None
         };
+        let considered_paths = app
+            .model
+            .types
+            .get(&sel.type_id)
+            .map(|tp| &tp.considered_paths);
         lines.extend(render_json_keypicker(
             &sel.obj,
             selected_path,
             app.live_key_focus,
             app.live_value_focus,
             &app.event_filters.key_filter,
+            considered_paths,
         ));
         Text::from(lines)
     } else {
@@ -171,7 +179,11 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
 fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f64) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .constraints([
+            Constraint::Percentage(22),
+            Constraint::Percentage(28),
+            Constraint::Percentage(50),
+        ])
         .split(area);
 
     let periods = app.model.closed_periods();
@@ -179,10 +191,10 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
     for (idx, p) in periods.iter().enumerate() {
         let mut style = Style::default();
         if idx == app.periods_index {
-            style = if app.periods_event_focus {
-                style.fg(Color::Gray)
-            } else {
+            style = if app.periods_focus == PeriodsFocus::Periods {
                 style.fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                style.fg(Color::Gray)
             };
         }
         let dur = p.end.unwrap_or(p.start) - p.start;
@@ -191,10 +203,10 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
             style,
         )])));
     }
-    let periods_title = if app.periods_event_focus {
-        "All Action Periods (list focus)"
+    let periods_title = if app.periods_focus == PeriodsFocus::Periods {
+        "Action Periods (active)"
     } else {
-        "All Action Periods (active)"
+        "Action Periods"
     };
     frame.render_widget(
         List::new(p_items).block(Block::default().title(periods_title).borders(Borders::ALL)),
@@ -204,6 +216,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
     let mut rows = Vec::new();
     let events_inner_width = cols[1].width.saturating_sub(2) as usize;
     let max_period_rows = (cols[1].height as usize).saturating_sub(2);
+    let mut selected_event: Option<&EventRecord> = None;
     if let Some(period) = periods.get(app.periods_index) {
         let start = period.start;
         let end = period.end.unwrap_or(period.start);
@@ -222,7 +235,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         };
         for (vis_idx, e) in events.iter().skip(start_idx).take(window).enumerate() {
             let idx = start_idx + vis_idx;
-            let selected = idx == app.period_event_index && app.periods_event_focus;
+            let selected = idx == app.period_event_index;
             rows.push(ListItem::new(render_event_line(
                 app,
                 e,
@@ -231,15 +244,53 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
                 max_type_count,
             )));
         }
+        selected_event = events.get(app.period_event_index).copied();
     }
-    let events_title = if app.periods_event_focus {
-        "Events in Selected Period (active)"
+    let events_title = if app.periods_focus == PeriodsFocus::Events {
+        "Events (active)"
     } else {
-        "Events in Selected Period (right/enter to focus)"
+        "Events"
     };
     frame.render_widget(
         List::new(rows).block(Block::default().title(events_title).borders(Borders::ALL)),
         cols[1],
+    );
+
+    let preview_text = if let Some(sel) = selected_event {
+        let mut lines = vec![Line::from(Span::styled(
+            app.model.type_display_name(&sel.type_id),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))];
+        lines.push(Line::from(""));
+        let considered_paths = app
+            .model
+            .types
+            .get(&sel.type_id)
+            .map(|tp| &tp.considered_paths);
+        lines.extend(render_json_keypicker(
+            &sel.obj,
+            None,
+            app.periods_focus == PeriodsFocus::Json,
+            false,
+            &app.event_filters.key_filter,
+            considered_paths,
+        ));
+        Text::from(lines)
+    } else {
+        Text::from("No event selected")
+    };
+    let json_title = if app.periods_focus == PeriodsFocus::Json {
+        "Selected JSON (active)"
+    } else {
+        "Selected JSON"
+    };
+    frame.render_widget(
+        Paragraph::new(preview_text)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title(json_title).borders(Borders::ALL)),
+        cols[2],
     );
 }
 
@@ -328,9 +379,25 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .iter()
         .filter_map(|id| app.model.types.get(id.as_str()).map(|tp| (id.as_str(), tp)))
         .collect();
+    let total_types = visible.len();
+    let selected_type = if total_types == 0 {
+        0
+    } else {
+        app.type_index.min(total_types.saturating_sub(1))
+    };
+    let type_window = (cols[0].height as usize).saturating_sub(2).max(1);
+    let type_start = if total_types <= type_window {
+        0
+    } else {
+        let half = type_window / 2;
+        selected_type
+            .saturating_sub(half)
+            .min(total_types.saturating_sub(type_window))
+    };
 
     let mut type_items = Vec::new();
-    for (idx, (type_id, tp)) in visible.iter().enumerate() {
+    for (vis_idx, (type_id, tp)) in visible.iter().skip(type_start).take(type_window).enumerate() {
+        let idx = type_start + vis_idx;
         let mut style = Style::default();
         if idx == app.type_index {
             style = if app.types_path_focus {
@@ -344,18 +411,14 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         let name = app.model.type_display_name(type_id);
         type_items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!(
-                "{}  count={}  r={} u={}",
-                name,
-                tp.count,
-                format_score(tp.latest_rate),
-                format_score(tp.latest_uniq)
-            ),
+            format!("{}  count={}", name, tp.count),
             style,
         )])));
     }
     let type_title = format!(
-        "Types ({})  [enter/right details, t filter, / search]",
+        "Types row {}/{} ({})  [enter/right details, t filter, / search]",
+        if total_types == 0 { 0 } else { selected_type + 1 },
+        total_types,
         if app.types_path_focus {
             "details focus"
         } else {
@@ -368,7 +431,7 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 
     let mut lines = Vec::new();
-    if let Some((type_id, tp)) = visible.get(app.type_index) {
+    if let Some((type_id, tp)) = visible.get(selected_type) {
         lines.push(Line::from(Span::styled(
             app.model.type_display_name(type_id),
             Style::default()
@@ -377,7 +440,30 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )));
         lines.push(Line::from(""));
 
-        for (idx, (path, on)) in tp.considered_paths.iter().enumerate() {
+        let total_paths = tp.considered_paths.len();
+        let selected_path = if total_paths == 0 {
+            0
+        } else {
+            app.path_index.min(total_paths.saturating_sub(1))
+        };
+        let path_window = (cols[1].height as usize).saturating_sub(15).max(1);
+        let path_start = if total_paths <= path_window {
+            0
+        } else {
+            let half = path_window / 2;
+            selected_path
+                .saturating_sub(half)
+                .min(total_paths.saturating_sub(path_window))
+        };
+
+        for (vis_idx, (path, on)) in tp
+            .considered_paths
+            .iter()
+            .skip(path_start)
+            .take(path_window)
+            .enumerate()
+        {
+            let idx = path_start + vis_idx;
             let selected = idx == app.path_index;
             let sel = if selected { ">" } else { " " };
             let override_mode = tp.path_overrides.get(path.as_str()).copied();
@@ -405,6 +491,12 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Span::raw(" "),
                 Span::styled(format!("{} ({})", path, mode), path_style),
             ]));
+        }
+        if total_paths > path_window {
+            lines.push(Line::from(Span::styled(
+                format!("rows {}/{}", selected_path.saturating_add(1), total_paths),
+                Style::default().fg(Color::Gray),
+            )));
         }
 
         lines.push(Line::from(""));
@@ -488,6 +580,15 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         text.push(Line::from(vec![
             Span::styled(format!("{}: ", title), Style::default().fg(Color::Yellow)),
             Span::raw(app.input_buffer.clone()),
+        ]));
+    } else if app.should_show_status_line() && !app.status.is_empty() {
+        let max_status = inner_width.saturating_sub(10).max(16);
+        text.push(Line::from(vec![
+            Span::styled("status: ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                truncate_text(&app.status, max_status),
+                Style::default().fg(Color::LightGreen),
+            ),
         ]));
     } else if let Some(hint) = app.startup_hint() {
         let max_hint = inner_width.saturating_sub(8).max(16);
@@ -720,9 +821,9 @@ fn draw_full_help(frame: &mut Frame<'_>) {
         Line::from("  k/t//e set filters, c clear filters, y toggle filters on/off"),
         Line::from(""),
         Line::from("Periods"),
-        Line::from("  up/down choose period"),
-        Line::from("  enter/right focus events for selected period"),
-        Line::from("  with event focus: up/down choose event, enter inspect, left return"),
+        Line::from("  3 panes: periods | events | selected JSON"),
+        Line::from("  enter/right move focus right, left move focus left"),
+        Line::from("  up/down choose row in active pane"),
         Line::from(""),
         Line::from("Types"),
         Line::from("  / filter types by id or name"),
@@ -786,6 +887,10 @@ fn draw_inspector(frame: &mut Frame<'_>, inspector: &ObjectInspector, app: &App)
         true,
         false,
         &app.event_filters.key_filter,
+        app.model
+            .types
+            .get(&inspector.event.type_id)
+            .map(|tp| &tp.considered_paths),
     );
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -801,6 +906,7 @@ fn render_json_keypicker(
     _focused: bool,
     value_focus: bool,
     active_key_filter: &str,
+    considered_paths: Option<&IndexMap<String, bool>>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     render_json_value_lines(
@@ -811,6 +917,7 @@ fn render_json_keypicker(
         selected_path.map(|s| s.as_str()),
         value_focus,
         active_key_filter,
+        considered_paths,
         &mut lines,
     );
     lines
@@ -824,6 +931,7 @@ fn render_json_value_lines(
     selected_path: Option<&str>,
     value_focus: bool,
     active_key_filter: &str,
+    considered_paths: Option<&IndexMap<String, bool>>,
     out: &mut Vec<Line<'static>>,
 ) {
     match value {
@@ -846,6 +954,7 @@ fn render_json_value_lines(
                     selected_path,
                     value_focus,
                     active_key_filter,
+                    considered_paths,
                     out,
                 );
             }
@@ -870,6 +979,7 @@ fn render_json_value_lines(
                     selected_path,
                     value_focus,
                     active_key_filter,
+                    considered_paths,
                     out,
                 );
             }
@@ -930,10 +1040,12 @@ fn render_json_keyed_value_line(
     selected_path: Option<&str>,
     value_focus: bool,
     active_key_filter: &str,
+    considered_paths: Option<&IndexMap<String, bool>>,
     out: &mut Vec<Line<'static>>,
 ) {
     let selected = selected_path == Some(path);
     let filtered = !active_key_filter.is_empty() && active_key_filter == path;
+    let normalized_out = is_path_normalized_out(considered_paths, path);
     let key_override = if selected {
         Style::default()
             .fg(Color::Yellow)
@@ -945,6 +1057,7 @@ fn render_json_keyed_value_line(
     } else {
         Style::default()
     };
+    let key_override = apply_normalized_out_style(key_override, normalized_out);
     let punctuation_override = if selected {
         Style::default()
             .fg(Color::Yellow)
@@ -954,16 +1067,20 @@ fn render_json_keyed_value_line(
     } else {
         Style::default()
     };
+    let punctuation_override = apply_normalized_out_style(punctuation_override, normalized_out);
 
     let mut prefix = vec![Span::raw("  ".repeat(indent))];
     if let Some(k) = key {
         let key_style = if selected || filtered {
             key_override
         } else {
-            json_key_base_style()
+            apply_normalized_out_style(json_key_base_style(), normalized_out)
         };
         prefix.push(Span::styled(format!("\"{k}\""), key_style));
-        prefix.push(Span::styled(": ", json_punctuation_style()));
+        prefix.push(Span::styled(
+            ": ",
+            apply_normalized_out_style(json_punctuation_style(), normalized_out),
+        ));
     }
 
     let sel_or_filt = selected || filtered;
@@ -982,6 +1099,7 @@ fn render_json_keyed_value_line(
                     selected_path,
                     value_focus,
                     active_key_filter,
+                    considered_paths,
                     out,
                 );
             }
@@ -1000,6 +1118,7 @@ fn render_json_keyed_value_line(
                     selected_path,
                     value_focus,
                     active_key_filter,
+                    considered_paths,
                     out,
                 );
             }
@@ -1019,12 +1138,31 @@ fn render_json_keyed_value_line(
             } else {
                 json_value_style(value)
             };
+            let value_override = apply_normalized_out_style(value_override, normalized_out);
             line.push(Span::styled(value_text, value_override));
             if !is_last {
-                line.push(Span::styled(",", json_punctuation_style()));
+                line.push(Span::styled(
+                    ",",
+                    apply_normalized_out_style(json_punctuation_style(), normalized_out),
+                ));
             }
             out.push(Line::from(line));
         }
+    }
+}
+
+fn is_path_normalized_out(considered_paths: Option<&IndexMap<String, bool>>, path: &str) -> bool {
+    considered_paths
+        .and_then(|paths| paths.get(path).copied())
+        .map(|is_considered| !is_considered)
+        .unwrap_or(false)
+}
+
+fn apply_normalized_out_style(style: Style, normalized_out: bool) -> Style {
+    if normalized_out {
+        style.fg(Color::Gray).add_modifier(Modifier::DIM)
+    } else {
+        style
     }
 }
 
@@ -1055,8 +1193,8 @@ fn render_event_line(
     row_width: usize,
     max_type_count: f64,
 ) -> Line<'static> {
-    let obj = serde_json::to_string(&e.obj).unwrap_or_default();
     let name = app.model.type_display_name(&e.type_id);
+    let ts = format!("{:.3}", e.ts);
     let type_count = app
         .model
         .types
@@ -1073,13 +1211,7 @@ fn render_event_line(
         Span::raw("  ")
     };
     let sel = if selected { "->" } else { "  " };
-    let name_style = if selected {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Cyan)
-    };
+    let name_style = style;
     // Build the metrics block text first so tail_len comes from the actual rendered string,
     // not from manually summed constants that can drift out of sync with the spans below.
     let metrics = if e.in_action_period {
@@ -1095,15 +1227,12 @@ fn render_event_line(
         .map(|(_, _, rendered)| rendered.chars().count())
         .unwrap_or(0);
 
-    let fixed_prefix = 2 + 1 + 3 + name.chars().count() + 1;
-    let mut obj_budget = row_width.saturating_sub(fixed_prefix + tail_len);
-    obj_budget = obj_budget.min(48);
-    let short = if obj_budget == 0 {
-        String::new()
-    } else {
-        truncate_text(&obj, obj_budget)
-    };
-    let line_len = fixed_prefix + short.chars().count() + tail_len;
+    let fixed_prefix = 2 + 1 + 3 + ts.chars().count() + 1;
+    let name_budget = row_width
+        .saturating_sub(fixed_prefix + tail_len)
+        .max(4);
+    let short_name = truncate_text(&name, name_budget);
+    let line_len = fixed_prefix + short_name.chars().count() + tail_len;
     let spacer_len = row_width.saturating_sub(line_len);
     let spacer = " ".repeat(spacer_len);
 
@@ -1111,8 +1240,9 @@ fn render_event_line(
         action_marker,
         Span::raw(" "),
         Span::raw(format!("{} ", sel)),
-        Span::styled(format!("{} ", name), name_style),
-        Span::styled(short, style),
+        Span::styled(ts, Style::default().fg(Color::Gray)),
+        Span::raw(" "),
+        Span::styled(short_name, name_style),
     ];
     if let Some((rate_str, value_str, _)) = metrics {
         let rate_color = rate_anomaly_color(anomaly_norm(e.live_rate_score));

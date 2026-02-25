@@ -19,13 +19,13 @@ use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 use serde_json::Value;
 use std::io::stdout;
+use std::fs;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LIVE_WINDOW_DEFAULT: usize = 120;
-const LIVE_RECOMPUTE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const UI_FRAME_SLEEP: Duration = Duration::from_millis(16);
 const UI_BURST_SLEEP: Duration = Duration::from_millis(1);
@@ -41,6 +41,13 @@ pub struct LiveRenderData<'a> {
     pub selected_visible: Option<usize>,
     pub selected: Option<&'a EventRecord>,
     pub total: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeriodsFocus {
+    Periods,
+    Events,
+    Json,
 }
 
 #[derive(Clone)]
@@ -74,7 +81,7 @@ pub struct App {
     pub data_index: usize,
     pub periods_index: usize,
     pub period_event_index: usize,
-    pub periods_event_focus: bool,
+    pub periods_focus: PeriodsFocus,
     pub live_event_index: usize, // absolute index in full live rows
     pub live_view_start: usize,
     pub live_window_rows: usize,
@@ -100,10 +107,26 @@ pub struct App {
     offline_fallback_ts: f64,
     pending_restore: Option<RestoredState>,
     startup_hint: Option<String>,
+    live_visible_indices: Vec<usize>,
+    live_cache_dirty: bool,
+    initial_load_target_bytes: Option<u64>,
+    initial_load_complete: bool,
+    pending_live_recompute: bool,
+    show_status_debug: bool,
 }
 
 impl App {
-    pub fn new(stream_path: PathBuf, baseline_path: Option<PathBuf>, offline: bool) -> Self {
+    pub fn new(
+        stream_path: PathBuf,
+        baseline_path: Option<PathBuf>,
+        offline: bool,
+        show_status_debug: bool,
+    ) -> Self {
+        let initial_load_target_bytes = fs::metadata(&stream_path)
+            .ok()
+            .map(|m| m.len())
+            .filter(|len| *len > 0);
+        let initial_load_complete = initial_load_target_bytes.is_none();
         let mut app = Self {
             model: AnalyzerModel::new(),
             mode: UiMode::Live,
@@ -117,7 +140,7 @@ impl App {
             data_index: 0,
             periods_index: 0,
             period_event_index: 0,
-            periods_event_focus: false,
+            periods_focus: PeriodsFocus::Periods,
             live_event_index: 0,
             live_view_start: 0,
             live_window_rows: LIVE_WINDOW_DEFAULT,
@@ -150,8 +173,18 @@ impl App {
             offline_fallback_ts: unix_ts(),
             pending_restore: None,
             startup_hint: None,
+            live_visible_indices: Vec::new(),
+            live_cache_dirty: true,
+            initial_load_target_bytes,
+            initial_load_complete,
+            pending_live_recompute: false,
+            show_status_debug,
         };
         app.restore_persisted_state();
+        app.update_loading_status();
+        if app.loading_locked() {
+            app.startup_hint = None;
+        }
         app
     }
 
@@ -176,11 +209,11 @@ impl App {
         let mut terminal = Terminal::new(backend)?;
 
         let mut last_poll = Instant::now() - LIVE_FALLBACK_POLL_INTERVAL;
-        let mut last_live_recompute = Instant::now();
 
         let loop_result = (|| -> Result<()> {
             loop {
                 let loop_started_at = Instant::now();
+                let was_loading_locked = self.loading_locked();
 
                 if !self.baseline_loaded {
                     self.ingest_baseline_corpus()?;
@@ -200,10 +233,23 @@ impl App {
                     }
                 }
 
-                let force_refresh = last_live_recompute.elapsed() >= LIVE_RECOMPUTE_MIN_INTERVAL;
-                if ingested_any || force_refresh {
+                self.update_loading_status();
+
+                let just_finished_loading = was_loading_locked && !self.loading_locked();
+                if just_finished_loading {
+                    self.pending_live_recompute = true;
+                }
+                let should_refresh_scores = if self.loading_locked() {
+                    false
+                } else {
+                    self.pending_live_recompute
+                };
+                if should_refresh_scores {
                     self.model.refresh_live_anomaly_scores();
-                    last_live_recompute = Instant::now();
+                    self.pending_live_recompute = false;
+                    if ingested_any {
+                        self.mark_live_cache_dirty();
+                    }
                 }
 
                 let mut should_quit = false;
@@ -222,6 +268,7 @@ impl App {
                     break;
                 }
 
+                self.rebuild_live_cache_if_needed();
                 terminal.draw(|f| draw_ui(f, self))?;
 
                 let target_sleep = if ingested_any {
@@ -255,6 +302,7 @@ impl App {
     }
 
     fn ingest_new_events(&mut self) -> Result<bool> {
+        self.rebuild_live_cache_if_needed();
         match self.reader.poll() {
             Ok(events) => {
                 let selected_anchor = if self.mode == UiMode::Live && !self.live_follow {
@@ -274,10 +322,18 @@ impl App {
                     let ts = self.resolve_event_ts(&e, batch_now, idx)?;
                     self.model.ingest(e, ts);
                 }
+                if n > 0 {
+                    self.mark_live_cache_dirty();
+                    self.pending_live_recompute = true;
+                }
                 self.apply_persisted_overrides_if_ready();
 
                 if n > 0 {
-                    self.status = format!("Ingested {} events", n);
+                    if self.offline && !self.offline_loaded {
+                        self.status = self.offline_load_status();
+                    } else {
+                        self.status = format!("Ingested {} events", n);
+                    }
                     if self.mode == UiMode::Live && self.live_follow {
                         self.live_edge_until_center = false;
                         self.pin_live_to_latest();
@@ -295,12 +351,24 @@ impl App {
                         self.clamp_live_indices();
                         self.ensure_live_selection_visible();
                     }
-                } else if self.offline && !self.offline_loaded && self.model.total_objects() == 0 {
-                    self.status = "Offline mode: no events found".to_string();
+                } else if self.offline && !self.offline_loaded {
+                    let progress = self.reader.progress();
+                    if progress.total_bytes > 0 && progress.loaded_bytes >= progress.total_bytes {
+                        self.status = format!(
+                            "Offline load complete: {} objects",
+                            self.model.total_objects()
+                        );
+                    } else if self.model.total_objects() == 0 {
+                        self.status = "Offline mode: no events found".to_string();
+                    } else {
+                        self.status = self.offline_load_status();
+                    }
                 }
 
                 if self.offline {
-                    self.offline_loaded = true;
+                    let progress = self.reader.progress();
+                    self.offline_loaded =
+                        progress.total_bytes == 0 || progress.loaded_bytes >= progress.total_bytes;
                 }
                 Ok(n > 0)
             }
@@ -339,6 +407,7 @@ impl App {
         }
 
         self.baseline_loaded = true;
+        self.pending_live_recompute = true;
         self.status = format!(
             "Baseline loaded: {} events from {}",
             self.baseline_events.len(),
@@ -376,6 +445,7 @@ impl App {
                 }
                 if !saved.periods.is_empty() {
                     self.model.set_periods(saved.periods.clone());
+                    self.pending_live_recompute = true;
                 }
                 self.pending_restore = Some(saved);
                 self.status = msg.clone();
@@ -415,6 +485,10 @@ impl App {
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
             return true;
+        }
+        if self.loading_locked() {
+            self.update_loading_status();
+            return false;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('U'))
@@ -459,11 +533,12 @@ impl App {
                 self.return_to_types_on_live_esc = false;
                 self.event_filters.type_filter.clear();
                 self.stashed_event_filters = None;
+                self.mark_live_cache_dirty();
                 self.refresh_live_position();
                 self.live_key_focus = false;
                 self.live_value_focus = false;
                 self.types_path_focus = false;
-                self.periods_event_focus = false;
+                self.periods_focus = PeriodsFocus::Periods;
                 self.status = "Returned to Types (type filter cleared)".to_string();
             }
             KeyCode::Esc
@@ -478,11 +553,12 @@ impl App {
                 self.clamp_live_indices();
                 self.ensure_live_selection_visible();
                 self.clamp_live_key_selection();
-                self.periods_event_focus = false;
+                self.periods_focus = PeriodsFocus::Periods;
                 self.status = "Returned to selected JSON".to_string();
             }
             KeyCode::Char('m') => {
                 if self.model.toggle_period() {
+                    self.pending_live_recompute = true;
                     self.status = if let Some(p) = self.model.active_period() {
                         format!("Action started: {} #{}", p.label, p.id)
                     } else {
@@ -562,6 +638,7 @@ impl App {
             KeyCode::Char('c') if self.mode != UiMode::Types => {
                 self.stashed_event_filters = None;
                 self.event_filters = DataFilters::default();
+                self.mark_live_cache_dirty();
                 self.refresh_live_position();
                 self.status = "Event filters cleared".to_string();
             }
@@ -582,10 +659,7 @@ impl App {
             }
             KeyCode::Enter if self.mode == UiMode::Live => self.toggle_live_key_focus(),
             KeyCode::Enter if self.mode == UiMode::Types => self.enter_types_path_focus(),
-            KeyCode::Enter if self.mode == UiMode::Periods && self.periods_event_focus => {
-                self.open_selected_event()
-            }
-            KeyCode::Enter if self.mode == UiMode::Periods => self.enter_period_event_focus(),
+            KeyCode::Enter if self.mode == UiMode::Periods => self.advance_periods_focus(),
             KeyCode::Enter => self.open_selected_event(),
             KeyCode::Char(' ') => self.toggle_current_path(),
             KeyCode::Char('u') => self.toggle_known_unrelated(),
@@ -665,6 +739,7 @@ impl App {
                             FilterField::Fuzzy => self.event_filters.fuzzy_filter = text,
                             FilterField::Exact => self.event_filters.exact_filter = text,
                         }
+                        self.mark_live_cache_dirty();
                         self.data_index = 0;
                         self.live_event_index = 0;
                         self.period_event_index = 0;
@@ -681,6 +756,7 @@ impl App {
                         if let Some(type_id) = visible.get(self.type_index) {
                             let type_id = type_id.clone();
                             self.model.rename_type(&type_id, self.input_buffer.clone());
+                            self.mark_live_cache_dirty();
                         }
                     }
                     InputMode::None => {}
@@ -714,6 +790,7 @@ impl App {
     fn toggle_event_filters_enabled(&mut self) {
         if let Some(saved) = self.stashed_event_filters.take() {
             self.event_filters = saved;
+            self.mark_live_cache_dirty();
             self.refresh_live_position();
             self.status = "Event filters restored".to_string();
             return;
@@ -726,6 +803,7 @@ impl App {
 
         self.stashed_event_filters = Some(self.event_filters.clone());
         self.event_filters = DataFilters::default();
+        self.mark_live_cache_dirty();
         self.refresh_live_position();
         self.status = "Event filters suspended (press y to restore)".to_string();
     }
@@ -776,8 +854,8 @@ impl App {
                 }
             }
         }
-        // Compute total once; pass to _n helpers to avoid repeated O(n) filter scans.
-        let total = self.model.filtered_events(&self.event_filters).len();
+        self.rebuild_live_cache_if_needed();
+        let total = self.live_visible_total();
         if total == 0 {
             self.live_event_index = 0;
             self.live_view_start = 0;
@@ -842,72 +920,75 @@ impl App {
         if periods.is_empty() {
             self.periods_index = 0;
             self.period_event_index = 0;
-            self.periods_event_focus = false;
+            self.periods_focus = PeriodsFocus::Periods;
             return;
         }
         self.periods_index = self.periods_index.min(periods.len().saturating_sub(1));
-
-        if self.periods_event_focus {
-            let n = self.visible_period_events().len();
-            if n == 0 {
-                self.period_event_index = 0;
-                self.periods_event_focus = false;
-                return;
+        let event_count = self.visible_period_events().len();
+        if event_count == 0 {
+            self.period_event_index = 0;
+            if self.periods_focus != PeriodsFocus::Periods {
+                self.periods_focus = PeriodsFocus::Periods;
             }
-            self.period_event_index = self.period_event_index.min(n.saturating_sub(1));
-            match intent {
-                NavIntent::LineUp => {
-                    self.period_event_index = self.period_event_index.saturating_sub(1);
-                }
-                NavIntent::LineDown => {
-                    if self.period_event_index + 1 < n {
-                        self.period_event_index += 1;
-                    }
-                }
-                NavIntent::Home => {
-                    self.period_event_index = 0;
-                }
-                NavIntent::End => {
-                    self.period_event_index = n.saturating_sub(1);
-                }
-                NavIntent::Left => {
-                    self.periods_event_focus = false;
-                }
-                NavIntent::Right => {}
-                NavIntent::PageUp | NavIntent::PageDown => {}
-            }
-            return;
+        } else {
+            self.period_event_index = self.period_event_index.min(event_count.saturating_sub(1));
         }
 
         match intent {
-            NavIntent::LineUp => {
-                if self.periods_index > 0 {
-                    self.periods_index -= 1;
-                    self.period_event_index = 0;
-                }
+            NavIntent::Left => {
+                self.periods_focus = match self.periods_focus {
+                    PeriodsFocus::Periods => PeriodsFocus::Periods,
+                    PeriodsFocus::Events => PeriodsFocus::Periods,
+                    PeriodsFocus::Json => PeriodsFocus::Events,
+                };
             }
-            NavIntent::LineDown => {
-                if self.periods_index + 1 < periods.len() {
-                    self.periods_index += 1;
-                    self.period_event_index = 0;
-                }
-            }
-            NavIntent::Home => {
-                self.periods_index = 0;
-                self.period_event_index = 0;
-            }
-            NavIntent::End => {
-                self.periods_index = periods.len().saturating_sub(1);
-                self.period_event_index = 0;
-            }
-            NavIntent::Left => {}
             NavIntent::Right => {
-                let n = self.visible_period_events().len();
-                if n > 0 {
-                    self.periods_event_focus = true;
-                    self.period_event_index = self.period_event_index.min(n.saturating_sub(1));
-                }
+                self.advance_periods_focus();
             }
+            NavIntent::LineUp => match self.periods_focus {
+                PeriodsFocus::Periods => {
+                    if self.periods_index > 0 {
+                        self.periods_index -= 1;
+                        self.period_event_index = 0;
+                    }
+                }
+                PeriodsFocus::Events | PeriodsFocus::Json => {
+                    self.period_event_index = self.period_event_index.saturating_sub(1);
+                }
+            },
+            NavIntent::LineDown => match self.periods_focus {
+                PeriodsFocus::Periods => {
+                    if self.periods_index + 1 < periods.len() {
+                        self.periods_index += 1;
+                        self.period_event_index = 0;
+                    }
+                }
+                PeriodsFocus::Events | PeriodsFocus::Json => {
+                    if event_count > 0 && self.period_event_index + 1 < event_count {
+                        self.period_event_index += 1;
+                    }
+                }
+            },
+            NavIntent::Home => match self.periods_focus {
+                PeriodsFocus::Periods => {
+                    self.periods_index = 0;
+                    self.period_event_index = 0;
+                }
+                PeriodsFocus::Events | PeriodsFocus::Json => {
+                    self.period_event_index = 0;
+                }
+            },
+            NavIntent::End => match self.periods_focus {
+                PeriodsFocus::Periods => {
+                    self.periods_index = periods.len().saturating_sub(1);
+                    self.period_event_index = 0;
+                }
+                PeriodsFocus::Events | PeriodsFocus::Json => {
+                    if event_count > 0 {
+                        self.period_event_index = event_count.saturating_sub(1);
+                    }
+                }
+            },
             NavIntent::PageUp | NavIntent::PageDown => {}
         }
     }
@@ -988,9 +1069,7 @@ impl App {
     }
 
     fn live_selected_event(&self) -> Option<&EventRecord> {
-        self.visible_live_events()
-            .get(self.live_event_index)
-            .copied()
+        self.live_event_at_visible_index(self.live_event_index)
     }
 
     pub fn live_selected_key_paths(&self) -> Vec<String> {
@@ -1016,7 +1095,7 @@ impl App {
         self.return_to_live_object_on_types_esc = false;
         self.return_to_types_on_live_esc = false;
         self.types_path_focus = false;
-        self.periods_event_focus = false;
+        self.periods_focus = PeriodsFocus::Periods;
         self.exit_live_key_focus();
     }
 
@@ -1072,6 +1151,7 @@ impl App {
 
     fn after_filter_change(&mut self, selected_anchor: Option<LiveAnchor>) {
         self.stashed_event_filters = None;
+        self.mark_live_cache_dirty();
         match self.mode {
             UiMode::Live => {
                 self.refresh_live_position();
@@ -1087,7 +1167,7 @@ impl App {
                 let n = self.visible_period_events().len();
                 if n == 0 {
                     self.period_event_index = 0;
-                    self.periods_event_focus = false;
+                    self.periods_focus = PeriodsFocus::Periods;
                 } else {
                     self.period_event_index = self.period_event_index.min(n.saturating_sub(1));
                 }
@@ -1180,12 +1260,9 @@ impl App {
     }
 
     fn open_selected_event(&mut self) {
+        self.rebuild_live_cache_if_needed();
         let selected = match self.mode {
-            UiMode::Live => self
-                .visible_live_events()
-                .get(self.live_event_index)
-                .cloned()
-                .cloned(),
+            UiMode::Live => self.live_event_at_visible_index(self.live_event_index).cloned(),
             UiMode::Periods => self
                 .visible_period_events()
                 .get(self.period_event_index)
@@ -1211,10 +1288,32 @@ impl App {
         }
     }
 
-    fn visible_live_events(&self) -> Vec<&EventRecord> {
-        let mut events = self.model.filtered_events(&self.event_filters);
-        events.reverse();
-        events
+    fn mark_live_cache_dirty(&mut self) {
+        self.live_cache_dirty = true;
+    }
+
+    fn rebuild_live_cache_if_needed(&mut self) {
+        if self.loading_locked() {
+            return;
+        }
+        if !self.live_cache_dirty {
+            return;
+        }
+        self.live_visible_indices = self.model.filtered_event_indices(&self.event_filters, None);
+        self.live_cache_dirty = false;
+    }
+
+    pub fn ensure_live_cache(&mut self) {
+        self.rebuild_live_cache_if_needed();
+    }
+
+    fn live_visible_total(&self) -> usize {
+        self.live_visible_indices.len()
+    }
+
+    fn live_event_at_visible_index(&self, index: usize) -> Option<&EventRecord> {
+        let event_idx = *self.live_visible_indices.get(index)?;
+        self.model.events.get(event_idx)
     }
 
     pub fn visible_baseline_events(&self) -> Vec<&EventRecord> {
@@ -1223,16 +1322,20 @@ impl App {
     }
 
     fn live_anchor_at(&self, index: usize) -> Option<LiveAnchor> {
-        self.visible_live_events().get(index).map(|e| LiveAnchor {
+        self.live_event_at_visible_index(index).map(|e| LiveAnchor {
             ts: e.ts,
             type_id: e.type_id.clone(),
         })
     }
 
     fn find_live_index(&self, anchor: &LiveAnchor) -> Option<usize> {
-        self.visible_live_events()
-            .iter()
-            .position(|e| e.ts == anchor.ts && e.type_id == anchor.type_id)
+        self.live_visible_indices.iter().position(|&event_idx| {
+            self.model
+                .events
+                .get(event_idx)
+                .map(|e| e.ts == anchor.ts && e.type_id == anchor.type_id)
+                .unwrap_or(false)
+        })
     }
 
     pub fn set_live_window_rows(&mut self, rows: usize) {
@@ -1240,8 +1343,7 @@ impl App {
     }
 
     pub fn live_render_data_for_window(&self, max_rows: usize) -> LiveRenderData<'_> {
-        let all = self.visible_live_events();
-        let total = all.len();
+        let total = self.live_visible_total();
         if total == 0 {
             return LiveRenderData {
                 rows: Vec::new(),
@@ -1265,8 +1367,11 @@ impl App {
             start = total.saturating_sub(window);
         }
         let end = (start + window).min(total);
-        let rows: Vec<&EventRecord> = all[start..end].to_vec();
-        let selected = all.get(self.live_event_index).copied();
+        let rows: Vec<&EventRecord> = self.live_visible_indices[start..end]
+            .iter()
+            .filter_map(|idx| self.model.events.get(*idx))
+            .collect();
+        let selected = self.live_event_at_visible_index(self.live_event_index);
         let selected_visible = if self.live_event_index >= start && self.live_event_index < end {
             Some(self.live_event_index - start)
         } else {
@@ -1295,7 +1400,8 @@ impl App {
     }
 
     fn clamp_live_indices(&mut self) {
-        let total = self.model.filtered_events(&self.event_filters).len();
+        self.rebuild_live_cache_if_needed();
+        let total = self.live_visible_total();
         self.clamp_live_indices_n(total);
     }
 
@@ -1314,7 +1420,8 @@ impl App {
     }
 
     fn pin_live_to_latest(&mut self) {
-        let total = self.model.filtered_events(&self.event_filters).len();
+        self.rebuild_live_cache_if_needed();
+        let total = self.live_visible_total();
         self.pin_live_to_latest_n(total);
     }
 
@@ -1350,7 +1457,8 @@ impl App {
     }
 
     fn ensure_live_selection_visible(&mut self) {
-        let total = self.model.filtered_events(&self.event_filters).len();
+        self.rebuild_live_cache_if_needed();
+        let total = self.live_visible_total();
         self.ensure_live_selection_visible_n(total);
     }
 
@@ -1389,7 +1497,8 @@ impl App {
     }
 
     fn reposition_live_selection(&mut self) {
-        let total = self.model.filtered_events(&self.event_filters).len();
+        self.rebuild_live_cache_if_needed();
+        let total = self.live_visible_total();
         self.reposition_live_selection_n(total);
     }
 
@@ -1428,6 +1537,16 @@ impl App {
         self.startup_hint.as_deref()
     }
 
+    pub fn should_show_status_line(&self) -> bool {
+        self.show_status_debug || self.loading_locked()
+    }
+
+    pub fn selected_period_event(&self) -> Option<&EventRecord> {
+        self.visible_period_events()
+            .get(self.period_event_index)
+            .copied()
+    }
+
     fn toggle_current_path(&mut self) {
         if self.mode != UiMode::Types || !self.types_path_focus {
             return;
@@ -1439,6 +1558,7 @@ impl App {
                 let keys: Vec<String> = tp.considered_paths.keys().cloned().collect();
                 if let Some(path) = keys.get(self.path_index) {
                     self.model.toggle_type_path(&type_id, path);
+                    self.pending_live_recompute = true;
                 }
             }
         }
@@ -1457,6 +1577,7 @@ impl App {
             self.period_event_index = 0;
             self.live_event_index = 0;
             self.types_path_focus = false;
+            self.mark_live_cache_dirty();
             self.refresh_live_position();
             self.status = format!(
                 "Applied type filter in Live: {} (Esc to return)",
@@ -1489,18 +1610,22 @@ impl App {
             .min(tp.considered_paths.len().saturating_sub(1));
     }
 
-    fn enter_period_event_focus(&mut self) {
+    fn advance_periods_focus(&mut self) {
         if self.mode != UiMode::Periods {
             return;
         }
         let n = self.visible_period_events().len();
         if n == 0 {
-            self.periods_event_focus = false;
+            self.periods_focus = PeriodsFocus::Periods;
             self.period_event_index = 0;
             self.status = "Selected period has no events".to_string();
             return;
         }
-        self.periods_event_focus = true;
+        self.periods_focus = match self.periods_focus {
+            PeriodsFocus::Periods => PeriodsFocus::Events,
+            PeriodsFocus::Events => PeriodsFocus::Json,
+            PeriodsFocus::Json => PeriodsFocus::Json,
+        };
         self.period_event_index = self.period_event_index.min(n.saturating_sub(1));
     }
 
@@ -1512,8 +1637,125 @@ impl App {
         if let Some(type_id) = visible.get(self.type_index) {
             let type_id = type_id.clone();
             self.model.toggle_known_unrelated_type(&type_id);
+            self.mark_live_cache_dirty();
+            if self.mode == UiMode::Live {
+                self.refresh_live_position();
+            }
         }
     }
+
+    fn loading_locked(&self) -> bool {
+        if self.offline && !self.offline_loaded {
+            return true;
+        }
+        if self.initial_load_complete {
+            return false;
+        }
+        let target = self
+            .initial_load_target_bytes
+            .or_else(|| {
+                let p = self.reader.progress();
+                if p.total_bytes > 0 {
+                    Some(p.total_bytes)
+                } else {
+                    None
+                }
+            });
+        let Some(target) = target else {
+            return false;
+        };
+        self.reader.progress().loaded_bytes < target
+    }
+
+    fn update_loading_status(&mut self) {
+        if self.offline && !self.offline_loaded {
+            self.status = self.offline_load_status();
+            return;
+        }
+
+        if self.initial_load_complete {
+            return;
+        }
+
+        let target = self
+            .initial_load_target_bytes
+            .or_else(|| {
+                let p = self.reader.progress();
+                if p.total_bytes > 0 {
+                    Some(p.total_bytes)
+                } else {
+                    None
+                }
+            });
+        let Some(target) = target else {
+            self.initial_load_complete = true;
+            return;
+        };
+        if self.initial_load_target_bytes.is_none() {
+            self.initial_load_target_bytes = Some(target);
+        }
+        let loaded = self.reader.progress().loaded_bytes;
+        if loaded >= target {
+            self.initial_load_complete = true;
+            self.status = format!("Initial load complete: {} objects", self.model.total_objects());
+            return;
+        }
+        self.status = self.initial_live_load_status(target);
+    }
+
+    fn offline_load_status(&self) -> String {
+        let progress = self.reader.progress();
+        let loaded = progress.loaded_bytes as f64 / (1024.0 * 1024.0);
+        let total = progress.total_bytes as f64 / (1024.0 * 1024.0);
+        let pct = if progress.total_bytes == 0 {
+            0.0
+        } else {
+            (progress.loaded_bytes as f64 * 100.0 / progress.total_bytes as f64).clamp(0.0, 100.0)
+        };
+        let bar = progress_bar(pct / 100.0, 24);
+        format!(
+            "Loading {} {:>6.1}% ({:.1} / {:.1} MiB)  objects {}",
+            bar,
+            pct,
+            loaded,
+            total,
+            self.model.total_objects()
+        )
+    }
+
+    fn initial_live_load_status(&self, target_bytes: u64) -> String {
+        let progress = self.reader.progress();
+        let loaded_bytes = progress.loaded_bytes.min(target_bytes);
+        let loaded = loaded_bytes as f64 / (1024.0 * 1024.0);
+        let total = target_bytes as f64 / (1024.0 * 1024.0);
+        let pct = if target_bytes == 0 {
+            100.0
+        } else {
+            (loaded_bytes as f64 * 100.0 / target_bytes as f64).clamp(0.0, 100.0)
+        };
+        let bar = progress_bar(pct / 100.0, 24);
+        format!(
+            "Loading {} {:>6.1}% ({:.1} / {:.1} MiB)  objects {}",
+            bar,
+            pct,
+            loaded,
+            total,
+            self.model.total_objects()
+        )
+    }
+}
+
+fn progress_bar(progress: f64, width: usize) -> String {
+    let clamped = progress.clamp(0.0, 1.0);
+    let filled = (clamped * width as f64).round() as usize;
+    let filled = filled.min(width);
+    let mut s = String::with_capacity(width + 2);
+    s.push('[');
+    for i in 0..width {
+        s.push(if i < filled { '#' } else { '-' });
+    }
+    s.push(']');
+    s
 }
 
 fn parse_event_timestamp_millis(obj: &Value) -> Result<Option<f64>> {
@@ -1574,7 +1816,7 @@ fn normalize_navigation_code(key: KeyEvent) -> KeyCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_navigation_code, parse_event_timestamp_millis, App};
+    use super::{normalize_navigation_code, parse_event_timestamp_millis, App, PeriodsFocus};
     use crate::tui::UiMode;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
@@ -1640,6 +1882,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/json_demo/stream.jsonl"),
             None,
             false,
+            false,
         );
         app.offline = false;
         let err = app
@@ -1662,7 +1905,12 @@ mod tests {
     }
 
     fn test_app() -> App {
-        App::new(std::path::PathBuf::from("/tmp/test_app.jsonl"), None, false)
+        App::new(
+            std::path::PathBuf::from("/tmp/test_app.jsonl"),
+            None,
+            false,
+            false,
+        )
     }
 
     #[test]
@@ -1756,7 +2004,7 @@ mod tests {
         app.return_to_live_object_on_types_esc = true;
         app.return_to_types_on_live_esc = true;
         app.types_path_focus = true;
-        app.periods_event_focus = true;
+        app.periods_focus = PeriodsFocus::Json;
         app.live_key_focus = true;
 
         app.set_ui_mode(UiMode::Types);
@@ -1764,7 +2012,7 @@ mod tests {
         assert!(!app.return_to_live_object_on_types_esc);
         assert!(!app.return_to_types_on_live_esc);
         assert!(!app.types_path_focus);
-        assert!(!app.periods_event_focus);
+        assert_eq!(app.periods_focus, PeriodsFocus::Periods);
         assert!(!app.live_key_focus);
     }
 }
