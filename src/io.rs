@@ -116,15 +116,9 @@ impl StreamReader {
         };
 
         let out = if line_spans.len() >= MIN_PAR_PARSE_LINES {
-            line_spans
-                .par_iter()
-                .filter_map(parse_line)
-                .collect()
+            line_spans.par_iter().filter_map(parse_line).collect()
         } else {
-            line_spans
-                .iter()
-                .filter_map(parse_line)
-                .collect()
+            line_spans.iter().filter_map(parse_line).collect()
         };
         Ok(out)
     }
@@ -152,9 +146,7 @@ impl StreamReader {
 
         let read_cap = snapshot_remaining.min(MAX_SNAPSHOT_BYTES_PER_POLL);
         let mut chunk = Vec::with_capacity(read_cap);
-        reader
-            .take(read_cap as u64)
-            .read_to_end(&mut chunk)?;
+        reader.take(read_cap as u64).read_to_end(&mut chunk)?;
         if chunk.is_empty() {
             return Ok(Vec::new());
         }

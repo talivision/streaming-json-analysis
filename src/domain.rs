@@ -21,6 +21,14 @@ pub struct EventRecord {
     pub live_uniq_score: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedEvent {
+    pub obj: Value,
+    pub type_id: String,
+    pub keys: Vec<String>,
+    pub(crate) scalar_paths: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActionPeriod {
     pub id: u64,
@@ -173,27 +181,37 @@ impl AnalyzerModel {
     }
 
     fn get_or_create_type_profile(&mut self, type_id: &str, obj: &Value) -> &mut TypeProfile {
-        self.types.entry(type_id.to_string()).or_insert_with(|| TypeProfile {
-            type_id: type_id.to_string(),
-            name: None,
-            count: 0,
-            example: obj.clone(),
-            considered_paths: IndexMap::new(),
-            path_overrides: IndexMap::new(),
-            path_stats: IndexMap::new(),
-            baseline_path_stats: IndexMap::new(),
-            known_unrelated: false,
-            latest_rate: 0.0,
-            latest_uniq: 0.0,
-        })
+        self.types
+            .entry(type_id.to_string())
+            .or_insert_with(|| TypeProfile {
+                type_id: type_id.to_string(),
+                name: None,
+                count: 0,
+                example: obj.clone(),
+                considered_paths: IndexMap::new(),
+                path_overrides: IndexMap::new(),
+                path_stats: IndexMap::new(),
+                baseline_path_stats: IndexMap::new(),
+                known_unrelated: false,
+                latest_rate: 0.0,
+                latest_uniq: 0.0,
+            })
     }
 
     pub fn ingest(&mut self, obj: Value, ts: f64) {
+        let prepared = prepare_event(obj);
+        self.ingest_prepared(prepared, ts);
+    }
+
+    pub fn ingest_prepared(&mut self, prepared: PreparedEvent, ts: f64) {
         self.account_rate_elapsed(ts);
         self.last_event_ts = Some(ts);
-        let shape = extract_shape(&obj);
-        let type_id = structural_hash(&shape);
-        let keys = collect_all_paths(&obj);
+        let PreparedEvent {
+            obj,
+            type_id,
+            keys,
+            scalar_paths,
+        } = prepared;
         let period_id = self.period_id_for_ts(ts);
         let in_action_period = period_id.is_some();
 
@@ -203,7 +221,7 @@ impl AnalyzerModel {
             if entry.count == 1 {
                 entry.example = obj.clone();
             }
-            update_uniqueness(entry, &obj, in_action_period)
+            update_uniqueness(entry, &scalar_paths, in_action_period)
         };
         let rate = self.update_rate_scores(&type_id, period_id);
         if let Some(entry) = self.types.get_mut(&type_id) {
@@ -224,25 +242,30 @@ impl AnalyzerModel {
     }
 
     pub fn ingest_baseline(&mut self, obj: Value, ts: f64) {
+        let prepared = prepare_event(obj);
+        self.ingest_baseline_prepared(&prepared, ts);
+    }
+
+    pub fn ingest_baseline_prepared(&mut self, prepared: &PreparedEvent, ts: f64) {
         if let Some(last_ts) = self.baseline_last_ts {
             self.baseline_elapsed_secs += (ts - last_ts).max(0.0);
         }
         self.baseline_last_ts = Some(ts);
 
-        let shape = extract_shape(&obj);
-        let type_id = structural_hash(&shape);
+        let obj = &prepared.obj;
+        let type_id = &prepared.type_id;
         *self.baseline_counts.entry(type_id.clone()).or_insert(0) += 1;
 
         let uniq = {
-            let entry = self.get_or_create_type_profile(&type_id, &obj);
+            let entry = self.get_or_create_type_profile(type_id, obj);
             entry.count += 1;
             if entry.count == 1 {
                 entry.example = obj.clone();
             }
-            update_uniqueness(entry, &obj, false)
+            update_uniqueness(entry, &prepared.scalar_paths, false)
         };
 
-        if let Some(entry) = self.types.get_mut(&type_id) {
+        if let Some(entry) = self.types.get_mut(type_id) {
             entry.latest_uniq = uniq;
         }
     }
@@ -677,14 +700,15 @@ fn value_frequency_anomaly(prev: u64, total: u64) -> f64 {
     (1.0 - scaled.powf(VALUE_ANOMALY_CURVE)).clamp(0.0, 1.0)
 }
 
-fn update_uniqueness(tp: &mut TypeProfile, obj: &Value, in_action_period: bool) -> f64 {
-    let mut scalar_paths = Vec::new();
-    collect_scalar_paths(obj, "", &mut scalar_paths);
-
+fn update_uniqueness(
+    tp: &mut TypeProfile,
+    scalar_paths: &[(String, String)],
+    in_action_period: bool,
+) -> f64 {
     let mut max_score = 0.0;
     for (path, token) in scalar_paths {
         let stats = tp.path_stats.entry(path.clone()).or_default();
-        let prev = stats.values.get(&token).copied().unwrap_or(0);
+        let prev = stats.values.get(token).copied().unwrap_or(0);
         let total = stats.total as f64;
         let distinct = stats.values.len() as f64;
 
@@ -718,7 +742,7 @@ fn update_uniqueness(tp: &mut TypeProfile, obj: &Value, in_action_period: bool) 
         if !in_action_period {
             let baseline_stats = tp.baseline_path_stats.entry(path.clone()).or_default();
             baseline_stats.total += 1;
-            *baseline_stats.values.entry(token).or_insert(0) += 1;
+            *baseline_stats.values.entry(token.clone()).or_insert(0) += 1;
         }
         // Fast path for very high uniqueness once enough support exists.
         if !tp.path_overrides.contains_key(path.as_str()) && total >= 12.0 {
@@ -826,6 +850,20 @@ pub fn classify_event(obj: &Value) -> (String, Vec<String>) {
     let type_id = structural_hash(&shape);
     let keys = collect_all_paths(obj);
     (type_id, keys)
+}
+
+pub fn prepare_event(obj: Value) -> PreparedEvent {
+    let shape = extract_shape(&obj);
+    let type_id = structural_hash(&shape);
+    let keys = collect_all_paths(&obj);
+    let mut scalar_paths = Vec::new();
+    collect_scalar_paths(&obj, "", &mut scalar_paths);
+    PreparedEvent {
+        obj,
+        type_id,
+        keys,
+        scalar_paths,
+    }
 }
 
 pub fn value_token(v: &Value) -> String {

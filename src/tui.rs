@@ -204,7 +204,11 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         )])));
     }
     frame.render_widget(
-        List::new(p_items).block(Block::default().title("Action Periods").borders(Borders::ALL)),
+        List::new(p_items).block(
+            Block::default()
+                .title("Action Periods")
+                .borders(Borders::ALL),
+        ),
         cols[0],
     );
 
@@ -295,7 +299,9 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
 fn styled_hotkey(label: &str) -> Span<'static> {
     Span::styled(
         label.to_string(),
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
     )
 }
 
@@ -394,7 +400,12 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let mut type_items = Vec::new();
-    for (vis_idx, (type_id, tp)) in visible.iter().skip(type_start).take(type_window).enumerate() {
+    for (vis_idx, (type_id, tp)) in visible
+        .iter()
+        .skip(type_start)
+        .take(type_window)
+        .enumerate()
+    {
         let idx = type_start + vis_idx;
         let mut style = Style::default();
         if idx == app.type_index {
@@ -415,7 +426,11 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     let type_title = format!(
         "Types row {}/{} ({})  [enter/right details, t filter, / search]",
-        if total_types == 0 { 0 } else { selected_type + 1 },
+        if total_types == 0 {
+            0
+        } else {
+            selected_type + 1
+        },
         total_types,
         if app.types_path_focus {
             "details focus"
@@ -1005,7 +1020,11 @@ fn push_open_bracket(
 ) {
     prefix.push(Span::styled(
         bracket,
-        if sel_or_filt { punctuation_override } else { json_punctuation_style() },
+        if sel_or_filt {
+            punctuation_override
+        } else {
+            json_punctuation_style()
+        },
     ));
     out.push(Line::from(prefix));
 }
@@ -1025,7 +1044,14 @@ fn push_close_bracket(
     };
     out.push(Line::from(vec![
         Span::raw("  ".repeat(indent)),
-        Span::styled(tail, if sel_or_filt { punctuation_override } else { json_punctuation_style() }),
+        Span::styled(
+            tail,
+            if sel_or_filt {
+                punctuation_override
+            } else {
+                json_punctuation_style()
+            },
+        ),
     ]));
 }
 
@@ -1226,9 +1252,7 @@ fn render_event_line(
         .unwrap_or(0);
 
     let fixed_prefix = 2 + 1 + 3 + ts.chars().count() + 1;
-    let name_budget = row_width
-        .saturating_sub(fixed_prefix + tail_len)
-        .max(4);
+    let name_budget = row_width.saturating_sub(fixed_prefix + tail_len).max(4);
     let short_name = truncate_text(&name, name_budget);
     let line_len = fixed_prefix + short_name.chars().count() + tail_len;
     let spacer_len = row_width.saturating_sub(line_len);

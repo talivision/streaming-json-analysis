@@ -1,6 +1,6 @@
 use crate::domain::{
-    classify_event, value_at_path, value_token, AnalyzerModel, DataFilters, EventRecord,
-    FilterField,
+    prepare_event, value_at_path, value_token, AnalyzerModel, DataFilters, EventRecord,
+    FilterField, PreparedEvent,
 };
 use crate::io::StreamReader;
 use crate::persistence::{load_state, save_state, RestoredState};
@@ -17,9 +17,10 @@ use crossterm::terminal::{
 };
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
+use rayon::prelude::*;
 use serde_json::Value;
-use std::io::stdout;
 use std::fs;
+use std::io::stdout;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -327,9 +328,11 @@ impl App {
 
                 let n = events.len();
                 let batch_now = unix_ts();
-                for (idx, e) in events.into_iter().enumerate() {
-                    let ts = self.resolve_event_ts(&e, batch_now, idx)?;
-                    self.model.ingest(e, ts);
+                let prepared_events: Vec<PreparedEvent> =
+                    events.into_par_iter().map(prepare_event).collect();
+                for (idx, prepared) in prepared_events.into_iter().enumerate() {
+                    let ts = self.resolve_event_ts(&prepared.obj, batch_now, idx)?;
+                    self.model.ingest_prepared(prepared, ts);
                 }
                 if n > 0 {
                     self.mark_live_cache_dirty();
@@ -396,13 +399,20 @@ impl App {
 
         let events = reader.poll()?;
         let seed_ts = unix_ts();
-        for (idx, obj) in events.into_iter().enumerate() {
-            let ts = match parse_event_timestamp_millis(&obj)? {
+        let prepared_events: Vec<PreparedEvent> =
+            events.into_par_iter().map(prepare_event).collect();
+        for (idx, prepared) in prepared_events.into_iter().enumerate() {
+            let ts = match parse_event_timestamp_millis(&prepared.obj)? {
                 Some(ts) => ts,
                 None => seed_ts + (idx as f64 * 0.001),
             };
-            self.model.ingest_baseline(obj.clone(), ts);
-            let (type_id, keys) = classify_event(&obj);
+            self.model.ingest_baseline_prepared(&prepared, ts);
+            let PreparedEvent {
+                obj,
+                type_id,
+                keys,
+                scalar_paths: _,
+            } = prepared;
             self.baseline_events.push(EventRecord {
                 ts,
                 type_id,
@@ -1344,7 +1354,9 @@ impl App {
     fn open_selected_event(&mut self) {
         self.rebuild_live_cache_if_needed();
         let selected = match self.mode {
-            UiMode::Live => self.live_event_at_visible_index(self.live_event_index).cloned(),
+            UiMode::Live => self
+                .live_event_at_visible_index(self.live_event_index)
+                .cloned(),
             UiMode::Periods => self
                 .visible_period_events()
                 .get(self.period_event_index)
@@ -1633,8 +1645,7 @@ impl App {
         let Some(event) = self.selected_period_event() else {
             return Vec::new();
         };
-        let (_name, keys) = classify_event(&event.obj);
-        keys
+        event.keys.clone()
     }
 
     fn toggle_current_path(&mut self) {
@@ -1726,9 +1737,7 @@ impl App {
             self.period_json_key_index = 0;
             return;
         }
-        self.period_json_key_index = self
-            .period_json_key_index
-            .min(key_count.saturating_sub(1));
+        self.period_json_key_index = self.period_json_key_index.min(key_count.saturating_sub(1));
     }
 
     fn toggle_known_unrelated(&mut self) {
@@ -1753,16 +1762,14 @@ impl App {
         if self.initial_load_complete {
             return false;
         }
-        let target = self
-            .initial_load_target_bytes
-            .or_else(|| {
-                let p = self.reader.progress();
-                if p.total_bytes > 0 {
-                    Some(p.total_bytes)
-                } else {
-                    None
-                }
-            });
+        let target = self.initial_load_target_bytes.or_else(|| {
+            let p = self.reader.progress();
+            if p.total_bytes > 0 {
+                Some(p.total_bytes)
+            } else {
+                None
+            }
+        });
         let Some(target) = target else {
             return false;
         };
@@ -1779,16 +1786,14 @@ impl App {
             return;
         }
 
-        let target = self
-            .initial_load_target_bytes
-            .or_else(|| {
-                let p = self.reader.progress();
-                if p.total_bytes > 0 {
-                    Some(p.total_bytes)
-                } else {
-                    None
-                }
-            });
+        let target = self.initial_load_target_bytes.or_else(|| {
+            let p = self.reader.progress();
+            if p.total_bytes > 0 {
+                Some(p.total_bytes)
+            } else {
+                None
+            }
+        });
         let Some(target) = target else {
             self.initial_load_complete = true;
             return;
@@ -1799,7 +1804,10 @@ impl App {
         let loaded = self.reader.progress().loaded_bytes;
         if loaded >= target {
             self.initial_load_complete = true;
-            self.status = format!("Initial load complete: {} objects", self.model.total_objects());
+            self.status = format!(
+                "Initial load complete: {} objects",
+                self.model.total_objects()
+            );
             return;
         }
         self.status = self.initial_live_load_status(target);
