@@ -100,6 +100,35 @@ pub fn load_state(stream_path: &Path) -> Result<Option<RestoredState>> {
     }))
 }
 
+/// Writes a state file that `load_state` will always reject, ensuring no state
+/// can be restored for this stream path in the next session.
+pub fn invalidate_state(stream_path: &Path) -> Result<()> {
+    let state_path = state_path_for_stream(stream_path)?;
+    if !state_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = state_path.parent() {
+        create_dir_all(parent)?;
+    }
+    let state = PersistedState {
+        version: STATE_VERSION,
+        stream_path: stream_path.to_string_lossy().to_string(),
+        saved_len: 0,
+        prefix_hash_hex: String::new(), // never matches any real SHA-256 output
+        periods: vec![],
+        renames: vec![],
+        current_label: String::new(),
+        event_filters: DataFilters::default(),
+        stashed_event_filters: None,
+        types_filter: String::new(),
+    };
+    let payload = serde_json::to_vec(&state).context("failed to serialize invalidated state")?;
+    let mut file = File::create(&state_path)
+        .with_context(|| format!("failed to create {}", state_path.display()))?;
+    file.write_all(&payload)?;
+    Ok(())
+}
+
 pub fn save_state(
     stream_path: &Path,
     saved_len: u64,
@@ -121,7 +150,7 @@ pub fn save_state(
         stream_path: stream_path.to_string_lossy().to_string(),
         saved_len,
         prefix_hash_hex,
-        periods: periods.to_vec(),
+        periods: periods.iter().filter(|p| p.end.is_some()).cloned().collect(),
         renames: renames
             .iter()
             .map(|(type_id, name)| TypeRename {

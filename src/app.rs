@@ -3,7 +3,7 @@ use crate::domain::{
     EventRecord, FilterField, PreparedEvent,
 };
 use crate::io::StreamReader;
-use crate::persistence::{load_state, save_state, RestoredState};
+use crate::persistence::{invalidate_state, load_state, save_state, RestoredState};
 use crate::tui::{draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
 use crossterm::event::{
@@ -508,6 +508,13 @@ impl App {
     }
 
     fn persist_state(&self) -> Result<()> {
+        if !self.reader.path().exists() {
+            // The stream file was deleted while we were running. The reader resets
+            // its offset to 0 on detecting a missing file, so saved_len would be 0
+            // and any new file at the same path would pass the hash check. Invalidate
+            // the state file instead so nothing is restored in the next session.
+            return invalidate_state(self.reader.path());
+        }
         save_state(
             self.reader.path(),
             self.reader.offset(),
