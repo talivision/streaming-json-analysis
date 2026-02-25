@@ -150,7 +150,7 @@ pub fn save_state(
         stream_path: stream_path.to_string_lossy().to_string(),
         saved_len,
         prefix_hash_hex,
-        periods: periods.iter().filter(|p| p.end.is_some()).cloned().collect(),
+        periods: periods.to_vec(),
         renames: renames
             .iter()
             .map(|(type_id, name)| TypeRename {
