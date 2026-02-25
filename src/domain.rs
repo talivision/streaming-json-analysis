@@ -15,6 +15,7 @@ pub struct EventRecord {
     pub type_id: String,
     pub obj: Value,
     pub keys: Vec<String>,
+    pub size_bytes: u32,
     pub action_period_id: Option<u64>,
     pub in_action_period: bool,
     pub live_rate_score: f64,
@@ -69,6 +70,8 @@ struct PeriodRateState {
     elapsed_secs: f64,
     counts: HashMap<String, u64>,
     first_event_ts: Option<f64>,
+    type_first_ts: HashMap<String, f64>,
+    type_last_ts: HashMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -157,6 +160,15 @@ impl AnalyzerModel {
         self.periods.last().filter(|p| p.end.is_none())
     }
 
+    /// Closes any open period, using the last event timestamp or `close_ts` as a fallback.
+    pub fn close_open_period(&mut self, close_ts: f64) {
+        if let Some(last) = self.periods.last_mut() {
+            if last.end.is_none() {
+                last.end = Some(self.last_event_ts.unwrap_or(close_ts));
+            }
+        }
+    }
+
     pub fn toggle_period(&mut self) -> bool {
         let Some(boundary_ts) = self.last_event_ts else {
             return false;
@@ -229,11 +241,13 @@ impl AnalyzerModel {
             entry.latest_uniq = uniq;
         }
 
+        let size_bytes = obj.to_string().len() as u32;
         self.events.push_back(EventRecord {
             ts,
             type_id,
             obj,
             keys,
+            size_bytes,
             action_period_id: period_id,
             in_action_period,
             live_rate_score: rate,
@@ -290,16 +304,26 @@ impl AnalyzerModel {
 
     fn update_rate_scores(&mut self, type_id: &str, active_period_id: Option<u64>) -> f64 {
         if let Some(pid) = active_period_id {
+            let ts = self.last_event_ts.unwrap_or_default();
             let pr = self.period_rate_states.entry(pid).or_default();
             *pr.counts.entry(type_id.to_string()).or_insert(0) += 1;
+            pr.type_first_ts.entry(type_id.to_string()).or_insert(ts);
+            pr.type_last_ts.insert(type_id.to_string(), ts);
             if pr.first_event_ts.is_none() {
-                pr.first_event_ts = self.last_event_ts;
+                pr.first_event_ts = Some(ts);
             }
             if pr.elapsed_secs < MIN_ACTION_RATE_DURATION_SECS {
                 return 0.0;
             }
             let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
-            let action_rate = action_count / pr.elapsed_secs;
+            if action_count < 2.0 {
+                return 0.0;
+            }
+            let type_elapsed = pr.type_last_ts[type_id] - pr.type_first_ts[type_id];
+            if type_elapsed <= 0.0 {
+                return 0.0;
+            }
+            let action_rate = (action_count - 1.0) / type_elapsed;
             let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
             let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
             normalized_rate_anomaly(action_rate, baseline_rate)
@@ -362,10 +386,35 @@ impl AnalyzerModel {
             return 0.0;
         }
         let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
-        let action_rate = action_count / pr.elapsed_secs;
+        if action_count < 2.0 {
+            return 0.0;
+        }
+        let type_elapsed = pr.type_last_ts.get(type_id).copied().unwrap_or(0.0)
+            - pr.type_first_ts.get(type_id).copied().unwrap_or(0.0);
+        if type_elapsed <= 0.0 {
+            return 0.0;
+        }
+        let action_rate = (action_count - 1.0) / type_elapsed;
         let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
         let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
         normalized_rate_anomaly(action_rate, baseline_rate)
+    }
+
+    pub fn rate_debug_info(&self, type_id: &str, period_id: u64) -> Option<(f64, f64)> {
+        let pr = self.period_rate_states.get(&period_id)?;
+        let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
+        if action_count < 2.0 {
+            return None;
+        }
+        let type_elapsed = pr.type_last_ts.get(type_id).copied()?
+            - pr.type_first_ts.get(type_id).copied()?;
+        if type_elapsed <= 0.0 {
+            return None;
+        }
+        let action_rate = (action_count - 1.0) / type_elapsed;
+        let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
+        let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
+        Some((action_rate, baseline_rate))
     }
 
     fn recomputed_uniq_for(&self, type_id: &str, obj: &Value) -> f64 {
@@ -1000,13 +1049,17 @@ fn collect_paths(v: &Value, path: &str, out: &mut Vec<String>) {
 }
 
 fn normalized_rate_anomaly(action_rate: f64, baseline_rate: f64) -> f64 {
-    if action_rate <= 0.0 {
+    if action_rate <= 0.0 && baseline_rate <= 0.0 {
         return 0.0;
     }
     if baseline_rate <= 0.0 {
         return 1.0;
     }
-    ((action_rate - baseline_rate) / action_rate).clamp(0.0, 1.0)
+    if action_rate <= 0.0 {
+        // type went silent during action period
+        return 1.0;
+    }
+    1.0 - action_rate.min(baseline_rate) / action_rate.max(baseline_rate)
 }
 
 #[cfg(test)]

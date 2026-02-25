@@ -307,6 +307,7 @@ impl App {
             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         }
         terminal.show_cursor()?;
+        self.model.close_open_period(unix_ts());
         if let Err(err) = self.persist_state() {
             eprintln!("warning: failed to persist session state: {err}");
         }
@@ -427,11 +428,13 @@ impl App {
                 keys,
                 scalar_paths: _,
             } = prepared;
+            let size_bytes = obj.to_string().len() as u32;
             self.baseline_events.push(EventRecord {
                 ts,
                 type_id,
                 obj,
                 keys,
+                size_bytes,
                 action_period_id: None,
                 in_action_period: false,
                 live_rate_score: 0.0,

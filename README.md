@@ -8,6 +8,7 @@ This app is now a Rust terminal UI focused on fast, practical anomaly discovery.
 - Basic analytics only:
   - rate anomaly
   - value uniqueness anomaly
+  - See [stats.md](stats.md) for scoring details.
 - Type Explorer:
   - shows uniqueness paths considered per type
   - lets you force paths on/off to normalize noisy fields

@@ -153,6 +153,22 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
                     Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
                 ),
             ]));
+            if let Some(pid) = sel.action_period_id {
+                if let Some((actual, expected)) = app.model.rate_debug_info(&sel.type_id, pid) {
+                    lines.push(Line::from(vec![
+                        Span::styled("rate  expected ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("{:.4}/s", expected),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled("  actual ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("{:.4}/s", actual),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+            }
         }
         lines.push(Line::from(""));
         let key_paths = app.live_selected_key_paths();
@@ -1361,7 +1377,8 @@ fn render_event_line(
     let row_label = row_index
         .map(|idx| format!("#{} ", idx))
         .unwrap_or_default();
-    let fixed_prefix = 2 + 1 + 3 + row_label.chars().count() + ts.chars().count() + 1;
+    let size_str = format_size_bytes(e.size_bytes);
+    let fixed_prefix = 2 + 1 + 3 + row_label.chars().count() + ts.chars().count() + 1 + size_str.chars().count() + 1;
     let name_budget = row_width.saturating_sub(fixed_prefix + tail_len).max(4);
     let short_name = truncate_text(&name, name_budget);
     let line_len = fixed_prefix + short_name.chars().count() + tail_len;
@@ -1373,7 +1390,9 @@ fn render_event_line(
         Span::raw(" "),
         Span::raw(format!("{} ", sel)),
         Span::styled(row_label, Style::default().fg(Color::Gray)),
-        Span::styled(ts, Style::default().fg(Color::Gray)),
+        Span::styled(ts, style),
+        Span::raw(" "),
+        Span::styled(size_str, style),
         Span::raw(" "),
         Span::styled(short_name, name_style),
     ];
@@ -1415,6 +1434,16 @@ fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
     (lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
 }
 
+fn format_size_bytes(n: u32) -> String {
+    if n < 10_000 {
+        format!("{:>4}B", n)
+    } else if n < 1_000_000 {
+        format!("{:>4}k", n / 1000)
+    } else {
+        format!("{:>4}M", n / 1_000_000)
+    }
+}
+
 fn truncate_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -1426,7 +1455,7 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 }
 
 fn anomaly_norm(score: f64) -> f64 {
-    score.clamp(0.0, 1.0)
+    score.clamp(0.0, 1.0).sqrt()
 }
 
 fn format_score(score: f64) -> String {
