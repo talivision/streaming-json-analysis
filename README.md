@@ -27,6 +27,23 @@ cargo build --release --target aarch64-unknown-linux-musl
 
 The output static binary will be written to `target/x86_64-unknown-linux-musl/release/json_analyzer`. This should be run-anywhere on all Linux boxes.
 
+### Windows build
+
+Native on Windows (MSVC toolchain):
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+cargo build --release --target x86_64-pc-windows-msvc
+```
+
+Cross-compile to Windows GNU from macOS/Linux:
+
+```bash
+brew install mingw-w64
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
 ---
 
 ## Getting started

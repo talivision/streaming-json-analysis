@@ -1,3 +1,4 @@
+.cargo/
 __pycache__/
 *.py[cod]
 target/
