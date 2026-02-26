@@ -804,6 +804,34 @@ impl AnalyzerModel {
         self.filter_events_from_iter(events.iter().rev(), filters, None)
     }
 
+    pub fn filtered_event_indices_in_slice(
+        &self,
+        events: &[EventRecord],
+        filters: &DataFilters,
+    ) -> Vec<usize> {
+        let mut out = Vec::new();
+        let type_expr = FilterExpr::parse(&filters.type_filter);
+        let key_expr = FilterExpr::parse(&filters.key_filter);
+        let substring_expr = FilterExpr::parse(&filters.substring_filter);
+        let fuzzy_expr = FilterExpr::parse(&filters.fuzzy_filter);
+        let exact_expr = FilterExpr::parse(&filters.exact_filter);
+        for idx in (0..events.len()).rev() {
+            let e = &events[idx];
+            if !self.matches_filters(
+                e,
+                &type_expr,
+                &key_expr,
+                &substring_expr,
+                &fuzzy_expr,
+                &exact_expr,
+            ) {
+                continue;
+            }
+            out.push(idx);
+        }
+        out
+    }
+
     fn filter_events_from_iter<'a>(
         &'a self,
         iter: impl Iterator<Item = &'a EventRecord>,

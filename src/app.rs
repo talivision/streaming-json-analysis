@@ -27,7 +27,7 @@ use std::env;
 use std::fs;
 use std::io::stdout;
 use std::path::PathBuf;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashSet as StdHashSet};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -132,7 +132,9 @@ pub struct App {
     pending_restore: Option<RestoredState>,
     startup_hint: Option<String>,
     live_visible_indices: Vec<usize>,
+    baseline_visible_indices: Vec<usize>,
     live_cache_dirty: bool,
+    baseline_cache_dirty: bool,
     initial_load_target_bytes: Option<u64>,
     initial_load_complete: bool,
     initial_load_is_directory: bool,
@@ -227,7 +229,9 @@ impl App {
             pending_restore: None,
             startup_hint: None,
             live_visible_indices: Vec::new(),
+            baseline_visible_indices: Vec::new(),
             live_cache_dirty: true,
+            baseline_cache_dirty: true,
             initial_load_target_bytes,
             initial_load_complete,
             initial_load_is_directory: is_directory_input,
@@ -686,13 +690,15 @@ impl App {
         }
         self.baseline_tab_enabled = !self.baseline_events.is_empty();
         let progress = reader.progress();
+        let baseline_path_display = reader.path().display().to_string();
         self.baseline_loaded = progress.total_bytes == 0 || progress.loaded_bytes >= progress.total_bytes;
         self.pending_live_recompute = true;
+        self.mark_live_cache_dirty();
         if self.baseline_loaded {
             self.status = format!(
                 "Baseline loaded: {} events from {}",
                 self.baseline_events.len(),
-                reader.path().display()
+                baseline_path_display
             );
         } else {
             self.status = self.baseline_load_status();
@@ -1964,6 +1970,7 @@ impl App {
     }
 
     fn navigate_data(&mut self, intent: NavIntent) {
+        self.ensure_baseline_cache();
         let total = self.visible_baseline_events().len();
         let page_step = MENU_PAGE_STEP;
         self.data_index = match intent {
@@ -2113,6 +2120,7 @@ impl App {
                 }
             }
             UiMode::Data => {
+                self.ensure_baseline_cache();
                 let n = self.visible_baseline_events().len();
                 if n == 0 {
                     self.data_index = 0;
@@ -2463,11 +2471,13 @@ impl App {
                 .get(self.period_event_index)
                 .cloned()
                 .cloned(),
-            UiMode::Data => self
-                .visible_baseline_events()
-                .get(self.data_index)
-                .cloned()
-                .cloned(),
+            UiMode::Data => {
+                self.ensure_baseline_cache();
+                self.visible_baseline_events()
+                    .get(self.data_index)
+                    .cloned()
+                    .cloned()
+            }
             UiMode::Types => None,
         };
 
@@ -2485,6 +2495,7 @@ impl App {
 
     fn mark_live_cache_dirty(&mut self) {
         self.live_cache_dirty = true;
+        self.baseline_cache_dirty = true;
     }
 
     fn rebuild_live_cache_if_needed(&mut self) {
@@ -2503,6 +2514,21 @@ impl App {
         self.rebuild_live_cache_if_needed();
     }
 
+    pub fn ensure_baseline_cache(&mut self) {
+        self.rebuild_baseline_cache_if_needed();
+    }
+
+    fn rebuild_baseline_cache_if_needed(&mut self) {
+        if !self.baseline_cache_dirty {
+            return;
+        }
+        let base = self
+            .model
+            .filtered_event_indices_in_slice(&self.baseline_events, &self.event_filters);
+        self.baseline_visible_indices = self.apply_whitelist_to_baseline_indices(base);
+        self.baseline_cache_dirty = false;
+    }
+
     fn live_visible_total(&self) -> usize {
         self.live_visible_indices.len()
     }
@@ -2513,26 +2539,30 @@ impl App {
     }
 
     pub fn visible_baseline_events(&self) -> Vec<&EventRecord> {
-        let base = self
-            .model
-            .filtered_event_slice(&self.baseline_events, &self.event_filters);
+        self.baseline_visible_indices
+            .iter()
+            .filter_map(|idx| self.baseline_events.get(*idx))
+            .collect()
+    }
+
+    fn apply_whitelist_to_baseline_indices(&self, indices: Vec<usize>) -> Vec<usize> {
         match self.whitelist_mode {
-            WhitelistMode::Off => base,
-            WhitelistMode::OnlyWhitelist => self
-                .baseline_events
-                .iter()
+            WhitelistMode::Off => indices,
+            WhitelistMode::OnlyWhitelist => (0..self.baseline_events.len())
                 .rev()
-                .filter(|e| self.event_matches_whitelist(e))
+                .filter(|idx| self.event_matches_whitelist(&self.baseline_events[*idx]))
                 .collect(),
             WhitelistMode::AlwaysShow => {
-                let mut out = base;
-                for e in self.baseline_events.iter().rev() {
-                    if self.event_matches_whitelist(e)
-                        && !out
-                            .iter()
-                            .any(|existing| existing.ts == e.ts && existing.type_id == e.type_id)
-                    {
-                        out.push(e);
+                let mut seen: StdHashSet<usize> = StdHashSet::with_capacity(indices.len());
+                let mut out = Vec::with_capacity(indices.len());
+                for idx in indices {
+                    if seen.insert(idx) {
+                        out.push(idx);
+                    }
+                }
+                for idx in (0..self.baseline_events.len()).rev() {
+                    if self.event_matches_whitelist(&self.baseline_events[idx]) && seen.insert(idx) {
+                        out.push(idx);
                     }
                 }
                 out
@@ -3115,6 +3145,15 @@ impl App {
         if self.pending_profile_override.is_some() {
             return;
         }
+        let loading_primary = if self.offline {
+            !self.offline_loaded
+        } else {
+            !self.initial_load_complete
+        };
+        if self.baseline_reader.is_some() && !self.baseline_loaded && loading_primary {
+            self.status = self.combined_load_status();
+            return;
+        }
         if self.baseline_reader.is_some() && !self.baseline_loaded {
             self.status = self.baseline_load_status();
             return;
@@ -3184,6 +3223,35 @@ impl App {
             loaded,
             total,
             self.model.total_objects()
+        )
+    }
+
+    fn combined_load_status(&self) -> String {
+        let baseline = self
+            .baseline_reader
+            .as_ref()
+            .map(|r| r.progress())
+            .unwrap_or(crate::io::StreamProgress {
+                loaded_bytes: 0,
+                total_bytes: 0,
+            });
+        let primary = self.reader.progress();
+        let loaded_total = baseline.loaded_bytes.saturating_add(primary.loaded_bytes);
+        let total_total = baseline.total_bytes.saturating_add(primary.total_bytes);
+        if total_total == 0 {
+            return format!(
+                "Loading baseline + primary: scanned {} objects",
+                self.model.total_objects()
+            );
+        }
+        let pct = (loaded_total as f64 * 100.0 / total_total as f64).clamp(0.0, 100.0);
+        let bar = progress_bar(pct / 100.0, 24);
+        format!(
+            "Loading baseline + primary: {} {:>5.1}% ({:.2}/{:.2} MB)",
+            bar,
+            pct,
+            loaded_total as f64 / (1024.0 * 1024.0),
+            total_total as f64 / (1024.0 * 1024.0)
         )
     }
 

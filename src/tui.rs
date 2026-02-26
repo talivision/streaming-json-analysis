@@ -412,22 +412,31 @@ fn styled_hotkey(label: &str) -> Span<'static> {
 
 fn types_list_title(row: usize, total: usize, unfiltered: usize, path_focus: bool, search: &str, pane_width: u16) -> Line<'static> {
     let focus = if path_focus { "details" } else { "list" };
-    let counter = if search.is_empty() {
-        format!("Types {}/{} ({focus}) ", row, total)
+    let (counter_len, counter_spans) = if search.is_empty() {
+        let counter = format!("Types {}/{} ({focus}) ", row, total);
+        (counter.len(), vec![Span::raw(counter)])
     } else {
         let omitted = unfiltered.saturating_sub(total);
-        format!("Types {}/{} ({omitted} omitted, filter: {}) ", row, total, truncate_text(search, 16))
+        let search = truncate_text(search, 16);
+        (
+            format!("Types {}/{} ({omitted} omitted, filter: {}) ", row, total, search).len(),
+            vec![
+                Span::raw(format!("Types {}/{} ({omitted} omitted, filter: ", row, total)),
+                Span::styled(search, Style::default().fg(Color::LightGreen)),
+                Span::raw(") "),
+            ],
+        )
     };
     if pane_width < 20 {
         return Line::from("Types");
     }
-    if (pane_width as usize) < counter.len() + 4 {
-        return Line::from(counter);
+    if (pane_width as usize) < counter_len + 4 {
+        return Line::from(counter_spans);
     }
     // Narrow: just show keys without descriptions
     if pane_width < 56 {
-        return Line::from(vec![
-            Span::raw(counter),
+        let mut spans = counter_spans.clone();
+        spans.extend([
             styled_hotkey("↵"),
             Span::raw("/"),
             styled_hotkey("t"),
@@ -436,11 +445,12 @@ fn types_list_title(row: usize, total: usize, unfiltered: usize, path_focus: boo
             Span::raw("/"),
             styled_hotkey("/"),
         ]);
+        return Line::from(spans);
     }
     // Medium: short descriptions
     if pane_width < 80 {
-        return Line::from(vec![
-            Span::raw(counter),
+        let mut spans = counter_spans.clone();
+        spans.extend([
             styled_hotkey("↵"),
             Span::raw(" details, "),
             styled_hotkey("t"),
@@ -450,10 +460,11 @@ fn types_list_title(row: usize, total: usize, unfiltered: usize, path_focus: boo
             styled_hotkey("/"),
             Span::raw(" search"),
         ]);
+        return Line::from(spans);
     }
     // Wide: full descriptions
-    Line::from(vec![
-        Span::raw(counter),
+    let mut spans = counter_spans;
+    spans.extend([
         styled_hotkey("↵"),
         Span::raw(" details, "),
         styled_hotkey("t"),
@@ -462,7 +473,8 @@ fn types_list_title(row: usize, total: usize, unfiltered: usize, path_focus: boo
         Span::raw(" toggle !type, "),
         styled_hotkey("/"),
         Span::raw(" search, by count"),
-    ])
+    ]);
+    Line::from(spans)
 }
 
 fn action_periods_title(pane_width: u16) -> Line<'static> {
@@ -759,7 +771,8 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f64) {
+fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f64) {
+    app.ensure_baseline_cache();
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
