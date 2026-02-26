@@ -1,141 +1,305 @@
-# JSON Analyzer (Rust + Ratatui)
+# JSON Analyzer
 
-This app is now a Rust terminal UI focused on fast, practical anomaly discovery.
+A terminal UI for investigating JSONL streams. Connect it to a stream of telemetry or application events, mark moments of interest as action periods, and it surfaces which event types and field values stand out against the surrounding baseline.
 
-## What It Does
-
-- Structural typing only: type IDs are SHA-256 hashes of normalized JSON shape.
-- Basic analytics only:
-  - rate anomaly
-  - value uniqueness anomaly
-  - See [stats.md](stats.md) for scoring details.
-- Type Explorer:
-  - shows uniqueness paths considered per type
-  - lets you force paths on/off to normalize noisy fields
-- Data Explorer:
-  - explore collected data with filters on keys, type ID, fuzzy text, exact key=value
-- Known unrelated controls:
-  - suppress entire types
-
-Removed by design: palette controls, long-tail analysis, semantic/fuzzy typing.
-
-## Install Rust
-
-macOS/Linux (rustup):
+## Install and build
 
 ```bash
+# macOS/Linux
 curl https://sh.rustup.rs -sSf | sh
 source "$HOME/.cargo/env"
-```
-
-## Build
-
-```bash
 cargo build --release
 ```
 
-## Run
+---
 
-By default it tails `/tmp/json_demo/stream.jsonl`:
+## Getting started
 
-```bash
-cargo run --release
-```
-
-Or pass a stream path:
+Point the tool at any JSONL file and it starts reading immediately:
 
 ```bash
-cargo run --release -- /path/to/stream.jsonl
+./target/release/json-analyzer stream.jsonl
 ```
 
-Optionally preload a known-clean baseline corpus:
+For static archives where you want to read the whole file at once rather than tail it:
 
 ```bash
-cargo run --release -- /path/to/stream.jsonl --baseline /path/to/clean-baseline.jsonl
+./target/release/json-analyzer --offline archive.jsonl
 ```
 
-Live mode requires each JSON object to include root `_timestamp` as epoch milliseconds
-(13-digit integer, e.g. `1739952000123`).
-If missing, the analyzer exits fast with an unsupported-input error.
-
-For offline analysis of files without `_timestamp`:
+If your events are spread across many files, you can read from a directory with `--directory`. Files are read in parallel and sorted by `_timestamp` before ingestion. Directory mode is offline-only — it reads the files once and does not tail for new additions:
 
 ```bash
-cargo run --release -- --offline /path/to/stream.jsonl
+./target/release/json-analyzer --directory /var/log/events/
 ```
 
-## Demo Source
+Directory mode is slower and less reliable than a single JSONL file — parallel reads can race and ordering depends entirely on `_timestamp` being present and correct. Where you have control over the source, prefer writing to a single append-only JSONL file with monotonically increasing `_timestamp` values.
 
-Run the built-in Python demo source (no separate trigger script needed):
+---
+
+## How the baseline works
+
+The tool continuously builds a picture of "normal" from events that arrive outside of any action period. When you mark an action period (press `m`), everything the tool has seen up to that point — and everything after the period closes — forms the implicit baseline that the anomaly engine scores against.
+
+This means you don't need to do anything special to establish a baseline: run the tool, let it observe normal operation for a while, then start marking periods.
+
+If you already have a large corpus of known-good events, you can pre-load it to give the engine a better reference from the start:
 
 ```bash
-python3 demo_source.py
+./target/release/json-analyzer stream.jsonl --baseline baseline.jsonl
 ```
 
-In the source terminal, use single-key triggers:
+This is optional but improves scoring quality, especially for rate anomalies, when the stream is young and the implicit baseline is thin.
 
-- `l` login
-- `p` purchase
-- `s` search
-- `c` experiment_control
-- `t` experiment_treatment
-- `h` source_like_heartbeat
-- `m` source_like_metric
-- `?` help
-- `q` quit
+---
+
+## Investigation workflow
+
+### 1. Watch the stream
+
+The default Live view shows incoming events in reverse-chronological order. Each row shows the structural type, event size, and time offset from the first event in view. As types accumulate, the **Types view (`3`)** becomes useful for orienting yourself: what kinds of events exist, how frequently they arrive, and what their fields look like. Press `j` on a type to see a sample event.
+
+Rename unfamiliar types with `r` to give them human-readable labels — these persist across sessions.
+
+### 2. Mark an action period
+
+When something of interest happens — a deployment, a user action, an incident — press **`m`** to open an action period. Press **`m`** again to close it. Label it with **`n`** before closing if you want a name on the period.
+
+Events inside the period are scored against the baseline:
+- **Rate anomaly** — is this event type arriving faster or slower than normal?
+- **Value uniqueness** — are the field values rare compared to what the baseline has seen?
+
+### 3. Review the period
+
+Switch to the **Periods view (`2`)** to see closed periods. Select one to browse its events colour-coded by anomaly score. The right pane shows the selected event's JSON with high-scoring paths highlighted.
+
+### 4. Tune the signal
+
+The Types view lets you push down noise from types that aren't relevant to your investigation. Press **`u`** on a type to add it to a negative type filter — it stays visible in the Types view but disappears from event lists. Press **`u`** again to remove it.
+
+Within a type, press `enter` to see the field paths the engine considers for uniqueness scoring. High-cardinality paths (IDs, free text) are auto-excluded; use `space` to force paths on or off.
+
+Use the filter keys (`k`, `t`, `/`, `z`, `e`) to narrow event lists to what you care about. Filters support `&&`, `||`, and `!` negation:
+
+```
+type:   payment && !healthcheck
+exact:  status=error && !env=staging
+sub:    "timeout" && !"connection reset"
+```
+
+### 5. Save your work
+
+Once you've tuned the noise — renamed types, excluded irrelevant ones, adjusted path scoring — press **`p`** to export a profile. Profiles capture your configuration without the events, so you can reload them next time you open the same stream, or apply them to a different stream of the same kind.
+
+Press **`x`** to export a full session snapshot including all events, baseline, and periods. Share it with a colleague so they can open your analysis directly without needing access to the original stream.
+
+---
+
+## Event format
+
+Events must be JSON objects, one per line. The only required field is:
+
+**`_timestamp`** — epoch milliseconds as an integer (13 digits, e.g. `1739952000123`). Required for live mode; missing or malformed values cause a fast-fail exit. Not required in `--offline` mode.
+
+All other fields are yours. The tool is completely schema-free.
+
+### Enrichment fields
+
+Any `_`-prefixed field beyond `_timestamp` is treated as enrichment or deployment context — it behaves like any other field:
+
+```json
+{
+  "_timestamp": 1739952000123,
+  "_env":       "prod",
+  "_service":   "auth",
+  "_region":    "us-east-1",
+  "event":      "login",
+  "user_id":    42
+}
+```
+
+- Two events that differ only in the *value* of `_env` have the same structural type. Two that differ in whether `_env` is *present* have different types.
+- Field values are tracked for uniqueness scoring. If `_env` is almost always `"prod"` in the baseline and a period produces `_env: "staging"`, the anomaly score rises.
+
+This makes enrichment fields genuinely useful — tagging events with `_service`, `_region`, or `_datacenter` gives the anomaly engine more signal.
+
+---
+
+## Sharing and reuse
+
+### Session export
+
+Press **`x`** to write a full session snapshot — events, baseline, periods, renames, filters, path overrides — to a `.session.json` file. A colleague can open it directly:
+
+```bash
+./target/release/json-analyzer --import session.json
+```
+
+Once you've used `x` in a session, the snapshot is re-written automatically on clean exit.
+
+### Profiles
+
+A profile captures your analysis configuration — type renames, negative filters, path overrides, whitelist terms — without the events. If you regularly investigate the same stream, export a profile with **`p`** and reload it next time to skip the setup:
+
+```bash
+./target/release/json-analyzer stream.jsonl --profile stream.profile.json
+```
+
+If the stream has restored session state that conflicts with the profile, you'll be prompted to choose. Whitelist terms always merge additively.
+
+### Whitelist
+
+A whitelist is a text file with one search term per line. Events matching any term are treated as always-interesting regardless of active filters:
+
+- **`always-show`** — whitelisted events appear even when filtered out
+- **`only-whitelist`** — only whitelisted events are shown
+- **`off`** — whitelist loaded but inactive
+
+Cycle modes with **`w`**. Matches are highlighted in orange in the JSON preview.
+
+```bash
+./target/release/json-analyzer stream.jsonl --whitelist terms.txt
+```
+
+---
+
+## Demo
+
+The bundled Python demo source writes background noise plus action-triggered events:
+
+```bash
+# Terminal 1
+python3 examples/sources/demo_source/demo_source.py
+
+# Terminal 2
+./target/release/json-analyzer /tmp/json_demo/stream.jsonl
+```
+
+In the source terminal, press `l` (login), `p` (purchase), `s` (search), `c`/`t` (experiment variants) to fire actions. In the analyzer, press `m` to bracket a window around them and watch the anomaly scores appear.
+
+---
+
+## Writing a source
+
+If you control the event producer, the format is simple — one JSON object per line, flushed immediately:
+
+```python
+import json, time
+
+def write_event(f, obj):
+    f.write(json.dumps(obj) + "\n")
+    f.flush()
+
+with open("/tmp/stream.jsonl", "a") as f:
+    seq = 0
+    while True:
+        write_event(f, {"_timestamp": int(time.time() * 1000), "event": "heartbeat", "seq": seq, "_service": "auth", "_env": "prod"})
+        seq += 1
+        time.sleep(1)
+```
+
+Rules:
+- One JSON object per line, no pretty-printing.
+- `_timestamp` must be a 13-digit epoch milliseconds integer (not a string, not seconds).
+- Fields with high cardinality (IDs, free text) are auto-excluded from uniqueness scoring. Force a path off explicitly in the Types view if needed.
+
+---
+
+## CLI reference
+
+```
+json_analyzer [<path>] [--jsonl <path>] [--directory <path>] [--baseline <path>]
+              [--import <path>] [--profile <path>] [--whitelist <path>]
+              [--offline] [--reset] [--debug-status]
+
+  <path> / --jsonl    path to input JSONL file (live, tailed)
+  --directory         path to a directory of JSON/JSONL files (offline only)
+  --baseline          pre-load known-good events from a file or directory
+  --import            open a previously exported session snapshot
+  --profile           apply a source profile on startup
+  --whitelist         load whitelist terms from a file (one per line)
+  --offline           read file once without tailing; _timestamp not required
+  --reset             start without loading persisted session state from disk
+  --debug-status      show internal status line details continuously
+```
+
+---
 
 ## Keybindings
 
-- `q`: quit (press twice within 2s)
-- `1/2/3/4`: switch modes (`Live`, `Periods`, `Types`, `Baseline`)
-- `m`: start/stop action period
-- `n`: set current action label
+### Global
 
-Event-list modes (`Periods`, `Baseline`):
+| Key | Action |
+|-----|--------|
+| `q` (×2) | Quit |
+| `h` / `?` | Toggle help overlay |
+| `1` `2` `3` `4` | Live / Periods / Types / Baseline |
+| `m` | Open / close action period |
+| `n` | Set action label |
+| `x` | Export session |
+| `p` | Export profile |
 
-- `enter`: open object inspector
-- `g`: toggle rate boundary display (`point` / `interval`)
-- `k`: edit key filter
-- `t`: edit type filter
-- `/`: edit fuzzy filter
-- `e`: edit exact filter (`path=value`)
-- `c`: clear event filters
-- `y`: toggle event filters off/on (restore previous set)
+### Filters
 
-Live mode:
+| Key | Filter |
+|-----|--------|
+| `k` | Keys |
+| `t` | Type |
+| `/` | Substring |
+| `z` | Fuzzy |
+| `e` | Exact `path=value` |
+| `c` | Clear all |
+| `y` | Suspend / restore |
+| `w` | Cycle whitelist mode |
 
-- `up/down`: select event row
-- `right` or `enter`: focus inline key picker in the selected object pane
-- `esc` or `left`: return focus to event rows (resumes follow if it was on)
-- while key-focused: `up/down` select key, `right` focus value, `enter` or `k` toggle key filter, `t` jump to type
-- while value-focused: `enter` or `e` toggle exact `path=value` filter in place, `left` back to key focus
-- follow mode is paused while key-focused and resumes when key focus exits
+### Live view
 
-Periods mode:
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Select event |
+| `f` | Toggle follow |
+| `→` / `enter` | Focus key picker |
+| `esc` / `←` | Back to event list |
+| (key-focused) `k` | Set key filter |
+| (key-focused) `t` | Jump to type |
+| (value-focused) `e` | Set exact filter |
 
-- `up/down`: move between action periods
-- `enter` or `right`: focus events for the selected period
-- while event-focused: `up/down` select event, `enter` open object inspector, `left` return to period list
+### Types view
 
-Types mode:
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Select type |
+| `r` | Rename |
+| `j` | Preview sample event |
+| `t` | Filter to type and jump to Live |
+| `u` | Toggle negative type filter |
+| `/` | Search type list |
+| `enter` / `→` | Focus path list |
+| (path-focused) `space` | Toggle path on / off |
 
-- `up/down`: select type
-- `t`: apply selected type as event filter and jump to Live mode
-- after `t`, `esc` in Live returns to Types
-- `enter` or `right`: focus uniqueness paths for selected type
-- `left`: return from path focus to type list
-- while path-focused: `up/down` select path, `space` toggle include/exclude
-- `u`: mark selected type as known unrelated
-- `/`: filter type list
-- `r`: rename selected type
+### Periods view
 
-Object inspector:
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Select period |
+| `enter` / `→` | Browse period events |
+| `del` | Delete period |
 
-- `up/down`: select key
-- `k`: apply selected key as event filter in the current mode
-- `t`: jump to the selected event's type in Types mode
-- `esc`: close inspector
+### Object inspector
 
-Type names are shown in all event lists as either:
-- `type-<hash8>` (default)
-- `<custom name> (type-<hash8>)` (renamed)
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Select key |
+| `k` | Set key filter |
+| `t` | Jump to type |
+| `esc` | Close |
+
+---
+
+## Anomaly scoring
+
+See [stats.md](stats.md) for full details. Brief summary:
+
+- **Rate anomaly** — compares event frequency during the action window against the baseline rate for that type. Falls back to inter-arrival time when the period is short or sparsely sampled.
+- **Value uniqueness** — scores each scalar field path: how rare is this value compared to baseline?
+- Both scores are in [0, 1]. Display uses `sqrt(score)` to keep mid-range anomalies visible.
