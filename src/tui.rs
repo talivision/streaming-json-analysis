@@ -304,16 +304,21 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
     if let Some(period) = periods.get(app.periods_index) {
         let start = period.start;
         let end = period.end.unwrap_or(period.start);
-        let events = app
+        let event_indices = app
             .model
-            .filtered_events_in_range(&app.event_filters, Some((start, end)));
+            .filtered_event_indices(&app.event_filters, Some((start, end)));
+        let events: Vec<(usize, &EventRecord)> = event_indices
+            .iter()
+            .rev()
+            .filter_map(|idx| app.model.events.get(*idx).map(|e| (*idx, e)))
+            .collect();
         let type_col_width = events
             .iter()
-            .map(|e| app.model.canonical_type_name(&e.type_id).chars().count() + 2)
+            .map(|(_, e)| app.model.canonical_type_name(&e.type_id).chars().count() + 2)
             .max()
             .unwrap_or(16)
             .clamp(12, 36);
-        let first_period_ts = events.last().map(|e| e.ts).unwrap_or(start);
+        let first_period_ts = events.last().map(|(_, e)| e.ts).unwrap_or(start);
         let total = events.len();
         let window = max_period_rows.max(1);
         let start_idx = if total <= window {
@@ -324,14 +329,14 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
                 .saturating_sub(half)
                 .min(total.saturating_sub(window))
         };
-        for (vis_idx, e) in events.iter().skip(start_idx).take(window).enumerate() {
+        for (vis_idx, (event_idx, e)) in events.iter().skip(start_idx).take(window).enumerate() {
             let idx = start_idx + vis_idx;
             let selected = idx == app.period_event_index;
             let diff_ms = Some((((e.ts - first_period_ts) * 1000.0).round() as i64).max(0));
             rows.push(ListItem::new(render_event_line(
                 app,
                 e,
-                None,
+                Some(*event_idx + 1),
                 index_width,
                 type_col_width,
                 diff_ms,
@@ -340,7 +345,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
                 max_type_count,
             )));
         }
-        selected_event = events.get(app.period_event_index).copied();
+        selected_event = events.get(app.period_event_index).map(|(_, e)| *e);
     }
     frame.render_widget(
         List::new(rows).block(Block::default().title("Events").borders(Borders::ALL)),
