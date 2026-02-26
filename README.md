@@ -27,29 +27,51 @@ For static archives where you want to read the whole file at once rather than ta
 ./target/release/json-analyzer --offline archive.jsonl
 ```
 
-If your events are spread across many files, you can read from a directory with `--directory`. Files are read in parallel and sorted by `_timestamp` before ingestion. Directory mode is offline-only — it reads the files once and does not tail for new additions:
-
-```bash
-./target/release/json-analyzer --directory /var/log/events/
-```
-
-Directory mode is slower and less reliable than a single JSONL file — parallel reads can race and ordering depends entirely on `_timestamp` being present and correct. Where you have control over the source, prefer writing to a single append-only JSONL file with monotonically increasing `_timestamp` values.
-
 ---
 
-## How the baseline works
+## Writing a source
 
-The tool continuously builds a picture of "normal" from events that arrive outside of any action period. When you mark an action period (press `m`), everything the tool has seen up to that point — and everything after the period closes — forms the implicit baseline that the anomaly engine scores against.
+If you control the event producer, the format is simple — one JSON object per line, flushed immediately. The only required field is **`_timestamp`**: epoch milliseconds as a 13-digit integer.
 
-This means you don't need to do anything special to establish a baseline: run the tool, let it observe normal operation for a while, then start marking periods.
+```python
+import json, time
 
-If you already have a large corpus of known-good events, you can pre-load it to give the engine a better reference from the start:
+def write_event(f, obj):
+    f.write(json.dumps(obj) + "\n")
+    f.flush()
 
-```bash
-./target/release/json-analyzer stream.jsonl --baseline baseline.jsonl
+with open("/tmp/stream.jsonl", "a") as f:
+    seq = 0
+    while True:
+        write_event(f, {"_timestamp": int(time.time() * 1000), "event": "heartbeat", "seq": seq, "_service": "auth", "_env": "prod"})
+        seq += 1
+        time.sleep(1)
 ```
 
-This is optional but improves scoring quality, especially for rate anomalies, when the stream is young and the implicit baseline is thin.
+Rules:
+- One JSON object per line, no pretty-printing.
+- `_timestamp` must be an integer, not a string, and not seconds — 13 digits (milliseconds).
+- `_timestamp` must be monotonically non-decreasing across lines — each event must have a timestamp equal to or greater than the one before it.
+
+### Enrichment fields
+
+Any `_`-prefixed field beyond `_timestamp` is treated as enrichment or deployment context and behaves like any other field:
+
+```json
+{
+  "_timestamp": 1739952000123,
+  "_env":       "prod",
+  "_service":   "auth",
+  "_region":    "us-east-1",
+  "event":      "login",
+  "user_id":    42
+}
+```
+
+- Two events that differ only in the *value* of `_env` have the same structural type. Two that differ in whether `_env` is *present* have different types.
+- Field values are tracked for uniqueness scoring. If `_env` is almost always `"prod"` in the baseline and a period produces `_env: "staging"`, the anomaly score rises.
+
+Tagging events with `_service`, `_region`, or `_datacenter` gives the anomaly engine more signal without polluting your application fields.
 
 ---
 
@@ -77,9 +99,9 @@ Switch to the **Periods view (`2`)** to see closed periods. Select one to browse
 
 The Types view lets you push down noise from types that aren't relevant to your investigation. Press **`u`** on a type to add it to a negative type filter — it stays visible in the Types view but disappears from event lists. Press **`u`** again to remove it.
 
-Within a type, press `enter` to see the field paths the engine considers for uniqueness scoring. High-cardinality paths (IDs, free text) are auto-excluded; use `space` to force paths on or off.
+Within a type, press `enter` to see the field paths the engine considers for uniqueness scoring. High-cardinality paths (IDs, free text) are auto-excluded by the engine; use `space` to force paths on or off if the heuristic gets it wrong.
 
-Use the filter keys (`k`, `t`, `/`, `z`, `e`) to narrow event lists to what you care about. Filters support `&&`, `||`, and `!` negation:
+Use the filter keys (`k`, `t`, `/`, `z`, `e`) to narrow event lists to what you care about. Filters support `&&`, `||`, and `!` negation, and quoted terms:
 
 ```
 type:   payment && !healthcheck
@@ -87,79 +109,53 @@ exact:  status=error && !env=staging
 sub:    "timeout" && !"connection reset"
 ```
 
-### 5. Save your work
+### 5. Whitelist known-related artefacts
 
-Once you've tuned the noise — renamed types, excluded irrelevant ones, adjusted path scoring — press **`p`** to export a profile. Profiles capture your configuration without the events, so you can reload them next time you open the same stream, or apply them to a different stream of the same kind.
-
-Press **`x`** to export a full session snapshot including all events, baseline, and periods. Share it with a colleague so they can open your analysis directly without needing access to the original stream.
-
----
-
-## Event format
-
-Events must be JSON objects, one per line. The only required field is:
-
-**`_timestamp`** — epoch milliseconds as an integer (13 digits, e.g. `1739952000123`). Required for live mode; missing or malformed values cause a fast-fail exit. Not required in `--offline` mode.
-
-All other fields are yours. The tool is completely schema-free.
-
-### Enrichment fields
-
-Any `_`-prefixed field beyond `_timestamp` is treated as enrichment or deployment context — it behaves like any other field:
-
-```json
-{
-  "_timestamp": 1739952000123,
-  "_env":       "prod",
-  "_service":   "auth",
-  "_region":    "us-east-1",
-  "event":      "login",
-  "user_id":    42
-}
-```
-
-- Two events that differ only in the *value* of `_env` have the same structural type. Two that differ in whether `_env` is *present* have different types.
-- Field values are tracked for uniqueness scoring. If `_env` is almost always `"prod"` in the baseline and a period produces `_env: "staging"`, the anomaly score rises.
-
-This makes enrichment fields genuinely useful — tagging events with `_service`, `_region`, or `_datacenter` gives the anomaly engine more signal.
-
----
-
-## Sharing and reuse
-
-### Session export
-
-Press **`x`** to write a full session snapshot — events, baseline, periods, renames, filters, path overrides — to a `.session.json` file. A colleague can open it directly:
+If you know certain event types or values will always be related to the activity you're investigating, load a whitelist so they're never accidentally filtered out. A whitelist is a text file with one search term per line:
 
 ```bash
-./target/release/json-analyzer --import session.json
+./target/release/json-analyzer stream.jsonl --whitelist terms.txt
 ```
 
-Once you've used `x` in a session, the snapshot is re-written automatically on clean exit.
-
-### Profiles
-
-A profile captures your analysis configuration — type renames, negative filters, path overrides, whitelist terms — without the events. If you regularly investigate the same stream, export a profile with **`p`** and reload it next time to skip the setup:
-
-```bash
-./target/release/json-analyzer stream.jsonl --profile stream.profile.json
-```
-
-If the stream has restored session state that conflicts with the profile, you'll be prompted to choose. Whitelist terms always merge additively.
-
-### Whitelist
-
-A whitelist is a text file with one search term per line. Events matching any term are treated as always-interesting regardless of active filters:
+Events matching any term are treated as always-interesting regardless of active filters. Cycle modes with **`w`**:
 
 - **`always-show`** — whitelisted events appear even when filtered out
 - **`only-whitelist`** — only whitelisted events are shown
 - **`off`** — whitelist loaded but inactive
 
-Cycle modes with **`w`**. Matches are highlighted in orange in the JSON preview.
+Matches are highlighted in orange in the JSON preview.
+
+### 6. Save your work
+
+Press **`p`** to export a profile — your configuration (type renames, excluded types, path overrides, whitelist terms) without the events. Reload it next time you open the same stream, or apply it to a different stream of the same kind:
 
 ```bash
-./target/release/json-analyzer stream.jsonl --whitelist terms.txt
+./target/release/json-analyzer stream.jsonl --profile stream.profile.json
 ```
+
+Press **`x`** to export a full session snapshot including all events, baseline, and periods. A colleague can open it directly without access to the original stream:
+
+```bash
+./target/release/json-analyzer --import session.json
+```
+
+Once you've used `x` in a session, the snapshot is re-written automatically on clean exit. If session state conflicts with a loaded profile, you'll be prompted to choose.
+
+---
+
+## How the baseline works
+
+The tool continuously builds a picture of "normal" from events that arrive outside of any action period. When you mark an action period (press `m`), everything the tool has seen up to that point — and everything after the period closes — forms the implicit baseline that the anomaly engine scores against.
+
+This means you don't need to do anything special to establish a baseline: run the tool, let it observe normal operation for a while, then start marking periods.
+
+If you already have a large corpus of known-good events, you can pre-load it to give the engine a better reference from the start:
+
+```bash
+./target/release/json-analyzer stream.jsonl --baseline baseline.jsonl
+```
+
+This is optional but improves scoring quality, especially for rate anomalies, when the stream is young and the implicit baseline is thin.
 
 ---
 
@@ -169,39 +165,13 @@ The bundled Python demo source writes background noise plus action-triggered eve
 
 ```bash
 # Terminal 1
-python3 examples/sources/demo_source/demo_source.py
+python3 examples/sources/demo-source/demo_source.py
 
 # Terminal 2
 ./target/release/json-analyzer /tmp/json_demo/stream.jsonl
 ```
 
 In the source terminal, press `l` (login), `p` (purchase), `s` (search), `c`/`t` (experiment variants) to fire actions. In the analyzer, press `m` to bracket a window around them and watch the anomaly scores appear.
-
----
-
-## Writing a source
-
-If you control the event producer, the format is simple — one JSON object per line, flushed immediately:
-
-```python
-import json, time
-
-def write_event(f, obj):
-    f.write(json.dumps(obj) + "\n")
-    f.flush()
-
-with open("/tmp/stream.jsonl", "a") as f:
-    seq = 0
-    while True:
-        write_event(f, {"_timestamp": int(time.time() * 1000), "event": "heartbeat", "seq": seq, "_service": "auth", "_env": "prod"})
-        seq += 1
-        time.sleep(1)
-```
-
-Rules:
-- One JSON object per line, no pretty-printing.
-- `_timestamp` must be a 13-digit epoch milliseconds integer (not a string, not seconds).
-- Fields with high cardinality (IDs, free text) are auto-excluded from uniqueness scoring. Force a path off explicitly in the Types view if needed.
 
 ---
 
@@ -222,6 +192,8 @@ json_analyzer [<path>] [--jsonl <path>] [--directory <path>] [--baseline <path>]
   --reset             start without loading persisted session state from disk
   --debug-status      show internal status line details continuously
 ```
+
+If your events are spread across many files, use `--directory`. Files are read in parallel and sorted by `_timestamp` before ingestion. Directory mode is offline-only — it reads the files once and does not tail for new additions. It is slower and less reliable than a single JSONL file, as ordering depends entirely on `_timestamp` being present and correct. Where you have control over the source, prefer writing to a single append-only JSONL file with monotonically increasing `_timestamp` values.
 
 ---
 
