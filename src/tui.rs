@@ -1,4 +1,4 @@
-use crate::app::{App, ObjectInspector, PeriodsFocus};
+use crate::app::{App, ModalConfirmation, ObjectInspector, PeriodsFocus};
 use crate::domain::{EventRecord, FilterField, PathOverride};
 use indexmap::IndexMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -29,6 +29,8 @@ pub enum InputMode {
     RenameType,
     InsertPeriodRange,
     EditPeriodRange,
+    ExportSessionPath,
+    ExportProfilePath,
 }
 
 pub fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
@@ -37,39 +39,54 @@ pub fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(10),
-            Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Length(5),
         ])
         .split(frame.area());
 
     // Compute once per frame; passed to every row renderer to avoid O(types) per row.
     let max_type_count = app.model.types.values().map(|t| t.count).max().unwrap_or(1) as f64;
 
-    draw_tabs(frame, root[0], app.mode);
+    draw_tabs(frame, root[0], app.mode, app.baseline_tab_enabled());
     match app.mode {
         UiMode::Live => draw_live(frame, root[1], app, max_type_count),
         UiMode::Periods => draw_periods(frame, root[1], app, max_type_count),
         UiMode::Types => draw_types(frame, root[1], app),
         UiMode::Data => draw_data(frame, root[1], app, max_type_count),
     }
-    draw_status(frame, root[2], app);
-    draw_help(frame, root[3], app);
+    let modal = app.modal_confirmation();
+    draw_controls(frame, root[2], app, modal.is_some());
 
     if let Some(inspector) = app.inspector.as_ref() {
         draw_inspector(frame, inspector, app);
     }
     if app.show_help_overlay {
-        draw_full_help(frame);
+        draw_full_help(frame, app);
+    }
+    if app.type_preview_open() && app.mode == UiMode::Types {
+        draw_type_preview_modal(frame, app);
+    }
+    if let Some(confirm) = modal {
+        draw_confirmation_modal(frame, &confirm);
     }
 }
 
-fn draw_tabs(frame: &mut Frame<'_>, area: Rect, mode: UiMode) {
-    let titles = ["1 Live", "2 Periods", "3 Types", "4 Baseline"];
+fn draw_tabs(frame: &mut Frame<'_>, area: Rect, mode: UiMode, baseline_enabled: bool) {
+    let titles = if baseline_enabled {
+        vec!["1 Live", "2 Periods", "3 Types", "4 Baseline"]
+    } else {
+        vec!["1 Live", "2 Periods", "3 Types"]
+    };
     let selected = match mode {
         UiMode::Live => 0,
         UiMode::Periods => 1,
         UiMode::Types => 2,
-        UiMode::Data => 3,
+        UiMode::Data => {
+            if baseline_enabled {
+                3
+            } else {
+                2
+            }
+        }
     };
     let tabs = Tabs::new(titles)
         .block(
@@ -101,15 +118,31 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
     } else {
         live.selected_visible.or(Some(0))
     };
+    let selected_event_abs_index = selected_visible
+        .and_then(|vis_idx| live.row_indices.get(vis_idx).copied())
+        .and_then(|row_1based| row_1based.checked_sub(1));
     let mut items = Vec::new();
     let stream_inner_width = cols[0].width.saturating_sub(2) as usize;
+    let index_width = app.model.total_objects().max(1).to_string().len().max(3);
+    let type_col_width = live
+        .rows
+        .iter()
+        .map(|e| app.model.canonical_type_name(&e.type_id).chars().count() + 2)
+        .max()
+        .unwrap_or(16)
+        .clamp(12, 36);
+    let first_live_ts = app.model.events.front().map(|e| e.ts).unwrap_or(0.0);
     for (idx, e) in live.rows.iter().enumerate() {
         let selected = Some(idx) == selected_visible;
         let row_index = live.row_indices.get(idx).copied();
+        let diff_ms = Some((((e.ts - first_live_ts) * 1000.0).round() as i64).max(0));
         items.push(ListItem::new(render_event_line(
             app,
             e,
             row_index,
+            index_width,
+            type_col_width,
+            diff_ms,
             selected,
             stream_inner_width,
             max_type_count,
@@ -153,8 +186,9 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
                     Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
                 ),
             ]));
-            if let Some(pid) = sel.action_period_id {
-                if let Some((actual, expected)) = app.model.rate_debug_info(&sel.type_id, pid) {
+            if let Some(event_idx) = selected_event_abs_index {
+                if let Some((actual, expected)) = app.model.rate_debug_info_for_event_index(event_idx)
+                {
                     lines.push(Line::from(vec![
                         Span::styled("rate  expected ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
@@ -183,6 +217,11 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
             .get(&sel.type_id)
             .map(|tp| &tp.considered_paths);
         let sub_lc = app.event_filters.substring_filter.to_lowercase();
+        let whitelist_terms = if app.whitelist_highlight_enabled() {
+            app.whitelist_terms()
+        } else {
+            &[]
+        };
         let rendered = render_json_keypicker(
             &sel.obj,
             selected_path,
@@ -190,6 +229,7 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
             app.live_value_focus,
             &app.event_filters.key_filter,
             &sub_lc,
+            whitelist_terms,
             considered_paths,
         );
         let scroll = selected_json_scroll(rendered.selected_line, cols[1].height);
@@ -255,6 +295,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
 
     let mut rows = Vec::new();
     let events_inner_width = cols[1].width.saturating_sub(2) as usize;
+    let index_width = app.model.total_objects().max(1).to_string().len().max(3);
     let max_period_rows = (cols[1].height as usize).saturating_sub(2);
     let mut selected_event: Option<&EventRecord> = None;
     if let Some(period) = periods.get(app.periods_index) {
@@ -263,6 +304,13 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         let events = app
             .model
             .filtered_events_in_range(&app.event_filters, Some((start, end)));
+        let type_col_width = events
+            .iter()
+            .map(|e| app.model.canonical_type_name(&e.type_id).chars().count() + 2)
+            .max()
+            .unwrap_or(16)
+            .clamp(12, 36);
+        let first_period_ts = events.last().map(|e| e.ts).unwrap_or(start);
         let total = events.len();
         let window = max_period_rows.max(1);
         let start_idx = if total <= window {
@@ -276,10 +324,14 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         for (vis_idx, e) in events.iter().skip(start_idx).take(window).enumerate() {
             let idx = start_idx + vis_idx;
             let selected = idx == app.period_event_index;
+            let diff_ms = Some((((e.ts - first_period_ts) * 1000.0).round() as i64).max(0));
             rows.push(ListItem::new(render_event_line(
                 app,
                 e,
                 None,
+                index_width,
+                type_col_width,
+                diff_ms,
                 selected,
                 events_inner_width,
                 max_type_count,
@@ -312,6 +364,11 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
             None
         };
         let sub_lc = app.event_filters.substring_filter.to_lowercase();
+        let whitelist_terms = if app.whitelist_highlight_enabled() {
+            app.whitelist_terms()
+        } else {
+            &[]
+        };
         let rendered = render_json_keypicker(
             &sel.obj,
             selected_path,
@@ -319,6 +376,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
             false,
             &app.event_filters.key_filter,
             &sub_lc,
+            whitelist_terms,
             considered_paths,
         );
         let scroll = selected_json_scroll(rendered.selected_line, cols[2].height);
@@ -374,6 +432,8 @@ fn types_list_title(row: usize, total: usize, unfiltered: usize, path_focus: boo
             Span::raw("/"),
             styled_hotkey("t"),
             Span::raw("/"),
+            styled_hotkey("u"),
+            Span::raw("/"),
             styled_hotkey("/"),
         ]);
     }
@@ -385,6 +445,8 @@ fn types_list_title(row: usize, total: usize, unfiltered: usize, path_focus: boo
             Span::raw(" details, "),
             styled_hotkey("t"),
             Span::raw(" filter, "),
+            styled_hotkey("u"),
+            Span::raw(" exclude, "),
             styled_hotkey("/"),
             Span::raw(" search"),
         ]);
@@ -396,6 +458,8 @@ fn types_list_title(row: usize, total: usize, unfiltered: usize, path_focus: boo
         Span::raw(" details, "),
         styled_hotkey("t"),
         Span::raw(" filter, "),
+        styled_hotkey("u"),
+        Span::raw(" toggle !type, "),
         styled_hotkey("/"),
         Span::raw(" search, by count"),
     ])
@@ -470,6 +534,8 @@ fn type_details_title(app: &App, pane_width: u16) -> Line<'static> {
                 styled_hotkey("t"),
                 Span::raw(", "),
                 styled_hotkey("u"),
+                Span::raw(", "),
+                styled_hotkey("j"),
                 Span::raw(")"),
             ]);
         }
@@ -478,7 +544,9 @@ fn type_details_title(app: &App, pane_width: u16) -> Line<'static> {
             styled_hotkey("t"),
             Span::raw(" filter to live, "),
             styled_hotkey("u"),
-            Span::raw(" toggle unrelated)"),
+            Span::raw(" toggle !type filter, "),
+            styled_hotkey("j"),
+            Span::raw(" preview sample)"),
         ]);
     }
     let narrow = pane_width < 64;
@@ -490,6 +558,8 @@ fn type_details_title(app: &App, pane_width: u16) -> Line<'static> {
             styled_hotkey("t"),
             Span::raw(", "),
             styled_hotkey("u"),
+            Span::raw(", "),
+            styled_hotkey("j"),
             Span::raw(")"),
         ])
     } else {
@@ -500,7 +570,9 @@ fn type_details_title(app: &App, pane_width: u16) -> Line<'static> {
             styled_hotkey("t"),
             Span::raw(" filter to live, "),
             styled_hotkey("u"),
-            Span::raw(" toggle unrelated)"),
+            Span::raw(" toggle !type filter, "),
+            styled_hotkey("j"),
+            Span::raw(" preview sample)"),
         ])
     }
 }
@@ -540,21 +612,25 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .enumerate()
     {
         let idx = type_start + vis_idx;
+        let excluded = app.type_excluded_by_type_filter(type_id);
         let mut style = Style::default();
         if idx == app.type_index {
             style = if app.types_path_focus {
                 style.fg(Color::Gray)
-            } else if tp.known_unrelated {
-                style.fg(Color::Yellow).add_modifier(Modifier::DIM)
+            } else if excluded {
+                style
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD | Modifier::DIM)
             } else {
                 style.fg(Color::Yellow).add_modifier(Modifier::BOLD)
             };
-        } else if tp.known_unrelated {
-            style = style.fg(Color::DarkGray);
+        } else if excluded {
+            style = style.fg(Color::Gray).add_modifier(Modifier::DIM);
         }
-        let name = app.model.type_display_name(type_id);
+        let name = app.model.canonical_type_name(type_id);
+        let marker = if excluded { "[-] " } else { "    " };
         type_items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!("{}  count={}", name, tp.count),
+            format!("{}{}  count={}", marker, name, tp.count),
             style,
         )])));
     }
@@ -574,11 +650,15 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines = Vec::new();
     if let Some((type_id, tp)) = visible.get(selected_type) {
         lines.push(Line::from(Span::styled(
-            app.model.type_display_name(type_id),
+            app.model.canonical_type_name(type_id),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
+        lines.push(Line::from(vec![
+            Span::styled("id: ", Style::default().fg(Color::Gray)),
+            Span::styled((*type_id).to_string(), Style::default().fg(Color::DarkGray)),
+        ]));
         lines.push(Line::from(""));
 
         let total_paths = tp.considered_paths.len();
@@ -587,7 +667,7 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             app.path_index.min(total_paths.saturating_sub(1))
         };
-        let path_window = (cols[1].height as usize).saturating_sub(15).max(1);
+        let path_window = (cols[1].height as usize).saturating_sub(6).max(1);
         let path_start = if total_paths <= path_window {
             0
         } else {
@@ -641,10 +721,10 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
 
         lines.push(Line::from(""));
-        let ex = serde_json::to_string_pretty(&tp.example).unwrap_or_else(|_| "{}".to_string());
-        for l in ex.lines().take(12) {
-            lines.push(Line::from(l.to_string()));
-        }
+        lines.push(Line::from(Span::styled(
+            "Press j to preview first-seen JSON sample",
+            Style::default().fg(Color::Gray),
+        )));
     }
 
     frame.render_widget(
@@ -660,64 +740,130 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f64) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+
     let rows = app.visible_baseline_events();
-    let start = app.data_index.min(rows.len().saturating_sub(1));
-    // 2 border rows + 2 header lines; remaining rows are for events
-    let max_event_rows = (area.height as usize).saturating_sub(4);
-    let slice = rows.into_iter().skip(start).take(max_event_rows);
-
-    let mut lines = Vec::new();
-    let type_filter_display = app
-        .model
-        .display_type_filter_value(&app.event_filters.type_filter);
-    lines.push(Line::from(vec![
-        Span::styled("k:", Style::default().fg(Color::Yellow)),
-        Span::raw(format!("{}  ", app.event_filters.key_filter)),
-        Span::styled("t:", Style::default().fg(Color::Yellow)),
-        Span::raw(format!("{}  ", type_filter_display)),
-        Span::styled("/:", Style::default().fg(Color::Yellow)),
-        Span::raw(format!("{}  ", app.event_filters.substring_filter)),
-        Span::styled("z:", Style::default().fg(Color::Yellow)),
-        Span::raw(format!("{}  ", app.event_filters.fuzzy_filter)),
-        Span::styled("e:", Style::default().fg(Color::Yellow)),
-        Span::raw(app.event_filters.exact_filter.clone()),
-    ]));
-    lines.push(Line::from(""));
-
-    let data_inner_width = area.width.saturating_sub(2) as usize;
-    for (idx, e) in slice.enumerate() {
-        // start = data_index, so the first visible row (idx == 0) is the selected event
-        let selected = idx == 0;
-        lines.push(render_event_line(
+    let total = rows.len();
+    let selected = if total == 0 {
+        0
+    } else {
+        app.data_index.min(total.saturating_sub(1))
+    };
+    let window = cols[0].height.saturating_sub(2) as usize;
+    let start = if total <= window {
+        0
+    } else {
+        let half = window / 2;
+        selected
+            .saturating_sub(half)
+            .min(total.saturating_sub(window))
+    };
+    let index_width = total.max(1).to_string().len().max(3);
+    let type_col_width = rows
+        .iter()
+        .map(|e| app.model.canonical_type_name(&e.type_id).chars().count() + 2)
+        .max()
+        .unwrap_or(16)
+        .clamp(12, 36);
+    let first_baseline_ts = rows.last().map(|e| e.ts).unwrap_or(0.0);
+    let mut items = Vec::new();
+    let list_inner_width = cols[0].width.saturating_sub(2) as usize;
+    for (vis_idx, e) in rows.iter().skip(start).take(window).enumerate() {
+        let row = start + vis_idx + 1;
+        let is_selected = row - 1 == selected;
+        let diff_ms = Some((((e.ts - first_baseline_ts) * 1000.0).round() as i64).max(0));
+        items.push(ListItem::new(render_event_line(
             app,
             e,
-            None,
-            selected,
-            data_inner_width,
+            Some(row),
+            index_width,
+            type_col_width,
+            diff_ms,
+            is_selected,
+            list_inner_width,
             max_type_count,
-        ));
+        )));
     }
-
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: true })
+        List::new(items).block(
+            Block::default()
+                .title(format!(
+                    "Baseline  row {}/{}",
+                    selected.saturating_add(1),
+                    total
+                ))
+                .borders(Borders::ALL),
+        ),
+        cols[0],
+    );
+
+    let (preview_text, preview_scroll) = if let Some(sel) = rows.get(selected) {
+        let mut lines = vec![Line::from(Span::styled(
+            app.model.type_display_name(&sel.type_id),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))];
+        lines.push(Line::from(""));
+        let considered_paths = app
+            .model
+            .types
+            .get(&sel.type_id)
+            .map(|tp| &tp.considered_paths);
+        let sub_lc = app.event_filters.substring_filter.to_lowercase();
+        let whitelist_terms = if app.whitelist_highlight_enabled() {
+            app.whitelist_terms()
+        } else {
+            &[]
+        };
+        let rendered = render_json_keypicker(
+            &sel.obj,
+            None,
+            false,
+            false,
+            &app.event_filters.key_filter,
+            &sub_lc,
+            whitelist_terms,
+            considered_paths,
+        );
+        let scroll = selected_json_scroll(rendered.selected_line, cols[1].height);
+        lines.extend(rendered.lines);
+        (Text::from(lines), scroll)
+    } else {
+        (Text::from("No baseline event selected"), 0)
+    };
+    frame.render_widget(
+        Paragraph::new(preview_text)
+            .scroll((preview_scroll, 0))
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
-                    .title("Baseline Explorer")
+                    .title("selected JSON")
                     .borders(Borders::ALL),
             ),
-        area,
+        cols[1],
     );
 }
 
-fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App, modal_open: bool) {
     let mut text = Vec::new();
     let inner_width = area.width.saturating_sub(2) as usize;
-    if app.input_mode != InputMode::None {
+    if modal_open {
+        // Suppress status/hint lines while a blocking confirmation modal is shown.
+    } else if app.input_mode != InputMode::None {
         let title = match app.input_mode {
             InputMode::None => "",
             InputMode::Label => "set label",
-            InputMode::EventFilter(field) => field.title(),
+            InputMode::EventFilter(field) => match field {
+                FilterField::Key => "keys (expr: a && !b, a || b)",
+                FilterField::Type => "type (expr: login && !debug)",
+                FilterField::Fuzzy => "fuzzy (expr: abc && !xyz)",
+                FilterField::Exact => "exact key=value (expr supported)",
+                FilterField::Substring => "substring (expr: foo && !bar)",
+            },
             InputMode::TypesFilter => "type list filter",
             InputMode::RenameType => "rename type",
             InputMode::InsertPeriodRange => {
@@ -726,6 +872,8 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             InputMode::EditPeriodRange => {
                 "edit period in format <row_start>-<row_end> (e.g. 234-268)"
             }
+            InputMode::ExportSessionPath => "export session path (Enter to write)",
+            InputMode::ExportProfilePath => "export profile path (Enter to write)",
         };
         text.push(Line::from(vec![
             Span::styled(format!("{}: ", title), Style::default().fg(Color::Yellow)),
@@ -740,6 +888,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(Color::LightGreen),
             ),
         ]));
+        text.push(Line::from(""));
     } else if let Some(hint) = app.startup_hint() {
         let max_hint = inner_width.saturating_sub(8).max(16);
         text.push(Line::from(vec![
@@ -749,14 +898,17 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(Color::LightGreen),
             ),
         ]));
+        text.push(Line::from(""));
     } else {
         let mut row = Vec::new();
         let action_on = app.model.active_period().is_some();
         let filters_active = app.event_filters.active_count();
-        let medium = inner_width >= 95;
+        let wide = inner_width >= 130;
+        let medium = inner_width >= 105;
+        let export_state = if medium { "ready" } else { "ok" };
 
         row.push(Span::styled(
-            if medium { "action (m)" } else { "m" },
+            if wide { "action (m)" } else { "m" },
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -773,7 +925,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         row.push(Span::raw("  "));
 
         row.push(Span::styled(
-            if medium { "follow (f)" } else { "f" },
+            if wide { "follow (f)" } else { "f" },
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -790,7 +942,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         row.push(Span::raw("  "));
 
         row.push(Span::styled(
-            if medium { "help (h)" } else { "h" },
+            if wide { "help (h)" } else { "h" },
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -800,7 +952,17 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         row.push(Span::raw("  "));
 
         row.push(Span::styled(
-            if medium { "filters (y)" } else { "y" },
+            if wide { "clear (c)" } else { "c" },
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        row.push(Span::raw(":"));
+        row.push(Span::styled("ready", Style::default().fg(Color::Gray)));
+        row.push(Span::raw("  "));
+
+        row.push(Span::styled(
+            if wide { "filters (y)" } else { "y" },
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -815,26 +977,41 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Color::DarkGray
             }),
         ));
+        row.push(Span::raw("  "));
+        row.push(Span::styled(
+            if wide { "whitelist (w)" } else { "w" },
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        row.push(Span::raw(":"));
+        let w_color = if !app.whitelist_loaded() || app.whitelist_mode_label() == "off" {
+            Color::DarkGray
+        } else {
+            Color::LightGreen
+        };
+        row.push(Span::styled(app.whitelist_mode_label(), Style::default().fg(w_color)));
+        row.push(Span::raw("  "));
+        row.push(Span::styled(
+            if wide { "export session (x)" } else { "x" },
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        row.push(Span::raw(":"));
+        row.push(Span::styled(export_state, Style::default().fg(Color::Gray)));
+        row.push(Span::raw("  "));
+        row.push(Span::styled(
+            if wide { "export profile (p)" } else { "p" },
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        row.push(Span::raw(":"));
+        row.push(Span::styled(export_state, Style::default().fg(Color::Gray)));
 
         text.push(Line::from(row));
     }
-
-    frame.render_widget(
-        Paragraph::new(Text::from(text))
-            .block(Block::default().title("Toggles").borders(Borders::ALL)),
-        area,
-    );
-}
-
-fn display_filter(value: &str) -> String {
-    if value.is_empty() {
-        "off".to_string()
-    } else {
-        truncate_text(value, 20)
-    }
-}
-
-fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let width = area.width.saturating_sub(2) as usize;
     let filters_active = app.event_filters.active_count();
     let show_long_names = width >= 100;
@@ -851,18 +1028,6 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let substring = display_filter(&app.event_filters.substring_filter);
     let fuzzy = display_filter(&app.event_filters.fuzzy_filter);
     let exact = display_filter(&app.event_filters.exact_filter);
-    let unrelated_count = app
-        .model
-        .types
-        .values()
-        .filter(|tp| tp.known_unrelated)
-        .count();
-    let unrelated = if unrelated_count == 0 {
-        "off".to_string()
-    } else {
-        format!("{}", unrelated_count)
-    };
-
     let mut row = vec![Span::raw(" ")];
     let mut push_value = |label: &str, value: String, active: bool, idx: usize| {
         if idx > 0 {
@@ -885,9 +1050,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let labels = if show_long_names {
-        ["k/key", "t/type", "//sub", "z/fuzzy", "e/exact", "u/unrelated"]
+        ["k/key", "t/type", "//sub", "z/fuzzy", "e/exact"]
     } else {
-        ["k", "t", "/", "z", "e", "u"]
+        ["k", "t", "/", "z", "e"]
     };
     push_value(labels[0], key, !app.event_filters.key_filter.is_empty(), 0);
     push_value(labels[1], typ, !app.event_filters.type_filter.is_empty(), 1);
@@ -909,7 +1074,6 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         !app.event_filters.exact_filter.is_empty(),
         4,
     );
-    push_value(labels[5], unrelated, unrelated_count > 0, 5);
     row.push(Span::raw("  "));
     row.push(Span::styled("state:", Style::default().fg(Color::Gray)));
     if app.filters_suspended() {
@@ -927,16 +1091,25 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }),
         ));
     }
-    row.push(Span::raw("  "));
+    let sep = "─".repeat(width.max(1));
+    text.push(Line::from(sep));
+    text.push(Line::from(row));
 
     frame.render_widget(
-        Paragraph::new(Text::from(vec![Line::from(row)]))
-            .block(Block::default().title("Filters").borders(Borders::ALL)),
+        Paragraph::new(Text::from(text)).block(Block::default().title("Controls").borders(Borders::ALL)),
         area,
     );
 }
 
-fn draw_full_help(frame: &mut Frame<'_>) {
+fn display_filter(value: &str) -> String {
+    if value.is_empty() {
+        "off".to_string()
+    } else {
+        truncate_text(value, 20)
+    }
+}
+
+fn draw_full_help(frame: &mut Frame<'_>, app: &App) {
     let popup = centered_rect(88, 88, frame.area());
     frame.render_widget(Clear, popup);
     let rows = Layout::default()
@@ -964,7 +1137,12 @@ fn draw_full_help(frame: &mut Frame<'_>) {
 
     let body = vec![
         Line::from("Global"),
-        Line::from("  q quit (press twice) | h/? help | 1 Live | 2 Periods | 3 Types | 4 Baseline"),
+        Line::from(if app.baseline_tab_enabled() {
+            "  q quit (press twice) | h/? help | 1 Live | 2 Periods | 3 Types | 4 Baseline"
+        } else {
+            "  q quit (press twice) | h/? help | 1 Live | 2 Periods | 3 Types"
+        }),
+        Line::from("  x export session now | p export profile now"),
         Line::from(""),
         Line::from("Live"),
         Line::from("  m toggle action period"),
@@ -975,7 +1153,9 @@ fn draw_full_help(frame: &mut Frame<'_>) {
         Line::from("  Home/End jump to top/bottom"),
         Line::from("  PageUp/PageDown move viewport and cursor (Ctrl+U / Ctrl+D also)"),
         Line::from("  with key focus: up/down select key, k apply key filter, t jump to type"),
-        Line::from("  k/t///z/e set filters (/ substring, z fuzzy), c clear filters, y toggle filters on/off"),
+        Line::from("  k/t///z/e set filters (/ substring, z fuzzy), c clear filters, y suspend/restore filters, w cycle whitelist"),
+        Line::from("  filter expression syntax: AND with &&, OR with ||, negate with !"),
+        Line::from("  examples: type 'login && !debug' | exact 'user=alice && !event=logout'"),
         Line::from(""),
         Line::from("Periods"),
         Line::from("  3 panes: periods | events | selected JSON"),
@@ -988,13 +1168,14 @@ fn draw_full_help(frame: &mut Frame<'_>) {
         Line::from("  t apply selected type as event filter and jump to Live"),
         Line::from("  after t: esc returns to Types"),
         Line::from("  r rename selected type"),
+        Line::from("  j popup preview of first-seen sample object"),
         Line::from("  enter/right focus paths, left return to type list"),
         Line::from("  with path focus: up/down choose path, space toggle include/exclude"),
-        Line::from("  u mark type known unrelated"),
+        Line::from("  u toggle selected type in negative type filter (!\"type name\")"),
         Line::from(""),
         Line::from("Baseline"),
         Line::from("  up/down scroll | enter inspect"),
-        Line::from("  k keys filter, t type filter, / substring filter, z fuzzy filter, e exact path=value"),
+        Line::from("  k keys filter, t type filter, / substring filter, z fuzzy filter, e exact path=value, w whitelist"),
     ];
     frame.render_widget(
         Paragraph::new(Text::from(body))
@@ -1040,6 +1221,11 @@ fn draw_inspector(frame: &mut Frame<'_>, inspector: &ObjectInspector, app: &App)
 
     let selected_path = inspector.key_paths.get(inspector.key_index);
     let sub_lc = app.event_filters.substring_filter.to_lowercase();
+    let whitelist_terms = if app.whitelist_highlight_enabled() {
+        app.whitelist_terms()
+    } else {
+        &[]
+    };
     let rendered = render_json_keypicker(
         &inspector.event.obj,
         selected_path,
@@ -1047,6 +1233,7 @@ fn draw_inspector(frame: &mut Frame<'_>, inspector: &ObjectInspector, app: &App)
         false,
         &app.event_filters.key_filter,
         &sub_lc,
+        whitelist_terms,
         app.model
             .types
             .get(&inspector.event.type_id)
@@ -1062,6 +1249,41 @@ fn draw_inspector(frame: &mut Frame<'_>, inspector: &ObjectInspector, app: &App)
     );
 }
 
+fn draw_type_preview_modal(frame: &mut Frame<'_>, app: &App) {
+    let popup = centered_rect(78, 82, frame.area());
+    frame.render_widget(Clear, popup);
+    let visible = app.visible_types();
+    let selected_idx = app.type_index.min(visible.len().saturating_sub(1));
+    let selected = visible.get(selected_idx).and_then(|type_id| {
+        app.model
+            .types
+            .get(type_id)
+            .map(|tp| (type_id.as_str(), tp.example.clone()))
+    });
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some((type_id, sample)) = selected {
+        lines.push(Line::from(Span::styled(
+            app.model.canonical_type_name(type_id),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        let rendered = render_json_keypicker(&sample, None, false, false, "", "", &[], None);
+        lines.extend(rendered.lines);
+    } else {
+        lines.push(Line::from("No type selected"));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("Type Sample Preview (j/Esc to close)")
+                    .borders(Borders::ALL),
+            ),
+        popup,
+    );
+}
+
 fn render_json_keypicker(
     value: &serde_json::Value,
     selected_path: Option<&String>,
@@ -1069,6 +1291,7 @@ fn render_json_keypicker(
     value_focus: bool,
     active_key_filter: &str,
     substring_filter: &str,
+    whitelist_terms: &[String],
     considered_paths: Option<&IndexMap<String, bool>>,
 ) -> JsonRender {
     let mut lines = Vec::new();
@@ -1082,6 +1305,7 @@ fn render_json_keypicker(
         value_focus,
         active_key_filter,
         substring_filter,
+        whitelist_terms,
         considered_paths,
         &mut lines,
         &mut selected_line,
@@ -1101,6 +1325,7 @@ fn render_json_value_lines(
     value_focus: bool,
     active_key_filter: &str,
     substring_filter: &str,
+    whitelist_terms: &[String],
     considered_paths: Option<&IndexMap<String, bool>>,
     out: &mut Vec<Line<'static>>,
     selected_line: &mut Option<usize>,
@@ -1126,6 +1351,7 @@ fn render_json_value_lines(
                     value_focus,
                     active_key_filter,
                     substring_filter,
+                    whitelist_terms,
                     considered_paths,
                     out,
                     selected_line,
@@ -1153,6 +1379,7 @@ fn render_json_value_lines(
                     value_focus,
                     active_key_filter,
                     substring_filter,
+                    whitelist_terms,
                     considered_paths,
                     out,
                     selected_line,
@@ -1166,16 +1393,21 @@ fn render_json_value_lines(
             let tail = if is_last { "" } else { "," };
             let highlight = !substring_filter.is_empty()
                 && value_text.to_lowercase().contains(substring_filter);
-            let val_style = if highlight {
-                Style::default().fg(Color::Black).bg(Color::Yellow)
+            let wl_highlight = matches_any_term(&value_text.to_lowercase(), whitelist_terms);
+            let base = json_value_style(value);
+            let mut line = vec![Span::raw("  ".repeat(indent))];
+            if highlight || wl_highlight {
+                line.extend(highlight_text_spans(
+                    &value_text,
+                    substring_filter,
+                    whitelist_terms,
+                    base,
+                ));
             } else {
-                json_value_style(value)
-            };
-            out.push(Line::from(vec![
-                Span::raw("  ".repeat(indent)),
-                Span::styled(value_text, val_style),
-                Span::styled(tail, json_punctuation_style()),
-            ]));
+                line.push(Span::styled(value_text, base));
+            }
+            line.push(Span::styled(tail, json_punctuation_style()));
+            out.push(Line::from(line));
         }
     }
 }
@@ -1234,6 +1466,7 @@ fn render_json_keyed_value_line(
     value_focus: bool,
     active_key_filter: &str,
     substring_filter: &str,
+    whitelist_terms: &[String],
     considered_paths: Option<&IndexMap<String, bool>>,
     out: &mut Vec<Line<'static>>,
     selected_line: &mut Option<usize>,
@@ -1243,6 +1476,9 @@ fn render_json_keyed_value_line(
     let normalized_out = is_path_normalized_out(considered_paths, path);
     let key_highlight = !substring_filter.is_empty()
         && key.map(|k| k.to_lowercase().contains(substring_filter)).unwrap_or(false);
+    let key_whitelist_highlight = key
+        .map(|k| matches_any_term(&k.to_lowercase(), whitelist_terms))
+        .unwrap_or(false);
     let key_override = if selected {
         Style::default()
             .fg(Color::Yellow)
@@ -1268,14 +1504,21 @@ fn render_json_keyed_value_line(
 
     let mut prefix = vec![Span::raw("  ".repeat(indent))];
     if let Some(k) = key {
-        let key_style = if selected || filtered {
-            key_override
-        } else if key_highlight {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
+        let key_base = apply_normalized_out_style(json_key_base_style(), normalized_out);
+        if selected || filtered {
+            prefix.push(Span::styled(format!("\"{k}\""), key_override));
+        } else if key_highlight || key_whitelist_highlight {
+            prefix.push(Span::raw("\""));
+            prefix.extend(highlight_text_spans(
+                k,
+                substring_filter,
+                whitelist_terms,
+                key_base,
+            ));
+            prefix.push(Span::raw("\""));
         } else {
-            apply_normalized_out_style(json_key_base_style(), normalized_out)
-        };
-        prefix.push(Span::styled(format!("\"{k}\""), key_style));
+            prefix.push(Span::styled(format!("\"{k}\""), key_base));
+        }
         prefix.push(Span::styled(
             ": ",
             apply_normalized_out_style(json_punctuation_style(), normalized_out),
@@ -1302,6 +1545,7 @@ fn render_json_keyed_value_line(
                     value_focus,
                     active_key_filter,
                     substring_filter,
+                    whitelist_terms,
                     considered_paths,
                     out,
                     selected_line,
@@ -1326,6 +1570,7 @@ fn render_json_keyed_value_line(
                     value_focus,
                     active_key_filter,
                     substring_filter,
+                    whitelist_terms,
                     considered_paths,
                     out,
                     selected_line,
@@ -1341,21 +1586,36 @@ fn render_json_keyed_value_line(
             let value_text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
             let value_highlight = !substring_filter.is_empty()
                 && value_text.to_lowercase().contains(substring_filter);
+            let value_whitelist_highlight =
+                matches_any_term(&value_text.to_lowercase(), whitelist_terms);
+            let base_value_style = apply_normalized_out_style(
+                if filtered {
+                    Style::default().fg(Color::LightGreen)
+                } else {
+                    json_value_style(value)
+                },
+                normalized_out,
+            );
             let value_override = if selected && value_focus {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else if selected {
                 Style::default().fg(Color::Yellow)
-            } else if value_highlight {
-                Style::default().fg(Color::Black).bg(Color::Yellow)
-            } else if filtered {
-                Style::default().fg(Color::LightGreen)
             } else {
-                json_value_style(value)
+                base_value_style
             };
             let value_override = apply_normalized_out_style(value_override, normalized_out);
-            line.push(Span::styled(value_text, value_override));
+            if !selected && !filtered && (value_highlight || value_whitelist_highlight) {
+                line.extend(highlight_text_spans(
+                    &value_text,
+                    substring_filter,
+                    whitelist_terms,
+                    base_value_style,
+                ));
+            } else {
+                line.push(Span::styled(value_text, value_override));
+            }
             if !is_last {
                 line.push(Span::styled(
                     ",",
@@ -1365,6 +1625,64 @@ fn render_json_keyed_value_line(
             out.push(Line::from(line));
         }
     }
+}
+
+fn matches_any_term(text_lc: &str, terms: &[String]) -> bool {
+    terms.iter().any(|needle| text_lc.contains(needle))
+}
+
+fn highlight_text_spans(
+    text: &str,
+    substring_filter: &str,
+    whitelist_terms: &[String],
+    base_style: Style,
+) -> Vec<Span<'static>> {
+    if !text.is_ascii() {
+        return vec![Span::styled(text.to_string(), base_style)];
+    }
+    let lower = text.to_ascii_lowercase();
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    while i < text.len() {
+        let mut best: Option<(usize, usize, Style)> = None;
+        if !substring_filter.is_empty() {
+            if let Some(pos) = lower[i..].find(substring_filter) {
+                let start = i + pos;
+                let end = start + substring_filter.len();
+                best = Some((start, end, Style::default().fg(Color::Black).bg(Color::Yellow)));
+            }
+        }
+        for needle in whitelist_terms {
+            if needle.is_empty() {
+                continue;
+            }
+            if let Some(pos) = lower[i..].find(needle) {
+                let start = i + pos;
+                let end = start + needle.len();
+                let candidate = (start, end, Style::default().fg(Color::Black).bg(Color::Rgb(255, 140, 0)));
+                best = match best {
+                    None => Some(candidate),
+                    Some(cur) => {
+                        if candidate.0 < cur.0 {
+                            Some(candidate)
+                        } else {
+                            Some(cur)
+                        }
+                    }
+                };
+            }
+        }
+        let Some((start, end, hl_style)) = best else {
+            spans.push(Span::styled(text[i..].to_string(), base_style));
+            break;
+        };
+        if start > i {
+            spans.push(Span::styled(text[i..start].to_string(), base_style));
+        }
+        spans.push(Span::styled(text[start..end].to_string(), hl_style));
+        i = end;
+    }
+    spans
 }
 
 fn selected_json_scroll(selected_line: Option<usize>, pane_height: u16) -> u16 {
@@ -1418,12 +1736,14 @@ fn render_event_line(
     app: &App,
     e: &EventRecord,
     row_index: Option<usize>,
+    index_width: usize,
+    type_col_width: usize,
+    diff_ms: Option<i64>,
     selected: bool,
     row_width: usize,
     max_type_count: f64,
 ) -> Line<'static> {
-    let name = app.model.type_display_name(&e.type_id);
-    let ts = format!("{:.3}", e.ts);
+    let name = app.model.canonical_type_name(&e.type_id);
     let type_count = app
         .model
         .types
@@ -1434,13 +1754,27 @@ fn render_event_line(
     if selected {
         style = style.add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
     }
+    let whitelist_hit = app.whitelist_highlight_enabled() && app.whitelist_matches_event(e);
     let action_marker = if e.in_action_period {
         Span::styled("  ", Style::default().bg(Color::Red))
     } else {
         Span::raw("  ")
     };
     let sel = if selected { "->" } else { "  " };
-    let name_style = style;
+    let name_style = if whitelist_hit {
+        style
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        style
+    };
+    let row_label = row_index
+        .map(|idx| format!("{:>width$}", idx, width = index_width))
+        .unwrap_or_else(|| " ".repeat(index_width));
+    let diff_label = diff_ms
+        .map(|ms| format!("+{}ms", ms.max(0)))
+        .unwrap_or_else(|| "+0ms".to_string());
+    let type_block = format!("[{}]", name);
     // Build the metrics block text first so tail_len comes from the actual rendered string,
     // not from manually summed constants that can drift out of sync with the spans below.
     let metrics = if e.in_action_period {
@@ -1456,14 +1790,25 @@ fn render_event_line(
         .map(|(_, _, rendered)| rendered.chars().count())
         .unwrap_or(0);
 
-    let row_label = row_index
-        .map(|idx| format!("#{} ", idx))
-        .unwrap_or_default();
     let size_str = format_size_bytes(e.size_bytes);
-    let fixed_prefix = 2 + 1 + 3 + row_label.chars().count() + ts.chars().count() + 1 + size_str.chars().count() + 1;
-    let name_budget = row_width.saturating_sub(fixed_prefix + tail_len).max(4);
-    let short_name = truncate_text(&name, name_budget);
-    let line_len = fixed_prefix + short_name.chars().count() + tail_len;
+    let fixed_prefix = 2
+        + 1
+        + 3
+        + row_label.chars().count()
+        + 1
+        + type_col_width
+        + 1
+        + size_str.chars().count()
+        + 1
+        + diff_label.chars().count()
+        + 1;
+    let short_name = truncate_text(&type_block, type_col_width.max(4));
+    let type_cell = if short_name.chars().count() < type_col_width {
+        format!("{:<width$}", short_name, width = type_col_width)
+    } else {
+        short_name
+    };
+    let line_len = fixed_prefix + tail_len;
     let spacer_len = row_width.saturating_sub(line_len);
     let spacer = " ".repeat(spacer_len);
 
@@ -1472,11 +1817,12 @@ fn render_event_line(
         Span::raw(" "),
         Span::raw(format!("{} ", sel)),
         Span::styled(row_label, Style::default().fg(Color::Gray)),
-        Span::styled(ts, style),
+        Span::raw(" "),
+        Span::styled(type_cell, name_style),
         Span::raw(" "),
         Span::styled(size_str, style),
         Span::raw(" "),
-        Span::styled(short_name, name_style),
+        Span::styled(diff_label, Style::default().fg(Color::Gray)),
     ];
     if let Some((rate_str, value_str, _)) = metrics {
         let rate_color = rate_anomaly_color(anomaly_norm(e.live_rate_score));
@@ -1572,4 +1918,67 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn draw_confirmation_modal(frame: &mut Frame<'_>, confirm: &ModalConfirmation) {
+    let popup = centered_rect(74, 30, frame.area());
+    frame.render_widget(Clear, popup);
+    let mut lines = vec![Line::from(Span::styled(
+        confirm.title.clone(),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    lines.push(Line::from(""));
+    lines.extend(confirm.lines.iter().map(|s| stylize_modal_line(s)));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title("Confirmation")),
+        popup,
+    );
+}
+
+fn stylize_modal_line(s: &str) -> Line<'static> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    let hotkeys = [("Esc", "Esc"), (" y ", "y"), (" n ", "n"), (" y", "y"), (" n", "n"), ("y ", "y"), ("n ", "n")];
+    while !rest.is_empty() {
+        let mut best: Option<(usize, usize, &str)> = None;
+        for (needle, label) in hotkeys {
+            if let Some(pos) = rest.find(needle) {
+                let end = pos + needle.len();
+                best = match best {
+                    None => Some((pos, end, label)),
+                    Some(cur) => {
+                        if pos < cur.0 {
+                            Some((pos, end, label))
+                        } else {
+                            Some(cur)
+                        }
+                    }
+                };
+            }
+        }
+        let Some((start, end, label)) = best else {
+            out.push(Span::raw(rest.to_string()));
+            break;
+        };
+        if start > 0 {
+            out.push(Span::raw(rest[..start].to_string()));
+        }
+        let token = if label == "Esc" {
+            "Esc".to_string()
+        } else {
+            label.to_string()
+        };
+        out.push(Span::styled(
+            token,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        rest = &rest[end..];
+    }
+    Line::from(out)
 }
