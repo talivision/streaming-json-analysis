@@ -158,6 +158,7 @@ impl App {
         baseline_path: Option<PathBuf>,
         offline: bool,
         show_status_debug: bool,
+        reset_state: bool,
     ) -> Self {
         let baseline_enabled = baseline_path.is_some();
         let initial_load_target_bytes = fs::metadata(&stream_path)
@@ -233,7 +234,9 @@ impl App {
             user_toggled_paths: HashSet::new(),
             type_preview_open: false,
         };
-        app.restore_persisted_state();
+        if !reset_state {
+            app.restore_persisted_state();
+        }
         app.update_loading_status();
         if app.loading_locked() {
             app.startup_hint = None;
@@ -448,14 +451,29 @@ impl App {
         session: SessionExport,
         profile_override: Option<SourceProfile>,
     ) -> Result<()> {
+        let SessionExport {
+            stream_path: _,
+            periods,
+            renames,
+            known_unrelated_types,
+            normalized_field_overrides,
+            current_label,
+            event_filters,
+            stashed_event_filters,
+            types_filter,
+            profile: session_profile,
+            events,
+            baseline_events,
+        } = session;
         self.offline = true;
         self.offline_loaded = true;
         self.initial_load_complete = true;
         self.baseline_loaded = true;
+        self.pending_restore = None;
 
         self.model = AnalyzerModel::new();
         self.baseline_events.clear();
-        for ev in &session.baseline_events {
+        for ev in &baseline_events {
             let prepared = prepare_event(ev.obj.clone());
             let obj_size = prepared.obj.to_string().len() as u32;
             self.model.ingest_baseline_prepared(&prepared, ev.ts);
@@ -471,35 +489,43 @@ impl App {
                 live_uniq_score: 0.0,
             });
         }
-        for ev in &session.events {
+        for ev in &events {
             self.model.ingest(ev.obj.clone(), ev.ts);
         }
 
-        self.model.set_periods(session.periods);
-        if !session.renames.is_empty() {
-            self.model.apply_renames(&session.renames);
+        self.model.set_periods(periods);
+        if !renames.is_empty() {
+            self.model.apply_renames(&renames);
         }
-        if !session.normalized_field_overrides.is_empty() {
+        if !normalized_field_overrides.is_empty() {
             self.model.apply_normalized_field_overrides(
-                &session
-                    .normalized_field_overrides
+                &normalized_field_overrides
                     .iter()
                     .map(|r| (r.type_id.clone(), r.path.clone(), r.mode))
                     .collect::<Vec<_>>(),
             );
         }
-        for type_id in session.known_unrelated_types {
+        for type_id in known_unrelated_types {
             if let Some(tp) = self.model.types.get_mut(&type_id) {
                 tp.known_unrelated = true;
             }
         }
         self.apply_profile_overrides_to_types();
-        self.model.current_label = session.current_label;
-        self.event_filters = session.event_filters;
-        self.stashed_event_filters = session.stashed_event_filters;
-        self.types_filter = session.types_filter;
-        if let Some(profile) = profile_override.or(session.profile) {
-            self.apply_profile(profile, true);
+        self.model.current_label = current_label;
+        self.event_filters = event_filters;
+        self.stashed_event_filters = stashed_event_filters;
+        self.types_filter = types_filter;
+        match (profile_override, session_profile) {
+            (Some(override_profile), Some(bundled_profile)) => {
+                if profile_fingerprint(&override_profile) == profile_fingerprint(&bundled_profile) {
+                    self.apply_profile(override_profile, false);
+                } else {
+                    self.apply_profile(override_profile, true);
+                }
+            }
+            (Some(override_profile), None) => self.apply_profile(override_profile, true),
+            (None, Some(bundled_profile)) => self.apply_profile(bundled_profile, false),
+            (None, None) => {}
         }
         self.baseline_tab_enabled = !self.baseline_events.is_empty();
         self.pending_live_recompute = true;
@@ -3347,6 +3373,7 @@ mod tests {
             None,
             false,
             false,
+            false,
         );
         app.offline = false;
         let err = app
@@ -3372,6 +3399,7 @@ mod tests {
         App::new(
             std::path::PathBuf::from("/tmp/test_app.jsonl"),
             None,
+            false,
             false,
             false,
         )

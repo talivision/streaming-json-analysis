@@ -39,6 +39,10 @@ struct Args {
     /// show internal status line details continuously
     #[argh(switch)]
     debug_status: bool,
+
+    /// start without loading persisted state from disk
+    #[argh(switch)]
+    reset: bool,
 }
 
 fn main() -> Result<()> {
@@ -52,7 +56,8 @@ fn main() -> Result<()> {
         }
         let session = import_session(import_path)?;
         let stream_path = PathBuf::from(&session.stream_path);
-        let mut app = App::new(stream_path, None, true, args.debug_status);
+        // Session import is self-contained; do not load persisted local state.
+        let mut app = App::new(stream_path, None, true, args.debug_status, true);
         if let Some(whitelist_path) = args.whitelist.as_ref() {
             let terms = read_whitelist_terms(whitelist_path)?;
             app.add_whitelist_terms(terms);
@@ -72,7 +77,13 @@ fn main() -> Result<()> {
         (None, None) => bail!("a path is required: provide <path> or --jsonl <path>"),
     };
 
-    let mut app = App::new(jsonl_path, args.baseline, args.offline, args.debug_status);
+    let mut app = App::new(
+        jsonl_path,
+        args.baseline,
+        args.offline,
+        args.debug_status,
+        args.reset,
+    );
     if let Some(whitelist_path) = args.whitelist.as_ref() {
         let terms = read_whitelist_terms(whitelist_path)?;
         app.add_whitelist_terms(terms);
