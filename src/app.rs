@@ -3,7 +3,10 @@ use crate::domain::{
     EventRecord, FilterField, PreparedEvent,
 };
 use crate::io::StreamReader;
-use crate::persistence::{invalidate_state, load_state, save_state, RestoredState};
+use crate::persistence::{
+    export_session, invalidate_state, load_state, save_profile, save_state, RestoredState,
+    SessionEvent, SessionExport, SourceProfile, TypePathOverride,
+};
 use crate::tui::{draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
 use crossterm::event::{
@@ -18,11 +21,13 @@ use crossterm::terminal::{
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 use serde_json::Value;
 use std::env;
 use std::fs;
 use std::io::stdout;
 use std::path::PathBuf;
+use std::collections::HashSet;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,6 +53,11 @@ pub struct LiveRenderData<'a> {
     pub total: usize,
 }
 
+pub struct ModalConfirmation {
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeriodsFocus {
     Periods,
@@ -71,6 +81,13 @@ enum NavIntent {
     End,
     Left,
     Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhitelistMode {
+    AlwaysShow,
+    OnlyWhitelist,
+    Off,
 }
 
 pub struct App {
@@ -121,6 +138,18 @@ pub struct App {
     show_status_debug: bool,
     quit_pending_until: Option<Instant>,
     pending_delete_period_id: Option<u64>,
+    pending_profile_override: Option<SourceProfile>,
+    baseline_tab_enabled: bool,
+    export_path: Option<PathBuf>,
+    whitelist_terms: Vec<String>,
+    whitelist_mode: WhitelistMode,
+    profile_renames: Vec<(String, String)>,
+    profile_known_unrelated_types: Vec<String>,
+    profile_manual_path_overrides: Vec<TypePathOverride>,
+    user_renamed_types: HashSet<String>,
+    user_toggled_unrelated_types: HashSet<String>,
+    user_toggled_paths: HashSet<String>,
+    type_preview_open: bool,
 }
 
 impl App {
@@ -130,6 +159,7 @@ impl App {
         offline: bool,
         show_status_debug: bool,
     ) -> Self {
+        let baseline_enabled = baseline_path.is_some();
         let initial_load_target_bytes = fs::metadata(&stream_path)
             .ok()
             .map(|m| m.len())
@@ -190,6 +220,18 @@ impl App {
             show_status_debug,
             quit_pending_until: None,
             pending_delete_period_id: None,
+            pending_profile_override: None,
+            baseline_tab_enabled: baseline_enabled,
+            export_path: None,
+            whitelist_terms: Vec::new(),
+            whitelist_mode: WhitelistMode::Off,
+            profile_renames: Vec::new(),
+            profile_known_unrelated_types: Vec::new(),
+            profile_manual_path_overrides: Vec::new(),
+            user_renamed_types: HashSet::new(),
+            user_toggled_unrelated_types: HashSet::new(),
+            user_toggled_paths: HashSet::new(),
+            type_preview_open: false,
         };
         app.restore_persisted_state();
         app.update_loading_status();
@@ -311,7 +353,164 @@ impl App {
         if let Err(err) = self.persist_state() {
             eprintln!("warning: failed to persist session state: {err}");
         }
+        if let Err(err) = self.export_session_if_configured() {
+            eprintln!("warning: failed to export session: {err}");
+        }
         loop_result
+    }
+
+    pub fn apply_profile(&mut self, profile: SourceProfile, prompt_on_conflict: bool) {
+        let same_profile = self.profile_matches_current_state(&profile);
+        if same_profile {
+            self.status = "Profile matches restored session (no changes)".to_string();
+            return;
+        }
+        if prompt_on_conflict && self.has_nonempty_profile_state() {
+            self.pending_profile_override = Some(profile);
+            self.status = "Apply profile over restored session state? (y/N, whitelist merges additively)".to_string();
+            return;
+        }
+        self.apply_profile_seeded(profile);
+        self.status = "Loaded source profile".to_string();
+    }
+
+    fn apply_profile_seeded(&mut self, profile: SourceProfile) {
+        self.profile_renames = profile.renames.clone();
+        self.profile_known_unrelated_types = profile.known_unrelated_types.clone();
+        self.profile_manual_path_overrides = profile.manual_path_overrides.clone();
+        self.apply_profile_overrides_to_types();
+        self.add_whitelist_terms(profile.whitelist_terms);
+        self.apply_profile_filters(profile.negative_filters);
+    }
+
+    fn apply_profile_forced(&mut self, profile: SourceProfile) {
+        let SourceProfile {
+            renames,
+            known_unrelated_types,
+            manual_path_overrides,
+            negative_filters,
+            whitelist_terms,
+        } = profile;
+        self.profile_renames = renames.clone();
+        self.profile_known_unrelated_types = known_unrelated_types.clone();
+        self.profile_manual_path_overrides = manual_path_overrides.clone();
+        self.user_renamed_types.clear();
+        self.user_toggled_unrelated_types.clear();
+        self.user_toggled_paths.clear();
+
+        if !renames.is_empty() {
+            self.model.apply_renames(&renames);
+        }
+        let unrelated_set: HashSet<String> = known_unrelated_types.into_iter().collect();
+        for (type_id, tp) in self.model.types.iter_mut() {
+            tp.known_unrelated = unrelated_set.contains(type_id);
+        }
+        self.model.apply_manual_path_overrides(
+            &manual_path_overrides
+                .iter()
+                .map(|r| (r.type_id.clone(), r.path.clone(), r.mode))
+                .collect::<Vec<_>>(),
+        );
+
+        self.add_whitelist_terms(whitelist_terms);
+        self.stashed_event_filters = None;
+        self.event_filters = negative_filters;
+        self.mark_live_cache_dirty();
+        self.refresh_live_position();
+    }
+
+    pub fn set_whitelist_terms(&mut self, terms: Vec<String>) {
+        self.whitelist_terms.clear();
+        self.add_whitelist_terms(terms);
+    }
+
+    pub fn add_whitelist_terms(&mut self, terms: Vec<String>) {
+        for t in terms
+            .into_iter()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+        {
+            if !self.whitelist_terms.iter().any(|existing| existing == &t) {
+                self.whitelist_terms.push(t);
+            }
+        }
+        self.whitelist_mode = if self.whitelist_terms.is_empty() {
+            WhitelistMode::Off
+        } else {
+            WhitelistMode::AlwaysShow
+        };
+        self.mark_live_cache_dirty();
+        self.refresh_live_position();
+    }
+
+    pub fn import_session(
+        &mut self,
+        session: SessionExport,
+        profile_override: Option<SourceProfile>,
+    ) -> Result<()> {
+        self.offline = true;
+        self.offline_loaded = true;
+        self.initial_load_complete = true;
+        self.baseline_loaded = true;
+
+        self.model = AnalyzerModel::new();
+        self.baseline_events.clear();
+        for ev in &session.baseline_events {
+            let prepared = prepare_event(ev.obj.clone());
+            let obj_size = prepared.obj.to_string().len() as u32;
+            self.model.ingest_baseline_prepared(&prepared, ev.ts);
+            self.baseline_events.push(EventRecord {
+                ts: ev.ts,
+                type_id: prepared.type_id,
+                obj: prepared.obj,
+                keys: prepared.keys,
+                size_bytes: obj_size,
+                action_period_id: None,
+                in_action_period: false,
+                live_rate_score: 0.0,
+                live_uniq_score: 0.0,
+            });
+        }
+        for ev in &session.events {
+            self.model.ingest(ev.obj.clone(), ev.ts);
+        }
+
+        self.model.set_periods(session.periods);
+        if !session.renames.is_empty() {
+            self.model.apply_renames(&session.renames);
+        }
+        if !session.manual_path_overrides.is_empty() {
+            self.model.apply_manual_path_overrides(
+                &session
+                    .manual_path_overrides
+                    .iter()
+                    .map(|r| (r.type_id.clone(), r.path.clone(), r.mode))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        for type_id in session.known_unrelated_types {
+            if let Some(tp) = self.model.types.get_mut(&type_id) {
+                tp.known_unrelated = true;
+            }
+        }
+        self.apply_profile_overrides_to_types();
+        self.model.current_label = session.current_label;
+        self.event_filters = session.event_filters;
+        self.stashed_event_filters = session.stashed_event_filters;
+        self.types_filter = session.types_filter;
+        if let Some(profile) = profile_override.or(session.profile) {
+            self.apply_profile(profile, true);
+        }
+        self.baseline_tab_enabled = !self.baseline_events.is_empty();
+        self.pending_live_recompute = true;
+        self.mark_live_cache_dirty();
+        self.refresh_live_position();
+        self.status = format!(
+            "Imported session: {} events, {} baseline",
+            self.model.total_objects(),
+            self.baseline_events.len()
+        );
+        Ok(())
     }
 
     fn ingest_new_events(&mut self) -> Result<bool> {
@@ -357,10 +556,12 @@ impl App {
         self.apply_persisted_overrides_if_ready();
 
         if n > 0 {
-            if self.offline && !self.offline_loaded {
-                self.status = self.offline_load_status();
-            } else {
-                self.status = format!("Ingested {} events", n);
+            if self.pending_profile_override.is_none() {
+                if self.offline && !self.offline_loaded {
+                    self.status = self.offline_load_status();
+                } else {
+                    self.status = format!("Ingested {} events", n);
+                }
             }
             if self.mode == UiMode::Live && self.live_follow {
                 self.live_edge_until_center = false;
@@ -381,15 +582,17 @@ impl App {
             }
         } else if self.offline && !self.offline_loaded {
             let progress = self.reader.progress();
-            if progress.total_bytes > 0 && progress.loaded_bytes >= progress.total_bytes {
-                self.status = format!(
-                    "Offline load complete: {} objects",
-                    self.model.total_objects()
-                );
-            } else if self.model.total_objects() == 0 {
-                self.status = "Offline mode: no events found".to_string();
-            } else {
-                self.status = self.offline_load_status();
+            if self.pending_profile_override.is_none() {
+                if progress.total_bytes > 0 && progress.loaded_bytes >= progress.total_bytes {
+                    self.status = format!(
+                        "Offline load complete: {} objects",
+                        self.model.total_objects()
+                    );
+                } else if self.model.total_objects() == 0 {
+                    self.status = "Offline mode: no events found".to_string();
+                } else {
+                    self.status = self.offline_load_status();
+                }
             }
         }
 
@@ -410,7 +613,7 @@ impl App {
             return Ok(());
         };
 
-        let events = reader.poll()?;
+        let events = reader.poll_snapshot_parallel()?;
         let seed_ts = unix_ts();
         let prepared_events: Vec<PreparedEvent> =
             events.into_par_iter().map(prepare_event).collect();
@@ -439,14 +642,19 @@ impl App {
                 live_uniq_score: 0.0,
             });
         }
-
-        self.baseline_loaded = true;
+        self.baseline_tab_enabled = !self.baseline_events.is_empty();
+        let progress = reader.progress();
+        self.baseline_loaded = progress.total_bytes == 0 || progress.loaded_bytes >= progress.total_bytes;
         self.pending_live_recompute = true;
-        self.status = format!(
-            "Baseline loaded: {} events from {}",
-            self.baseline_events.len(),
-            reader.path().display()
-        );
+        if self.baseline_loaded {
+            self.status = format!(
+                "Baseline loaded: {} events from {}",
+                self.baseline_events.len(),
+                reader.path().display()
+            );
+        } else {
+            self.status = self.baseline_load_status();
+        }
         Ok(())
     }
 
@@ -470,9 +678,21 @@ impl App {
         match load_state(self.reader.path()) {
             Ok(Some(saved)) => {
                 let msg = format!(
-                    "Restored session: {} periods, {} renames",
+                    "Restored session: {} periods, {} renames, {} unrelated, filters {}/5{}{}",
                     saved.periods.len(),
-                    saved.renames.len()
+                    saved.renames.len(),
+                    saved.known_unrelated_types.len(),
+                    saved.event_filters.active_count(),
+                    if saved.stashed_event_filters.is_some() {
+                        " (suspended set saved)"
+                    } else {
+                        ""
+                    },
+                    if saved.types_filter.is_empty() {
+                        ""
+                    } else {
+                        ", type list filter set"
+                    },
                 );
                 if !saved.current_label.trim().is_empty() {
                     self.model.current_label = saved.current_label.clone();
@@ -500,11 +720,61 @@ impl App {
 
     fn apply_persisted_overrides_if_ready(&mut self) {
         if self.pending_restore.is_none() || self.model.total_objects() == 0 {
+            self.apply_profile_overrides_to_types();
             return;
         }
         let saved = self.pending_restore.take().unwrap();
         if !saved.renames.is_empty() {
             self.model.apply_renames(&saved.renames);
+        }
+        for type_id in &saved.known_unrelated_types {
+            if let Some(tp) = self.model.types.get_mut(type_id) {
+                tp.known_unrelated = true;
+            }
+        }
+        self.apply_profile_overrides_to_types();
+    }
+
+    fn apply_profile_overrides_to_types(&mut self) {
+        if !self.profile_renames.is_empty() {
+            for (type_id, name) in &self.profile_renames {
+                if self.user_renamed_types.contains(type_id) {
+                    continue;
+                }
+                if let Some(tp) = self.model.types.get(type_id) {
+                    if tp.name.is_none() {
+                        self.model.rename_type(type_id, name.clone());
+                    }
+                }
+            }
+        }
+        for type_id in &self.profile_known_unrelated_types {
+            if self.user_toggled_unrelated_types.contains(type_id) {
+                continue;
+            }
+            if let Some(tp) = self.model.types.get_mut(type_id) {
+                if !tp.known_unrelated {
+                    tp.known_unrelated = true;
+                }
+            }
+        }
+        if !self.profile_manual_path_overrides.is_empty() {
+            let mut current = self.model.manual_path_overrides();
+            for rule in &self.profile_manual_path_overrides {
+                let key = path_override_key(&rule.type_id, &rule.path);
+                if self.user_toggled_paths.contains(&key) {
+                    continue;
+                }
+                if let Some(existing) = current
+                    .iter_mut()
+                    .find(|(tid, path, _)| tid == &rule.type_id && path == &rule.path)
+                {
+                    existing.2 = rule.mode;
+                } else {
+                    current.push((rule.type_id.clone(), rule.path.clone(), rule.mode));
+                }
+            }
+            self.model.apply_manual_path_overrides(&current);
         }
     }
 
@@ -521,6 +791,12 @@ impl App {
             self.reader.offset(),
             &self.model.periods,
             &self.model.renamed_types(),
+            &self
+                .model
+                .types
+                .iter()
+                .filter_map(|(type_id, tp)| tp.known_unrelated.then_some(type_id.clone()))
+                .collect::<Vec<_>>(),
             &self.model.current_label,
             &self.event_filters,
             self.stashed_event_filters.as_ref(),
@@ -528,8 +804,145 @@ impl App {
         )
     }
 
+    fn export_session_if_configured(&self) -> Result<()> {
+        let Some(path) = self.export_path.as_ref() else {
+            return Ok(());
+        };
+        let snapshot = self.build_session_export();
+        export_session(path, &snapshot)
+    }
+
+    fn export_session_to_path(&mut self, path: PathBuf) {
+        match export_session(&path, &self.build_session_export()) {
+            Ok(_) => {
+                self.status = format!("Session exported to {}", path.display());
+                self.export_path = Some(path);
+            }
+            Err(err) => {
+                self.status = format!("Session export failed: {err}");
+            }
+        }
+    }
+
+    fn export_profile_to_path(&mut self, path: PathBuf) {
+        let profile = SourceProfile {
+            renames: self.model.renamed_types(),
+            known_unrelated_types: self
+                .model
+                .types
+                .iter()
+                .filter_map(|(type_id, tp)| tp.known_unrelated.then_some(type_id.clone()))
+                .collect(),
+            manual_path_overrides: self.current_manual_path_overrides(),
+            negative_filters: self.event_filters.clone(),
+            whitelist_terms: self.whitelist_terms.clone(),
+        };
+        match save_profile(&path, &profile) {
+            Ok(_) => self.status = format!("Profile exported to {}", path.display()),
+            Err(err) => self.status = format!("Profile export failed: {err}"),
+        }
+    }
+
+    fn build_session_export(&self) -> SessionExport {
+        let mut snapshot = SessionExport::new(self.reader.path().display().to_string());
+        snapshot.periods = self.model.periods.clone();
+        snapshot.renames = self.model.renamed_types();
+        snapshot.known_unrelated_types = self
+            .model
+            .types
+            .iter()
+            .filter_map(|(type_id, tp)| tp.known_unrelated.then_some(type_id.clone()))
+            .collect();
+        snapshot.manual_path_overrides = self.current_manual_path_overrides();
+        snapshot.current_label = self.model.current_label.clone();
+        snapshot.event_filters = self.event_filters.clone();
+        snapshot.stashed_event_filters = self.stashed_event_filters.clone();
+        snapshot.types_filter = self.types_filter.clone();
+        snapshot.profile = Some(SourceProfile {
+            renames: self.model.renamed_types(),
+            known_unrelated_types: self
+                .model
+                .types
+                .iter()
+                .filter_map(|(type_id, tp)| tp.known_unrelated.then_some(type_id.clone()))
+                .collect(),
+            manual_path_overrides: self.current_manual_path_overrides(),
+            negative_filters: self.event_filters.clone(),
+            whitelist_terms: self.whitelist_terms.clone(),
+        });
+        snapshot.events = self
+            .model
+            .events
+            .iter()
+            .map(|e| SessionEvent {
+                ts: e.ts,
+                obj: e.obj.clone(),
+            })
+            .collect();
+        snapshot.baseline_events = self
+            .baseline_events
+            .iter()
+            .map(|e| SessionEvent {
+                ts: e.ts,
+                obj: e.obj.clone(),
+            })
+            .collect();
+        snapshot
+    }
+
+    fn current_manual_path_overrides(&self) -> Vec<TypePathOverride> {
+        self.model
+            .manual_path_overrides()
+            .into_iter()
+            .map(|(type_id, path, mode)| TypePathOverride {
+                type_id,
+                path,
+                mode,
+            })
+            .collect()
+    }
+
+    fn default_session_export_path(&self) -> PathBuf {
+        let mut p = self.reader.path().clone();
+        let fname = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| format!("{n}.session.json"))
+            .unwrap_or_else(|| "session-export.json".to_string());
+        p.set_file_name(fname);
+        p
+    }
+
+    fn default_profile_export_path(&self) -> PathBuf {
+        let mut p = self.reader.path().clone();
+        let fname = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| format!("{n}.profile.json"))
+            .unwrap_or_else(|| "source-profile.json".to_string());
+        p.set_file_name(fname);
+        p
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.startup_hint = None;
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            return true;
+        }
+        if matches!(key.code, KeyCode::Char('q')) {
+            let now = Instant::now();
+            if self
+                .quit_pending_until
+                .is_some_and(|deadline| deadline >= now)
+            {
+                return true;
+            }
+            self.quit_pending_until = Some(now + QUIT_CONFIRM_WINDOW);
+            self.status = "Press q again within 2s to quit".to_string();
+            return false;
+        }
         if self.pending_delete_period_id.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -540,13 +953,25 @@ impl App {
                     self.cancel_pending_period_delete();
                     return false;
                 }
-                _ => {}
+                _ => {
+                    return false;
+                }
             }
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
-        {
-            return true;
+        if self.pending_profile_override.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_pending_profile_override();
+                    return false;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+                    self.cancel_pending_profile_override();
+                    return false;
+                }
+                _ => {
+                    return false;
+                }
+            }
         }
         if self.loading_locked() {
             self.update_loading_status();
@@ -560,6 +985,15 @@ impl App {
 
         if self.inspector.is_some() {
             return self.handle_inspector(code);
+        }
+        if self.mode == UiMode::Types && self.type_preview_open {
+            match code {
+                KeyCode::Esc | KeyCode::Char('j') | KeyCode::Char('J') => {
+                    self.type_preview_open = false;
+                    return false;
+                }
+                _ => {}
+            }
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -576,23 +1010,19 @@ impl App {
         }
 
         match code {
-            KeyCode::Char('q') => {
-                let now = Instant::now();
-                if self
-                    .quit_pending_until
-                    .is_some_and(|deadline| deadline >= now)
-                {
-                    return true;
-                }
-                self.quit_pending_until = Some(now + QUIT_CONFIRM_WINDOW);
-                self.status = "Press q again within 2s to quit".to_string();
-                return false;
-            }
             KeyCode::Esc if self.mode == UiMode::Live && self.live_key_focus => {
                 self.exit_live_key_focus();
             }
             KeyCode::Char('h') | KeyCode::Char('?') => {
                 self.show_help_overlay = !self.show_help_overlay;
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') => {
+                self.input_mode = InputMode::ExportSessionPath;
+                self.input_buffer = self.default_session_export_path().display().to_string();
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                self.input_mode = InputMode::ExportProfilePath;
+                self.input_buffer = self.default_profile_export_path().display().to_string();
             }
             KeyCode::Char('1') => {
                 self.set_ui_mode(UiMode::Live);
@@ -600,7 +1030,13 @@ impl App {
             }
             KeyCode::Char('2') => self.set_ui_mode(UiMode::Periods),
             KeyCode::Char('3') => self.set_ui_mode(UiMode::Types),
-            KeyCode::Char('4') => self.set_ui_mode(UiMode::Data),
+            KeyCode::Char('4') => {
+                if self.baseline_tab_enabled {
+                    self.set_ui_mode(UiMode::Data)
+                } else {
+                    self.status = "Baseline view is unavailable (start with --baseline)".to_string();
+                }
+            }
             KeyCode::Esc if self.mode == UiMode::Live && self.return_to_types_on_live_esc => {
                 self.mode = UiMode::Types;
                 self.return_to_types_on_live_esc = false;
@@ -728,9 +1164,13 @@ impl App {
                 self.start_event_filter_input(FilterField::Exact)
             }
             KeyCode::Char('y') if self.mode != UiMode::Types => self.toggle_event_filters_enabled(),
+            KeyCode::Char('w') if self.mode != UiMode::Types => self.cycle_whitelist_mode(),
             KeyCode::Char('/') if self.mode == UiMode::Types => {
                 self.input_mode = InputMode::TypesFilter;
                 self.input_buffer = self.types_filter.clone();
+            }
+            KeyCode::Char('j') | KeyCode::Char('J') if self.mode == UiMode::Types => {
+                self.type_preview_open = !self.type_preview_open;
             }
             KeyCode::Char('r') if self.mode == UiMode::Types => {
                 let visible = self.visible_types();
@@ -889,6 +1329,7 @@ impl App {
                         if let Some(type_id) = visible.get(self.type_index) {
                             let type_id = type_id.clone();
                             self.model.rename_type(&type_id, self.input_buffer.clone());
+                            self.user_renamed_types.insert(type_id);
                             self.mark_live_cache_dirty();
                         }
                     }
@@ -917,6 +1358,24 @@ impl App {
                             }
                             Err(err) => self.status = err,
                         }
+                    }
+                    InputMode::ExportSessionPath => {
+                        let raw = self.input_buffer.trim();
+                        let path = if raw.is_empty() {
+                            self.default_session_export_path()
+                        } else {
+                            PathBuf::from(raw)
+                        };
+                        self.export_session_to_path(path);
+                    }
+                    InputMode::ExportProfilePath => {
+                        let raw = self.input_buffer.trim();
+                        let path = if raw.is_empty() {
+                            self.default_profile_export_path()
+                        } else {
+                            PathBuf::from(raw)
+                        };
+                        self.export_profile_to_path(path);
                     }
                     InputMode::None => {}
                 }
@@ -966,6 +1425,78 @@ impl App {
         self.mark_live_cache_dirty();
         self.refresh_live_position();
         self.status = "Event filters suspended (press y to restore)".to_string();
+    }
+
+    fn apply_profile_filters(&mut self, filters: DataFilters) {
+        if filters.has_active() {
+            self.stashed_event_filters = None;
+            self.event_filters = filters;
+            self.mark_live_cache_dirty();
+            self.refresh_live_position();
+        }
+    }
+
+    fn confirm_pending_profile_override(&mut self) {
+        let Some(profile) = self.pending_profile_override.take() else {
+            return;
+        };
+        self.apply_profile_forced(profile);
+        self.status = format!(
+            "Profile applied (whitelist merged: {} terms)",
+            self.whitelist_terms.len()
+        );
+    }
+
+    fn cancel_pending_profile_override(&mut self) {
+        self.pending_profile_override = None;
+        self.status = "Kept restored session filters".to_string();
+    }
+
+    fn profile_matches_current_state(&self, profile: &SourceProfile) -> bool {
+        self.current_profile_fingerprint() == profile_fingerprint(profile)
+    }
+
+    fn current_profile_fingerprint(&self) -> String {
+        let profile = SourceProfile {
+            renames: self.model.renamed_types(),
+            known_unrelated_types: self
+                .model
+                .types
+                .iter()
+                .filter_map(|(type_id, tp)| tp.known_unrelated.then_some(type_id.clone()))
+                .collect(),
+            manual_path_overrides: self.current_manual_path_overrides(),
+            negative_filters: self.event_filters.clone(),
+            whitelist_terms: self.whitelist_terms.clone(),
+        };
+        profile_fingerprint(&profile)
+    }
+
+    fn has_nonempty_profile_state(&self) -> bool {
+        self.event_filters.has_active()
+            || !self.model.renamed_types().is_empty()
+            || self
+                .model
+                .types
+                .values()
+                .any(|tp| tp.known_unrelated)
+            || !self.model.manual_path_overrides().is_empty()
+            || !self.whitelist_terms.is_empty()
+    }
+
+    fn cycle_whitelist_mode(&mut self) {
+        if self.whitelist_terms.is_empty() {
+            self.status = "No whitelist loaded".to_string();
+            return;
+        }
+        self.whitelist_mode = match self.whitelist_mode {
+            WhitelistMode::AlwaysShow => WhitelistMode::OnlyWhitelist,
+            WhitelistMode::OnlyWhitelist => WhitelistMode::Off,
+            WhitelistMode::Off => WhitelistMode::AlwaysShow,
+        };
+        self.mark_live_cache_dirty();
+        self.refresh_live_position();
+        self.status = format!("Whitelist mode: {}", self.whitelist_mode_label());
     }
 
     fn handle_navigation_intent(&mut self, intent: NavIntent) {
@@ -1364,6 +1895,7 @@ impl App {
         self.return_to_live_object_on_types_esc = false;
         self.return_to_types_on_live_esc = false;
         self.types_path_focus = false;
+        self.type_preview_open = false;
         self.periods_focus = PeriodsFocus::Periods;
         self.exit_live_key_focus();
     }
@@ -1823,7 +2355,8 @@ impl App {
         if !self.live_cache_dirty {
             return;
         }
-        self.live_visible_indices = self.model.filtered_event_indices(&self.event_filters, None);
+        let base = self.model.filtered_event_indices(&self.event_filters, None);
+        self.live_visible_indices = self.apply_whitelist_to_indices(base, None);
         self.live_cache_dirty = false;
     }
 
@@ -1841,8 +2374,31 @@ impl App {
     }
 
     pub fn visible_baseline_events(&self) -> Vec<&EventRecord> {
-        self.model
-            .filtered_event_slice(&self.baseline_events, &self.event_filters)
+        let base = self
+            .model
+            .filtered_event_slice(&self.baseline_events, &self.event_filters);
+        match self.whitelist_mode {
+            WhitelistMode::Off => base,
+            WhitelistMode::OnlyWhitelist => self
+                .baseline_events
+                .iter()
+                .rev()
+                .filter(|e| self.event_matches_whitelist(e))
+                .collect(),
+            WhitelistMode::AlwaysShow => {
+                let mut out = base;
+                for e in self.baseline_events.iter().rev() {
+                    if self.event_matches_whitelist(e)
+                        && !out
+                            .iter()
+                            .any(|existing| existing.ts == e.ts && existing.type_id == e.type_id)
+                    {
+                        out.push(e);
+                    }
+                }
+                out
+            }
+        }
     }
 
     fn live_anchor_at(&self, index: usize) -> Option<LiveAnchor> {
@@ -2037,8 +2593,35 @@ impl App {
         if let Some(p) = periods.get(self.periods_index) {
             let start = p.start;
             let end = p.end.unwrap_or(p.start);
-            self.model
-                .filtered_events_in_range(&self.event_filters, Some((start, end)))
+            let base = self
+                .model
+                .filtered_events_in_range(&self.event_filters, Some((start, end)));
+            match self.whitelist_mode {
+                WhitelistMode::Off => base,
+                WhitelistMode::OnlyWhitelist => self
+                    .model
+                    .events
+                    .iter()
+                    .rev()
+                    .filter(|e| e.ts >= start && e.ts <= end && self.event_matches_whitelist(e))
+                    .collect(),
+                WhitelistMode::AlwaysShow => {
+                    let mut out = base;
+                    for e in self.model.events.iter().rev() {
+                        if e.ts < start || e.ts > end {
+                            continue;
+                        }
+                        if self.event_matches_whitelist(e)
+                            && !out.iter().any(|existing| {
+                                existing.ts == e.ts && existing.type_id == e.type_id
+                            })
+                        {
+                            out.push(e);
+                        }
+                    }
+                    out
+                }
+            }
         } else {
             Vec::new()
         }
@@ -2071,7 +2654,61 @@ impl App {
     }
 
     pub fn should_show_status_line(&self) -> bool {
-        self.show_status_debug || self.loading_locked() || self.pending_delete_period_id.is_some()
+        self.show_status_debug || self.loading_locked()
+    }
+
+    pub fn has_modal_confirmation(&self) -> bool {
+        self.pending_delete_period_id.is_some() || self.pending_profile_override.is_some()
+    }
+
+    pub fn type_preview_open(&self) -> bool {
+        self.type_preview_open
+    }
+
+    pub fn modal_confirmation(&self) -> Option<ModalConfirmation> {
+        if let Some(period_id) = self.pending_delete_period_id {
+            let periods = self.model.closed_periods();
+            let detail = periods
+                .iter()
+                .enumerate()
+                .find(|(_, p)| p.id == period_id)
+                .map(|(idx, p)| {
+                    let rows = self
+                        .period_row_range_for(p)
+                        .map(|(a, b)| format!("{a}-{b}"))
+                        .unwrap_or_else(|| "-".to_string());
+                    format!("Period [{}] #{} '{}' rows {}", idx + 1, p.id, p.label, rows)
+                })
+                .unwrap_or_else(|| format!("Period id {}", period_id));
+            return Some(ModalConfirmation {
+                title: "Delete Period".to_string(),
+                lines: vec![
+                    "Delete the selected action period?".to_string(),
+                    detail,
+                    "Events stay; only period boundaries are removed.".to_string(),
+                    "Press y to confirm, n or Esc to cancel.".to_string(),
+                ],
+            });
+        }
+        if let Some(profile) = self.pending_profile_override.as_ref() {
+            return Some(ModalConfirmation {
+                title: "Apply Profile".to_string(),
+                lines: vec![
+                    "Apply profile over restored session state?".to_string(),
+                    format!(
+                        "Profile: {} renames, {} unrelated, {} manual paths, filters {}/5, whitelist {} terms",
+                        profile.renames.len(),
+                        profile.known_unrelated_types.len(),
+                        profile.manual_path_overrides.len(),
+                        profile.negative_filters.active_count(),
+                        profile.whitelist_terms.len()
+                    ),
+                    "Whitelist merges additively with --whitelist terms.".to_string(),
+                    "Press y to apply, n or Esc to keep session state.".to_string(),
+                ],
+            });
+        }
+        None
     }
 
     pub fn selected_period_event(&self) -> Option<&EventRecord> {
@@ -2087,6 +2724,91 @@ impl App {
         event.keys.clone()
     }
 
+    pub fn baseline_tab_enabled(&self) -> bool {
+        self.baseline_tab_enabled
+    }
+
+    pub fn type_excluded_by_type_filter(&self, type_id: &str) -> bool {
+        let term = negated_type_term(&self.model.canonical_type_name(type_id));
+        self.event_filters
+            .type_filter
+            .split("&&")
+            .map(|s| s.trim())
+            .any(|s| s == term)
+    }
+
+    pub fn whitelist_mode_label(&self) -> &'static str {
+        match self.whitelist_mode {
+            WhitelistMode::AlwaysShow => "always-show",
+            WhitelistMode::OnlyWhitelist => "only-whitelist",
+            WhitelistMode::Off => "off",
+        }
+    }
+
+    pub fn whitelist_loaded(&self) -> bool {
+        !self.whitelist_terms.is_empty()
+    }
+
+    pub fn whitelist_highlight_enabled(&self) -> bool {
+        self.whitelist_loaded() && self.whitelist_mode != WhitelistMode::Off
+    }
+
+    pub fn whitelist_matches_event(&self, event: &EventRecord) -> bool {
+        self.event_matches_whitelist(event)
+    }
+
+    pub fn whitelist_terms(&self) -> &[String] {
+        &self.whitelist_terms
+    }
+
+    fn event_matches_whitelist(&self, event: &EventRecord) -> bool {
+        if self.whitelist_terms.is_empty() {
+            return false;
+        }
+        let obj = serde_json::to_string(&event.obj).unwrap_or_default().to_lowercase();
+        self.whitelist_terms.iter().any(|needle| obj.contains(needle))
+    }
+
+    fn apply_whitelist_to_indices(
+        &self,
+        indices: Vec<usize>,
+        range: Option<(f64, f64)>,
+    ) -> Vec<usize> {
+        match self.whitelist_mode {
+            WhitelistMode::Off => indices,
+            WhitelistMode::AlwaysShow => {
+                let mut out = indices;
+                for (idx, event) in self.model.events.iter().enumerate() {
+                    if let Some((start, end)) = range {
+                        if event.ts < start || event.ts > end {
+                            continue;
+                        }
+                    }
+                    if self.event_matches_whitelist(event) && !out.contains(&idx) {
+                        out.push(idx);
+                    }
+                }
+                out.sort_unstable();
+                out
+            }
+            WhitelistMode::OnlyWhitelist => self
+                .model
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    if let Some((start, end)) = range {
+                        if e.ts < start || e.ts > end {
+                            return false;
+                        }
+                    }
+                    self.event_matches_whitelist(e)
+                })
+                .map(|(idx, _)| idx)
+                .collect(),
+        }
+    }
+
     fn toggle_current_path(&mut self) {
         if self.mode != UiMode::Types || !self.types_path_focus {
             return;
@@ -2098,6 +2820,8 @@ impl App {
                 let keys: Vec<String> = tp.considered_paths.keys().cloned().collect();
                 if let Some(path) = keys.get(self.path_index) {
                     self.model.toggle_type_path(&type_id, path);
+                    self.user_toggled_paths
+                        .insert(path_override_key(&type_id, path));
                     self.pending_live_recompute = true;
                 }
             }
@@ -2185,16 +2909,32 @@ impl App {
         }
         let visible = self.visible_types();
         if let Some(type_id) = visible.get(self.type_index) {
-            let type_id = type_id.clone();
-            self.model.toggle_known_unrelated_type(&type_id);
-            self.mark_live_cache_dirty();
-            if self.mode == UiMode::Live {
-                self.refresh_live_position();
+            let name = self.model.canonical_type_name(type_id);
+            let term = negated_type_term(&name);
+            let mut parts: Vec<String> = self
+                .event_filters
+                .type_filter
+                .split("&&")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.iter().any(|p| p == &term) {
+                parts.retain(|p| p != &term);
+                self.status = format!("Removed negative type filter: {}", name);
+            } else {
+                parts.push(term);
+                self.status = format!("Added negative type filter: {}", name);
             }
+            self.event_filters.type_filter = parts.join(" && ");
+            self.mark_live_cache_dirty();
+            self.refresh_live_position();
         }
     }
 
     fn loading_locked(&self) -> bool {
+        if self.baseline_reader.is_some() && !self.baseline_loaded {
+            return true;
+        }
         if self.offline && !self.offline_loaded {
             return true;
         }
@@ -2216,6 +2956,13 @@ impl App {
     }
 
     fn update_loading_status(&mut self) {
+        if self.pending_profile_override.is_some() {
+            return;
+        }
+        if self.baseline_reader.is_some() && !self.baseline_loaded {
+            self.status = self.baseline_load_status();
+            return;
+        }
         if self.offline && !self.offline_loaded {
             self.status = self.offline_load_status();
             return;
@@ -2269,6 +3016,29 @@ impl App {
             loaded,
             total,
             self.model.total_objects()
+        )
+    }
+
+    fn baseline_load_status(&self) -> String {
+        let Some(reader) = self.baseline_reader.as_ref() else {
+            return String::new();
+        };
+        let progress = reader.progress();
+        let loaded = progress.loaded_bytes as f64 / (1024.0 * 1024.0);
+        let total = progress.total_bytes as f64 / (1024.0 * 1024.0);
+        let pct = if progress.total_bytes == 0 {
+            0.0
+        } else {
+            (progress.loaded_bytes as f64 * 100.0 / progress.total_bytes as f64).clamp(0.0, 100.0)
+        };
+        let bar = progress_bar(pct / 100.0, 24);
+        format!(
+            "Loading baseline {} {:>6.1}% ({:.1} / {:.1} MiB)  objects {}",
+            bar,
+            pct,
+            loaded,
+            total,
+            self.baseline_events.len()
         )
     }
 
@@ -2437,6 +3207,49 @@ fn normalize_navigation_code(key: KeyEvent) -> KeyCode {
 fn parse_usize_1based(raw: &str) -> std::result::Result<usize, String> {
     raw.parse::<usize>()
         .map_err(|_| format!("Invalid number: {raw}"))
+}
+
+fn negated_type_term(name: &str) -> String {
+    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("!\"{}\"", escaped)
+}
+
+fn path_override_key(type_id: &str, path: &str) -> String {
+    format!("{}\n{}", type_id, path)
+}
+
+fn profile_fingerprint(profile: &SourceProfile) -> String {
+    let normalized = normalize_profile(profile.clone());
+    let bytes = serde_json::to_vec(&normalized).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn normalize_profile(mut profile: SourceProfile) -> SourceProfile {
+    profile.renames.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    profile.renames.dedup();
+    profile.known_unrelated_types.sort();
+    profile.known_unrelated_types.dedup();
+    profile.manual_path_overrides.sort_by(|a, b| {
+        a.type_id
+            .cmp(&b.type_id)
+            .then(a.path.cmp(&b.path))
+            .then((a.mode as u8).cmp(&(b.mode as u8)))
+    });
+    profile.manual_path_overrides.dedup_by(|a, b| {
+        a.type_id == b.type_id && a.path == b.path && a.mode == b.mode
+    });
+    let mut wl: Vec<String> = profile
+        .whitelist_terms
+        .into_iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    wl.sort();
+    wl.dedup();
+    profile.whitelist_terms = wl;
+    profile
 }
 
 #[cfg(test)]
