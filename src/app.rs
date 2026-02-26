@@ -5,7 +5,7 @@ use crate::domain::{
 use crate::io::StreamReader;
 use crate::persistence::{
     export_session, invalidate_state, load_state, save_profile, save_state, RestoredState,
-    SessionEvent, SessionExport, SourceProfile, TypePathOverride,
+    SessionEvent, SessionExport, SourceProfile, NormalizedFieldOverride,
 };
 use crate::tui::{draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
@@ -145,7 +145,7 @@ pub struct App {
     whitelist_mode: WhitelistMode,
     profile_renames: Vec<(String, String)>,
     profile_known_unrelated_types: Vec<String>,
-    profile_manual_path_overrides: Vec<TypePathOverride>,
+    profile_normalized_field_overrides: Vec<NormalizedFieldOverride>,
     user_renamed_types: HashSet<String>,
     user_toggled_unrelated_types: HashSet<String>,
     user_toggled_paths: HashSet<String>,
@@ -227,7 +227,7 @@ impl App {
             whitelist_mode: WhitelistMode::Off,
             profile_renames: Vec::new(),
             profile_known_unrelated_types: Vec::new(),
-            profile_manual_path_overrides: Vec::new(),
+            profile_normalized_field_overrides: Vec::new(),
             user_renamed_types: HashSet::new(),
             user_toggled_unrelated_types: HashSet::new(),
             user_toggled_paths: HashSet::new(),
@@ -377,7 +377,7 @@ impl App {
     fn apply_profile_seeded(&mut self, profile: SourceProfile) {
         self.profile_renames = profile.renames.clone();
         self.profile_known_unrelated_types = profile.known_unrelated_types.clone();
-        self.profile_manual_path_overrides = profile.manual_path_overrides.clone();
+        self.profile_normalized_field_overrides = profile.normalized_field_overrides.clone();
         self.apply_profile_overrides_to_types();
         self.add_whitelist_terms(profile.whitelist_terms);
         self.apply_profile_filters(profile.negative_filters);
@@ -387,13 +387,13 @@ impl App {
         let SourceProfile {
             renames,
             known_unrelated_types,
-            manual_path_overrides,
+            normalized_field_overrides,
             negative_filters,
             whitelist_terms,
         } = profile;
         self.profile_renames = renames.clone();
         self.profile_known_unrelated_types = known_unrelated_types.clone();
-        self.profile_manual_path_overrides = manual_path_overrides.clone();
+        self.profile_normalized_field_overrides = normalized_field_overrides.clone();
         self.user_renamed_types.clear();
         self.user_toggled_unrelated_types.clear();
         self.user_toggled_paths.clear();
@@ -405,8 +405,8 @@ impl App {
         for (type_id, tp) in self.model.types.iter_mut() {
             tp.known_unrelated = unrelated_set.contains(type_id);
         }
-        self.model.apply_manual_path_overrides(
-            &manual_path_overrides
+        self.model.apply_normalized_field_overrides(
+            &normalized_field_overrides
                 .iter()
                 .map(|r| (r.type_id.clone(), r.path.clone(), r.mode))
                 .collect::<Vec<_>>(),
@@ -479,10 +479,10 @@ impl App {
         if !session.renames.is_empty() {
             self.model.apply_renames(&session.renames);
         }
-        if !session.manual_path_overrides.is_empty() {
-            self.model.apply_manual_path_overrides(
+        if !session.normalized_field_overrides.is_empty() {
+            self.model.apply_normalized_field_overrides(
                 &session
-                    .manual_path_overrides
+                    .normalized_field_overrides
                     .iter()
                     .map(|r| (r.type_id.clone(), r.path.clone(), r.mode))
                     .collect::<Vec<_>>(),
@@ -678,10 +678,11 @@ impl App {
         match load_state(self.reader.path()) {
             Ok(Some(saved)) => {
                 let msg = format!(
-                    "Restored session: {} periods, {} renames, {} unrelated, filters {}/5{}{}",
+                    "Restored session: {} periods, {} renames, {} unrelated, {} normalized fields, filters {}/5{}{}",
                     saved.periods.len(),
                     saved.renames.len(),
                     saved.known_unrelated_types.len(),
+                    saved.normalized_field_overrides.len(),
                     saved.event_filters.active_count(),
                     if saved.stashed_event_filters.is_some() {
                         " (suspended set saved)"
@@ -732,6 +733,15 @@ impl App {
                 tp.known_unrelated = true;
             }
         }
+        if !saved.normalized_field_overrides.is_empty() {
+            self.model.apply_normalized_field_overrides(
+                &saved
+                    .normalized_field_overrides
+                    .iter()
+                    .map(|r| (r.type_id.clone(), r.path.clone(), r.mode))
+                    .collect::<Vec<_>>(),
+            );
+        }
         self.apply_profile_overrides_to_types();
     }
 
@@ -758,9 +768,9 @@ impl App {
                 }
             }
         }
-        if !self.profile_manual_path_overrides.is_empty() {
-            let mut current = self.model.manual_path_overrides();
-            for rule in &self.profile_manual_path_overrides {
+        if !self.profile_normalized_field_overrides.is_empty() {
+            let mut current = self.model.normalized_field_overrides();
+            for rule in &self.profile_normalized_field_overrides {
                 let key = path_override_key(&rule.type_id, &rule.path);
                 if self.user_toggled_paths.contains(&key) {
                     continue;
@@ -774,7 +784,7 @@ impl App {
                     current.push((rule.type_id.clone(), rule.path.clone(), rule.mode));
                 }
             }
-            self.model.apply_manual_path_overrides(&current);
+            self.model.apply_normalized_field_overrides(&current);
         }
     }
 
@@ -797,6 +807,7 @@ impl App {
                 .iter()
                 .filter_map(|(type_id, tp)| tp.known_unrelated.then_some(type_id.clone()))
                 .collect::<Vec<_>>(),
+            &self.current_normalized_field_overrides(),
             &self.model.current_label,
             &self.event_filters,
             self.stashed_event_filters.as_ref(),
@@ -833,7 +844,7 @@ impl App {
                 .iter()
                 .filter_map(|(type_id, tp)| tp.known_unrelated.then_some(type_id.clone()))
                 .collect(),
-            manual_path_overrides: self.current_manual_path_overrides(),
+            normalized_field_overrides: self.current_normalized_field_overrides(),
             negative_filters: self.event_filters.clone(),
             whitelist_terms: self.whitelist_terms.clone(),
         };
@@ -853,7 +864,7 @@ impl App {
             .iter()
             .filter_map(|(type_id, tp)| tp.known_unrelated.then_some(type_id.clone()))
             .collect();
-        snapshot.manual_path_overrides = self.current_manual_path_overrides();
+        snapshot.normalized_field_overrides = self.current_normalized_field_overrides();
         snapshot.current_label = self.model.current_label.clone();
         snapshot.event_filters = self.event_filters.clone();
         snapshot.stashed_event_filters = self.stashed_event_filters.clone();
@@ -866,7 +877,7 @@ impl App {
                 .iter()
                 .filter_map(|(type_id, tp)| tp.known_unrelated.then_some(type_id.clone()))
                 .collect(),
-            manual_path_overrides: self.current_manual_path_overrides(),
+            normalized_field_overrides: self.current_normalized_field_overrides(),
             negative_filters: self.event_filters.clone(),
             whitelist_terms: self.whitelist_terms.clone(),
         });
@@ -890,11 +901,11 @@ impl App {
         snapshot
     }
 
-    fn current_manual_path_overrides(&self) -> Vec<TypePathOverride> {
+    fn current_normalized_field_overrides(&self) -> Vec<NormalizedFieldOverride> {
         self.model
-            .manual_path_overrides()
+            .normalized_field_overrides()
             .into_iter()
-            .map(|(type_id, path, mode)| TypePathOverride {
+            .map(|(type_id, path, mode)| NormalizedFieldOverride {
                 type_id,
                 path,
                 mode,
@@ -1457,6 +1468,16 @@ impl App {
     }
 
     fn current_profile_fingerprint(&self) -> String {
+        if let Some(saved) = self.pending_restore.as_ref() {
+            let profile = SourceProfile {
+                renames: saved.renames.clone(),
+                known_unrelated_types: saved.known_unrelated_types.clone(),
+                normalized_field_overrides: saved.normalized_field_overrides.clone(),
+                negative_filters: self.event_filters.clone(),
+                whitelist_terms: self.whitelist_terms.clone(),
+            };
+            return profile_fingerprint(&profile);
+        }
         let profile = SourceProfile {
             renames: self.model.renamed_types(),
             known_unrelated_types: self
@@ -1465,7 +1486,7 @@ impl App {
                 .iter()
                 .filter_map(|(type_id, tp)| tp.known_unrelated.then_some(type_id.clone()))
                 .collect(),
-            manual_path_overrides: self.current_manual_path_overrides(),
+            normalized_field_overrides: self.current_normalized_field_overrides(),
             negative_filters: self.event_filters.clone(),
             whitelist_terms: self.whitelist_terms.clone(),
         };
@@ -1480,7 +1501,7 @@ impl App {
                 .types
                 .values()
                 .any(|tp| tp.known_unrelated)
-            || !self.model.manual_path_overrides().is_empty()
+            || !self.model.normalized_field_overrides().is_empty()
             || !self.whitelist_terms.is_empty()
     }
 
@@ -2683,10 +2704,11 @@ impl App {
             return Some(ModalConfirmation {
                 title: "Delete Period".to_string(),
                 lines: vec![
+                    "`y` to delete, `n`/`Esc` to disregard".to_string(),
+                    "".to_string(),
                     "Delete the selected action period?".to_string(),
                     detail,
                     "Events stay; only period boundaries are removed.".to_string(),
-                    "Press y to confirm, n or Esc to cancel.".to_string(),
                 ],
             });
         }
@@ -2694,17 +2716,18 @@ impl App {
             return Some(ModalConfirmation {
                 title: "Apply Profile".to_string(),
                 lines: vec![
+                    "`y` to apply, `n`/`Esc` to disregard".to_string(),
+                    "".to_string(),
                     "Apply profile over restored session state?".to_string(),
                     format!(
-                        "Profile: {} renames, {} unrelated, {} manual paths, filters {}/5, whitelist {} terms",
+                        "Profile: {} renames, {} unrelated, {} normalized fields, filters {}/5, whitelist {} terms",
                         profile.renames.len(),
                         profile.known_unrelated_types.len(),
-                        profile.manual_path_overrides.len(),
+                        profile.normalized_field_overrides.len(),
                         profile.negative_filters.active_count(),
                         profile.whitelist_terms.len()
                     ),
                     "Whitelist merges additively with --whitelist terms.".to_string(),
-                    "Press y to apply, n or Esc to keep session state.".to_string(),
                 ],
             });
         }
@@ -3231,13 +3254,13 @@ fn normalize_profile(mut profile: SourceProfile) -> SourceProfile {
     profile.renames.dedup();
     profile.known_unrelated_types.sort();
     profile.known_unrelated_types.dedup();
-    profile.manual_path_overrides.sort_by(|a, b| {
+    profile.normalized_field_overrides.sort_by(|a, b| {
         a.type_id
             .cmp(&b.type_id)
             .then(a.path.cmp(&b.path))
             .then((a.mode as u8).cmp(&(b.mode as u8)))
     });
-    profile.manual_path_overrides.dedup_by(|a, b| {
+    profile.normalized_field_overrides.dedup_by(|a, b| {
         a.type_id == b.type_id && a.path == b.path && a.mode == b.mode
     });
     let mut wl: Vec<String> = profile

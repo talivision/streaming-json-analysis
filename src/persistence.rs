@@ -22,7 +22,7 @@ pub struct SessionExport {
     pub periods: Vec<ActionPeriod>,
     pub renames: Vec<(String, String)>,
     pub known_unrelated_types: Vec<String>,
-    pub manual_path_overrides: Vec<TypePathOverride>,
+    pub normalized_field_overrides: Vec<NormalizedFieldOverride>,
     pub current_label: String,
     pub event_filters: DataFilters,
     pub stashed_event_filters: Option<DataFilters>,
@@ -39,7 +39,7 @@ impl SessionExport {
             periods: Vec::new(),
             renames: Vec::new(),
             known_unrelated_types: Vec::new(),
-            manual_path_overrides: Vec::new(),
+            normalized_field_overrides: Vec::new(),
             current_label: String::new(),
             event_filters: DataFilters::default(),
             stashed_event_filters: None,
@@ -55,13 +55,13 @@ impl SessionExport {
 pub struct SourceProfile {
     pub renames: Vec<(String, String)>,
     pub known_unrelated_types: Vec<String>,
-    pub manual_path_overrides: Vec<TypePathOverride>,
+    pub normalized_field_overrides: Vec<NormalizedFieldOverride>,
     pub negative_filters: DataFilters,
     pub whitelist_terms: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TypePathOverride {
+pub struct NormalizedFieldOverride {
     pub type_id: String,
     pub path: String,
     pub mode: PathOverride,
@@ -72,6 +72,7 @@ pub struct RestoredState {
     pub periods: Vec<ActionPeriod>,
     pub renames: Vec<(String, String)>,
     pub known_unrelated_types: Vec<String>,
+    pub normalized_field_overrides: Vec<NormalizedFieldOverride>,
     pub current_label: String,
     pub event_filters: DataFilters,
     pub stashed_event_filters: Option<DataFilters>,
@@ -88,6 +89,8 @@ struct PersistedState {
     renames: Vec<TypeRename>,
     #[serde(default)]
     known_unrelated_types: Vec<String>,
+    #[serde(default)]
+    normalized_field_overrides: Vec<NormalizedFieldOverride>,
     current_label: String,
     event_filters: DataFilters,
     stashed_event_filters: Option<DataFilters>,
@@ -131,6 +134,7 @@ pub fn load_state(stream_path: &Path) -> Result<Option<RestoredState>> {
                 .map(|r| (r.type_id, r.name))
                 .collect(),
             known_unrelated_types: state.known_unrelated_types,
+            normalized_field_overrides: state.normalized_field_overrides,
             current_label: state.current_label,
             event_filters: state.event_filters,
             stashed_event_filters: state.stashed_event_filters,
@@ -156,6 +160,7 @@ pub fn load_state(stream_path: &Path) -> Result<Option<RestoredState>> {
             .map(|r| (r.type_id, r.name))
             .collect(),
         known_unrelated_types: state.known_unrelated_types,
+        normalized_field_overrides: state.normalized_field_overrides,
         current_label: state.current_label,
         event_filters: state.event_filters,
         stashed_event_filters: state.stashed_event_filters,
@@ -181,6 +186,7 @@ pub fn invalidate_state(stream_path: &Path) -> Result<()> {
         periods: vec![],
         renames: vec![],
         known_unrelated_types: vec![],
+        normalized_field_overrides: vec![],
         current_label: String::new(),
         event_filters: DataFilters::default(),
         stashed_event_filters: None,
@@ -199,6 +205,7 @@ pub fn save_state(
     periods: &[ActionPeriod],
     renames: &[(String, String)],
     known_unrelated_types: &[String],
+    normalized_field_overrides: &[NormalizedFieldOverride],
     current_label: &str,
     event_filters: &DataFilters,
     stashed_event_filters: Option<&DataFilters>,
@@ -224,6 +231,7 @@ pub fn save_state(
             })
             .collect(),
         known_unrelated_types: known_unrelated_types.to_vec(),
+        normalized_field_overrides: normalized_field_overrides.to_vec(),
         current_label: current_label.to_string(),
         event_filters: event_filters.clone(),
         stashed_event_filters: stashed_event_filters.cloned(),

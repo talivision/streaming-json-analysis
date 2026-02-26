@@ -638,7 +638,7 @@ impl AnalyzerModel {
         }
     }
 
-    pub fn manual_path_overrides(&self) -> Vec<(String, String, PathOverride)> {
+    pub fn normalized_field_overrides(&self) -> Vec<(String, String, PathOverride)> {
         let mut out = Vec::new();
         for (type_id, tp) in &self.types {
             for (path, mode) in &tp.path_overrides {
@@ -648,7 +648,7 @@ impl AnalyzerModel {
         out
     }
 
-    pub fn apply_manual_path_overrides(&mut self, overrides: &[(String, String, PathOverride)]) {
+    pub fn apply_normalized_field_overrides(&mut self, overrides: &[(String, String, PathOverride)]) {
         for tp in self.types.values_mut() {
             tp.path_overrides.clear();
         }

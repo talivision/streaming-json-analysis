@@ -54,7 +54,7 @@ pub fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
         UiMode::Data => draw_data(frame, root[1], app, max_type_count),
     }
     let modal = app.modal_confirmation();
-    draw_controls(frame, root[2], app, modal.is_some());
+    draw_controls(frame, root[2], app);
 
     if let Some(inspector) = app.inspector.as_ref() {
         draw_inspector(frame, inspector, app);
@@ -71,11 +71,14 @@ pub fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn draw_tabs(frame: &mut Frame<'_>, area: Rect, mode: UiMode, baseline_enabled: bool) {
-    let titles = if baseline_enabled {
-        vec!["1 Live", "2 Periods", "3 Types", "4 Baseline"]
-    } else {
-        vec!["1 Live", "2 Periods", "3 Types"]
-    };
+    let mut titles = vec![
+        tab_title("1", "Live"),
+        tab_title("2", "Periods"),
+        tab_title("3", "Types"),
+    ];
+    if baseline_enabled {
+        titles.push(tab_title("4", "Baseline"));
+    }
     let selected = match mode {
         UiMode::Live => 0,
         UiMode::Periods => 1,
@@ -848,12 +851,10 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f64) 
     );
 }
 
-fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App, modal_open: bool) {
+fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut text = Vec::new();
     let inner_width = area.width.saturating_sub(2) as usize;
-    if modal_open {
-        // Suppress status/hint lines while a blocking confirmation modal is shown.
-    } else if app.input_mode != InputMode::None {
+    if app.input_mode != InputMode::None {
         let title = match app.input_mode {
             InputMode::None => "",
             InputMode::Label => "set label",
@@ -1921,7 +1922,16 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn draw_confirmation_modal(frame: &mut Frame<'_>, confirm: &ModalConfirmation) {
-    let popup = centered_rect(74, 30, frame.area());
+    let mut content_width = modal_rendered_width(&confirm.title);
+    for line in &confirm.lines {
+        content_width = content_width.max(modal_rendered_width(line));
+    }
+    let max_w = frame.area().width.saturating_sub(2) as usize;
+    let target_w = (content_width + 6).clamp(44, max_w.max(44)) as u16;
+    let text_rows = confirm.lines.len() + 2; // title + spacer + body
+    let max_h = frame.area().height.saturating_sub(2) as usize;
+    let target_h = (text_rows + 3).clamp(8, max_h.max(8)) as u16;
+    let popup = centered_rect_abs(target_w, target_h, frame.area());
     frame.render_widget(Clear, popup);
     let mut lines = vec![Line::from(Span::styled(
         confirm.title.clone(),
@@ -1939,46 +1949,48 @@ fn draw_confirmation_modal(frame: &mut Frame<'_>, confirm: &ModalConfirmation) {
     );
 }
 
+fn modal_rendered_width(s: &str) -> usize {
+    s.chars().filter(|c| *c != '`').count()
+}
+
+fn centered_rect_abs(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width.saturating_sub(2)).max(1);
+    let h = height.min(area.height.saturating_sub(2)).max(1);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
+}
+
+fn tab_title(hotkey: &'static str, label: &'static str) -> Line<'static> {
+    Line::from(vec![styled_hotkey(hotkey), Span::raw(format!(" {}", label))])
+}
+
 fn stylize_modal_line(s: &str) -> Line<'static> {
     let mut out = Vec::new();
-    let mut rest = s;
-    let hotkeys = [("Esc", "Esc"), (" y ", "y"), (" n ", "n"), (" y", "y"), (" n", "n"), ("y ", "y"), ("n ", "n")];
-    while !rest.is_empty() {
-        let mut best: Option<(usize, usize, &str)> = None;
-        for (needle, label) in hotkeys {
-            if let Some(pos) = rest.find(needle) {
-                let end = pos + needle.len();
-                best = match best {
-                    None => Some((pos, end, label)),
-                    Some(cur) => {
-                        if pos < cur.0 {
-                            Some((pos, end, label))
-                        } else {
-                            Some(cur)
-                        }
-                    }
-                };
+    let mut i = 0usize;
+    while i < s.len() {
+        if s.as_bytes()[i] == b'`' {
+            if let Some(end_rel) = s[i + 1..].find('`') {
+                let end = i + 1 + end_rel;
+                let token = &s[i + 1..end];
+                out.push(Span::styled(
+                    token.to_string(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                i = end + 1;
+                continue;
             }
         }
-        let Some((start, end, label)) = best else {
-            out.push(Span::raw(rest.to_string()));
-            break;
-        };
-        if start > 0 {
-            out.push(Span::raw(rest[..start].to_string()));
-        }
-        let token = if label == "Esc" {
-            "Esc".to_string()
-        } else {
-            label.to_string()
-        };
-        out.push(Span::styled(
-            token,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-        rest = &rest[end..];
+        let next_tick = s[i..].find('`').map(|p| i + p).unwrap_or(s.len());
+        out.push(Span::raw(s[i..next_tick].to_string()));
+        i = next_tick;
     }
     Line::from(out)
 }
