@@ -80,6 +80,8 @@ pub struct DataFilters {
     pub type_filter: String,
     pub fuzzy_filter: String,
     pub exact_filter: String,
+    #[serde(default)]
+    pub substring_filter: String,
 }
 
 impl DataFilters {
@@ -89,6 +91,7 @@ impl DataFilters {
             &self.type_filter,
             &self.fuzzy_filter,
             &self.exact_filter,
+            &self.substring_filter,
         ]
         .iter()
         .filter(|f| !f.is_empty())
@@ -106,6 +109,7 @@ pub enum FilterField {
     Type,
     Fuzzy,
     Exact,
+    Substring,
 }
 
 impl FilterField {
@@ -115,6 +119,7 @@ impl FilterField {
             Self::Type => "type",
             Self::Fuzzy => "fuzzy",
             Self::Exact => "exact key=value",
+            Self::Substring => "substring",
         }
     }
 }
@@ -590,6 +595,7 @@ impl AnalyzerModel {
         let mut out = Vec::new();
         let type_query = filters.type_filter.to_lowercase();
         let fuzzy_query = filters.fuzzy_filter.to_lowercase();
+        let substring_query = filters.substring_filter.to_lowercase();
         let wanted_keys: Vec<&str> = if filters.key_filter.is_empty() {
             Vec::new()
         } else {
@@ -632,6 +638,14 @@ impl AnalyzerModel {
                     .all(|k| e.keys.iter().any(|event_key| event_key == k))
             {
                 continue;
+            }
+            if !substring_query.is_empty() {
+                let obj = serde_json::to_string(&e.obj)
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if !obj.contains(&substring_query) {
+                    continue;
+                }
             }
             if !fuzzy_query.is_empty() {
                 let obj = serde_json::to_string(&e.obj)
@@ -704,6 +718,14 @@ impl AnalyzerModel {
                     .filter(|s| !s.is_empty())
                     .collect();
                 if !wanted.iter().all(|k| e.keys.iter().any(|ek| ek == k)) {
+                    continue;
+                }
+            }
+            if !filters.substring_filter.is_empty() {
+                let s = serde_json::to_string(&e.obj)
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if !s.contains(&filters.substring_filter.to_lowercase()) {
                     continue;
                 }
             }

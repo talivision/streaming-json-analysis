@@ -317,93 +317,91 @@ impl App {
     fn ingest_new_events(&mut self) -> Result<bool> {
         self.rebuild_live_cache_if_needed();
         let use_snapshot_parallel = self.offline || self.loading_locked();
-        let events_result = if use_snapshot_parallel {
+        let events = if use_snapshot_parallel {
             self.reader.poll_snapshot_parallel()
         } else {
             self.reader.poll()
+        }?;
+
+        let selected_anchor = if self.mode == UiMode::Live && !self.live_follow {
+            self.live_anchor_at(self.live_event_index)
+        } else {
+            None
         };
-        match events_result {
-            Ok(events) => {
-                let selected_anchor = if self.mode == UiMode::Live && !self.live_follow {
-                    self.live_anchor_at(self.live_event_index)
-                } else {
-                    None
-                };
-                let view_anchor = if self.mode == UiMode::Live && !self.live_follow {
-                    self.live_anchor_at(self.live_view_start)
-                } else {
-                    None
-                };
+        let view_anchor = if self.mode == UiMode::Live && !self.live_follow {
+            self.live_anchor_at(self.live_view_start)
+        } else {
+            None
+        };
 
-                let n = events.len();
-                let batch_now = unix_ts();
-                let prepared_events: Vec<PreparedEvent> =
-                    events.into_par_iter().map(prepare_event).collect();
-                for (idx, prepared) in prepared_events.into_iter().enumerate() {
-                    let ts = self.resolve_event_ts(&prepared.obj, batch_now, idx)?;
-                    self.model.ingest_prepared(prepared, ts);
+        let n = events.len();
+        let batch_now = unix_ts();
+        let prepared_events: Vec<PreparedEvent> =
+            events.into_par_iter().map(prepare_event).collect();
+        for (idx, prepared) in prepared_events.into_iter().enumerate() {
+            let ts = self.resolve_event_ts(&prepared.obj, batch_now, idx)?;
+            if let Some(last) = self.model.events.back() {
+                if ts < last.ts - 1e-9 {
+                    bail!(
+                        "Events must be sorted by timestamp. Found event at {ts} after event at {}. Sort your JSONL file with: jq -cs 'sort_by(._timestamp)[]' input.jsonl > sorted.jsonl",
+                        last.ts
+                    );
                 }
-                if n > 0 {
-                    self.mark_live_cache_dirty();
-                    self.pending_live_recompute = true;
-                }
-                self.apply_persisted_overrides_if_ready();
-
-                if n > 0 {
-                    if self.offline && !self.offline_loaded {
-                        self.status = self.offline_load_status();
-                    } else {
-                        self.status = format!("Ingested {} events", n);
-                    }
-                    if self.mode == UiMode::Live && self.live_follow {
-                        self.live_edge_until_center = false;
-                        self.pin_live_to_latest();
-                    } else if self.mode == UiMode::Live {
-                        if let Some(anchor) = selected_anchor.as_ref() {
-                            if let Some(idx) = self.find_live_index(anchor) {
-                                self.live_event_index = idx;
-                            }
-                        }
-                        if let Some(anchor) = view_anchor.as_ref() {
-                            if let Some(idx) = self.find_live_index(anchor) {
-                                self.live_view_start = idx;
-                            }
-                        }
-                        self.clamp_live_indices();
-                        self.ensure_live_selection_visible();
-                    }
-                } else if self.offline && !self.offline_loaded {
-                    let progress = self.reader.progress();
-                    if progress.total_bytes > 0 && progress.loaded_bytes >= progress.total_bytes {
-                        self.status = format!(
-                            "Offline load complete: {} objects",
-                            self.model.total_objects()
-                        );
-                    } else if self.model.total_objects() == 0 {
-                        self.status = "Offline mode: no events found".to_string();
-                    } else {
-                        self.status = self.offline_load_status();
-                    }
-                }
-
-                if self.offline {
-                    let progress = self.reader.progress();
-                    self.offline_loaded =
-                        progress.total_bytes == 0 || progress.loaded_bytes >= progress.total_bytes;
-                }
-                if let Some(prompt) = self.delete_confirmation_status() {
-                    self.status = prompt;
-                }
-                Ok(n > 0)
             }
-            Err(err) => {
-                self.status = format!("Stream read error: {err}");
-                if let Some(prompt) = self.delete_confirmation_status() {
-                    self.status = prompt;
+            self.model.ingest_prepared(prepared, ts);
+        }
+        if n > 0 {
+            self.mark_live_cache_dirty();
+            self.pending_live_recompute = true;
+        }
+        self.apply_persisted_overrides_if_ready();
+
+        if n > 0 {
+            if self.offline && !self.offline_loaded {
+                self.status = self.offline_load_status();
+            } else {
+                self.status = format!("Ingested {} events", n);
+            }
+            if self.mode == UiMode::Live && self.live_follow {
+                self.live_edge_until_center = false;
+                self.pin_live_to_latest();
+            } else if self.mode == UiMode::Live {
+                if let Some(anchor) = selected_anchor.as_ref() {
+                    if let Some(idx) = self.find_live_index(anchor) {
+                        self.live_event_index = idx;
+                    }
                 }
-                Ok(false)
+                if let Some(anchor) = view_anchor.as_ref() {
+                    if let Some(idx) = self.find_live_index(anchor) {
+                        self.live_view_start = idx;
+                    }
+                }
+                self.clamp_live_indices();
+                self.ensure_live_selection_visible();
+            }
+        } else if self.offline && !self.offline_loaded {
+            let progress = self.reader.progress();
+            if progress.total_bytes > 0 && progress.loaded_bytes >= progress.total_bytes {
+                self.status = format!(
+                    "Offline load complete: {} objects",
+                    self.model.total_objects()
+                );
+            } else if self.model.total_objects() == 0 {
+                self.status = "Offline mode: no events found".to_string();
+            } else {
+                self.status = self.offline_load_status();
             }
         }
+
+        if self.offline {
+            let progress = self.reader.progress();
+            self.offline_loaded =
+                progress.total_bytes == 0 || progress.loaded_bytes >= progress.total_bytes;
+        }
+        if let Some(prompt) = self.delete_confirmation_status() {
+            self.status = prompt;
+        }
+        Ok(n > 0)
     }
 
     fn ingest_baseline_corpus(&mut self) -> Result<()> {
@@ -632,7 +630,9 @@ impl App {
                 self.status = "Returned to selected JSON".to_string();
             }
             KeyCode::Char('m') => {
-                if self.model.toggle_period() {
+                if self.offline {
+                    self.status = "Cannot mark action periods in offline mode".to_string();
+                } else if self.model.toggle_period() {
                     self.pending_live_recompute = true;
                     self.status = if let Some(p) = self.model.active_period() {
                         format!("Action started: {} #{}", p.label, p.id)
@@ -719,6 +719,9 @@ impl App {
             }
             KeyCode::Char('t') if self.mode == UiMode::Types => self.apply_selected_type_filter(),
             KeyCode::Char('/') if self.mode != UiMode::Types => {
+                self.start_event_filter_input(FilterField::Substring)
+            }
+            KeyCode::Char('z') if self.mode != UiMode::Types => {
                 self.start_event_filter_input(FilterField::Fuzzy)
             }
             KeyCode::Char('e') if self.mode != UiMode::Types => {
@@ -867,6 +870,7 @@ impl App {
                             FilterField::Type => self.event_filters.type_filter = text,
                             FilterField::Fuzzy => self.event_filters.fuzzy_filter = text,
                             FilterField::Exact => self.event_filters.exact_filter = text,
+                            FilterField::Substring => self.event_filters.substring_filter = text,
                         }
                         self.mark_live_cache_dirty();
                         self.data_index = 0;
@@ -935,6 +939,7 @@ impl App {
             FilterField::Type => self.event_filters.type_filter.clone(),
             FilterField::Fuzzy => self.event_filters.fuzzy_filter.clone(),
             FilterField::Exact => self.event_filters.exact_filter.clone(),
+            FilterField::Substring => self.event_filters.substring_filter.clone(),
         };
     }
 
@@ -2041,7 +2046,8 @@ impl App {
 
     pub fn visible_types(&self) -> Vec<String> {
         let query = self.types_filter.to_lowercase();
-        self.model
+        let mut result: Vec<(String, u64)> = self
+            .model
             .types
             .iter()
             .filter(|(type_id, tp)| {
@@ -2054,8 +2060,10 @@ impl App {
                     || name.contains(&query)
                     || default.contains(&query)
             })
-            .map(|(type_id, _)| type_id.clone())
-            .collect()
+            .map(|(type_id, tp)| (type_id.clone(), tp.count))
+            .collect();
+        result.sort_by(|a, b| b.1.cmp(&a.1));
+        result.into_iter().map(|(id, _)| id).collect()
     }
 
     pub fn startup_hint(&self) -> Option<&str> {

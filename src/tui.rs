@@ -182,12 +182,14 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
             .types
             .get(&sel.type_id)
             .map(|tp| &tp.considered_paths);
+        let sub_lc = app.event_filters.substring_filter.to_lowercase();
         let rendered = render_json_keypicker(
             &sel.obj,
             selected_path,
             app.live_key_focus,
             app.live_value_focus,
             &app.event_filters.key_filter,
+            &sub_lc,
             considered_paths,
         );
         let scroll = selected_json_scroll(rendered.selected_line, cols[1].height);
@@ -309,12 +311,14 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         } else {
             None
         };
+        let sub_lc = app.event_filters.substring_filter.to_lowercase();
         let rendered = render_json_keypicker(
             &sel.obj,
             selected_path,
             app.periods_focus == PeriodsFocus::Json,
             false,
             &app.event_filters.key_filter,
+            &sub_lc,
             considered_paths,
         );
         let scroll = selected_json_scroll(rendered.selected_line, cols[2].height);
@@ -346,6 +350,55 @@ fn styled_hotkey(label: &str) -> Span<'static> {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )
+}
+
+fn types_list_title(row: usize, total: usize, unfiltered: usize, path_focus: bool, search: &str, pane_width: u16) -> Line<'static> {
+    let focus = if path_focus { "details" } else { "list" };
+    let counter = if search.is_empty() {
+        format!("Types {}/{} ({focus}) ", row, total)
+    } else {
+        let omitted = unfiltered.saturating_sub(total);
+        format!("Types {}/{} ({omitted} omitted, filter: {}) ", row, total, truncate_text(search, 16))
+    };
+    if pane_width < 20 {
+        return Line::from("Types");
+    }
+    if (pane_width as usize) < counter.len() + 4 {
+        return Line::from(counter);
+    }
+    // Narrow: just show keys without descriptions
+    if pane_width < 56 {
+        return Line::from(vec![
+            Span::raw(counter),
+            styled_hotkey("↵"),
+            Span::raw("/"),
+            styled_hotkey("t"),
+            Span::raw("/"),
+            styled_hotkey("/"),
+        ]);
+    }
+    // Medium: short descriptions
+    if pane_width < 80 {
+        return Line::from(vec![
+            Span::raw(counter),
+            styled_hotkey("↵"),
+            Span::raw(" details, "),
+            styled_hotkey("t"),
+            Span::raw(" filter, "),
+            styled_hotkey("/"),
+            Span::raw(" search"),
+        ]);
+    }
+    // Wide: full descriptions
+    Line::from(vec![
+        Span::raw(counter),
+        styled_hotkey("↵"),
+        Span::raw(" details, "),
+        styled_hotkey("t"),
+        Span::raw(" filter, "),
+        styled_hotkey("/"),
+        Span::raw(" search, by count"),
+    ])
 }
 
 fn action_periods_title(pane_width: u16) -> Line<'static> {
@@ -491,11 +544,12 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         if idx == app.type_index {
             style = if app.types_path_focus {
                 style.fg(Color::Gray)
+            } else if tp.known_unrelated {
+                style.fg(Color::Yellow).add_modifier(Modifier::DIM)
             } else {
                 style.fg(Color::Yellow).add_modifier(Modifier::BOLD)
             };
-        }
-        if tp.known_unrelated {
+        } else if tp.known_unrelated {
             style = style.fg(Color::DarkGray);
         }
         let name = app.model.type_display_name(type_id);
@@ -504,19 +558,13 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
             style,
         )])));
     }
-    let type_title = format!(
-        "Types row {}/{} ({})  [enter/right details, t filter, / search]",
-        if total_types == 0 {
-            0
-        } else {
-            selected_type + 1
-        },
+    let type_title = types_list_title(
+        if total_types == 0 { 0 } else { selected_type + 1 },
         total_types,
-        if app.types_path_focus {
-            "details focus"
-        } else {
-            "list focus"
-        }
+        app.model.types.len(),
+        app.types_path_focus,
+        &app.types_filter,
+        cols[0].width,
     );
     frame.render_widget(
         List::new(type_items).block(Block::default().title(type_title).borders(Borders::ALL)),
@@ -628,6 +676,8 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f64) 
         Span::styled("t:", Style::default().fg(Color::Yellow)),
         Span::raw(format!("{}  ", type_filter_display)),
         Span::styled("/:", Style::default().fg(Color::Yellow)),
+        Span::raw(format!("{}  ", app.event_filters.substring_filter)),
+        Span::styled("z:", Style::default().fg(Color::Yellow)),
         Span::raw(format!("{}  ", app.event_filters.fuzzy_filter)),
         Span::styled("e:", Style::default().fg(Color::Yellow)),
         Span::raw(app.event_filters.exact_filter.clone()),
@@ -798,6 +848,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             20,
         )
     };
+    let substring = display_filter(&app.event_filters.substring_filter);
     let fuzzy = display_filter(&app.event_filters.fuzzy_filter);
     let exact = display_filter(&app.event_filters.exact_filter);
     let unrelated_count = app
@@ -834,25 +885,31 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let labels = if show_long_names {
-        ["k/key", "t/type", "/fuzzy", "e/exact", "u/unrelated"]
+        ["k/key", "t/type", "//sub", "z/fuzzy", "e/exact", "u/unrelated"]
     } else {
-        ["k", "t", "/", "e", "u"]
+        ["k", "t", "/", "z", "e", "u"]
     };
     push_value(labels[0], key, !app.event_filters.key_filter.is_empty(), 0);
     push_value(labels[1], typ, !app.event_filters.type_filter.is_empty(), 1);
     push_value(
         labels[2],
-        fuzzy,
-        !app.event_filters.fuzzy_filter.is_empty(),
+        substring,
+        !app.event_filters.substring_filter.is_empty(),
         2,
     );
     push_value(
         labels[3],
-        exact,
-        !app.event_filters.exact_filter.is_empty(),
+        fuzzy,
+        !app.event_filters.fuzzy_filter.is_empty(),
         3,
     );
-    push_value(labels[4], unrelated, unrelated_count > 0, 4);
+    push_value(
+        labels[4],
+        exact,
+        !app.event_filters.exact_filter.is_empty(),
+        4,
+    );
+    push_value(labels[5], unrelated, unrelated_count > 0, 5);
     row.push(Span::raw("  "));
     row.push(Span::styled("state:", Style::default().fg(Color::Gray)));
     if app.filters_suspended() {
@@ -862,7 +919,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ));
     } else {
         row.push(Span::styled(
-            format!("active:{}/4", filters_active),
+            format!("active:{}/5", filters_active),
             Style::default().fg(if filters_active > 0 {
                 Color::LightGreen
             } else {
@@ -918,7 +975,7 @@ fn draw_full_help(frame: &mut Frame<'_>) {
         Line::from("  Home/End jump to top/bottom"),
         Line::from("  PageUp/PageDown move viewport and cursor (Ctrl+U / Ctrl+D also)"),
         Line::from("  with key focus: up/down select key, k apply key filter, t jump to type"),
-        Line::from("  k/t//e set filters, c clear filters, y toggle filters on/off"),
+        Line::from("  k/t///z/e set filters (/ substring, z fuzzy), c clear filters, y toggle filters on/off"),
         Line::from(""),
         Line::from("Periods"),
         Line::from("  3 panes: periods | events | selected JSON"),
@@ -937,7 +994,7 @@ fn draw_full_help(frame: &mut Frame<'_>) {
         Line::from(""),
         Line::from("Baseline"),
         Line::from("  up/down scroll | enter inspect"),
-        Line::from("  k keys filter, t type filter, / fuzzy filter, e exact path=value"),
+        Line::from("  k keys filter, t type filter, / substring filter, z fuzzy filter, e exact path=value"),
     ];
     frame.render_widget(
         Paragraph::new(Text::from(body))
@@ -982,12 +1039,14 @@ fn draw_inspector(frame: &mut Frame<'_>, inspector: &ObjectInspector, app: &App)
     );
 
     let selected_path = inspector.key_paths.get(inspector.key_index);
+    let sub_lc = app.event_filters.substring_filter.to_lowercase();
     let rendered = render_json_keypicker(
         &inspector.event.obj,
         selected_path,
         true,
         false,
         &app.event_filters.key_filter,
+        &sub_lc,
         app.model
             .types
             .get(&inspector.event.type_id)
@@ -1009,6 +1068,7 @@ fn render_json_keypicker(
     _focused: bool,
     value_focus: bool,
     active_key_filter: &str,
+    substring_filter: &str,
     considered_paths: Option<&IndexMap<String, bool>>,
 ) -> JsonRender {
     let mut lines = Vec::new();
@@ -1021,6 +1081,7 @@ fn render_json_keypicker(
         selected_path.map(|s| s.as_str()),
         value_focus,
         active_key_filter,
+        substring_filter,
         considered_paths,
         &mut lines,
         &mut selected_line,
@@ -1039,6 +1100,7 @@ fn render_json_value_lines(
     selected_path: Option<&str>,
     value_focus: bool,
     active_key_filter: &str,
+    substring_filter: &str,
     considered_paths: Option<&IndexMap<String, bool>>,
     out: &mut Vec<Line<'static>>,
     selected_line: &mut Option<usize>,
@@ -1063,6 +1125,7 @@ fn render_json_value_lines(
                     selected_path,
                     value_focus,
                     active_key_filter,
+                    substring_filter,
                     considered_paths,
                     out,
                     selected_line,
@@ -1089,6 +1152,7 @@ fn render_json_value_lines(
                     selected_path,
                     value_focus,
                     active_key_filter,
+                    substring_filter,
                     considered_paths,
                     out,
                     selected_line,
@@ -1100,9 +1164,16 @@ fn render_json_value_lines(
         _ => {
             let value_text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
             let tail = if is_last { "" } else { "," };
+            let highlight = !substring_filter.is_empty()
+                && value_text.to_lowercase().contains(substring_filter);
+            let val_style = if highlight {
+                Style::default().fg(Color::Black).bg(Color::Yellow)
+            } else {
+                json_value_style(value)
+            };
             out.push(Line::from(vec![
                 Span::raw("  ".repeat(indent)),
-                Span::styled(value_text, json_value_style(value)),
+                Span::styled(value_text, val_style),
                 Span::styled(tail, json_punctuation_style()),
             ]));
         }
@@ -1162,6 +1233,7 @@ fn render_json_keyed_value_line(
     selected_path: Option<&str>,
     value_focus: bool,
     active_key_filter: &str,
+    substring_filter: &str,
     considered_paths: Option<&IndexMap<String, bool>>,
     out: &mut Vec<Line<'static>>,
     selected_line: &mut Option<usize>,
@@ -1169,6 +1241,8 @@ fn render_json_keyed_value_line(
     let selected = selected_path == Some(path);
     let filtered = !active_key_filter.is_empty() && active_key_filter == path;
     let normalized_out = is_path_normalized_out(considered_paths, path);
+    let key_highlight = !substring_filter.is_empty()
+        && key.map(|k| k.to_lowercase().contains(substring_filter)).unwrap_or(false);
     let key_override = if selected {
         Style::default()
             .fg(Color::Yellow)
@@ -1196,6 +1270,8 @@ fn render_json_keyed_value_line(
     if let Some(k) = key {
         let key_style = if selected || filtered {
             key_override
+        } else if key_highlight {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
         } else {
             apply_normalized_out_style(json_key_base_style(), normalized_out)
         };
@@ -1225,6 +1301,7 @@ fn render_json_keyed_value_line(
                     selected_path,
                     value_focus,
                     active_key_filter,
+                    substring_filter,
                     considered_paths,
                     out,
                     selected_line,
@@ -1248,6 +1325,7 @@ fn render_json_keyed_value_line(
                     selected_path,
                     value_focus,
                     active_key_filter,
+                    substring_filter,
                     considered_paths,
                     out,
                     selected_line,
@@ -1261,12 +1339,16 @@ fn render_json_keyed_value_line(
             }
             let mut line = prefix;
             let value_text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+            let value_highlight = !substring_filter.is_empty()
+                && value_text.to_lowercase().contains(substring_filter);
             let value_override = if selected && value_focus {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else if selected {
                 Style::default().fg(Color::Yellow)
+            } else if value_highlight {
+                Style::default().fg(Color::Black).bg(Color::Yellow)
             } else if filtered {
                 Style::default().fg(Color::LightGreen)
             } else {

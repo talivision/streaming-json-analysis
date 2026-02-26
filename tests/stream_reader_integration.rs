@@ -21,13 +21,31 @@ fn temp_stream_path() -> PathBuf {
 }
 
 #[test]
-fn stream_reader_polls_incrementally_and_ignores_invalid_json() {
+fn stream_reader_fails_fast_on_invalid_json_line() {
     let path = temp_stream_path();
     fs::write(
         &path,
         "{\"event\":\"a\"}\nnot-json\n\n{\"event\":\"b\",\"n\":1}\n",
     )
     .expect("write initial file");
+
+    let mut reader = StreamReader::new(path.clone());
+    let result = reader.poll();
+    assert!(result.is_err(), "poll must fail on invalid JSON line");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("multiple lines") || msg.contains("Invalid JSON"),
+        "error should mention multi-line: {msg}"
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn stream_reader_polls_incrementally() {
+    let path = temp_stream_path();
+    fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\",\"n\":1}\n")
+        .expect("write initial file");
 
     let mut reader = StreamReader::new(path.clone());
     let first = reader.poll().expect("first poll succeeds");

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use serde_json::Value;
 use std::fs::File;
@@ -107,20 +107,28 @@ impl StreamReader {
 
         self.offset += consumed as u64;
 
-        let parse_line = |(start, end): &(usize, usize)| -> Option<Value> {
+        let parse_line = |(start, end): &(usize, usize)| -> Result<Option<Value>> {
             let slice = &chunk[*start..*end];
             if slice.iter().all(|b| matches!(*b, b' ' | b'\t' | b'\r')) {
-                return None;
+                return Ok(None);
             }
-            serde_json::from_slice::<Value>(slice).ok()
+            match serde_json::from_slice::<Value>(slice) {
+                Ok(v) => Ok(Some(v)),
+                Err(e) => {
+                    let preview = String::from_utf8_lossy(&slice[..slice.len().min(120)]);
+                    Err(anyhow!(
+                        "Invalid JSON line — single object spread across multiple lines? {e}. Line: {preview:?}"
+                    ))
+                }
+            }
         };
 
-        let out = if line_spans.len() >= MIN_PAR_PARSE_LINES {
-            line_spans.par_iter().filter_map(parse_line).collect()
+        let opts: Vec<Option<Value>> = if line_spans.len() >= MIN_PAR_PARSE_LINES {
+            line_spans.par_iter().map(parse_line).collect::<Result<Vec<_>>>()?
         } else {
-            line_spans.iter().filter_map(parse_line).collect()
+            line_spans.iter().map(parse_line).collect::<Result<Vec<_>>>()?
         };
-        Ok(out)
+        Ok(opts.into_iter().flatten().collect())
     }
 
     pub fn poll_snapshot_parallel(&mut self) -> Result<Vec<Value>> {
@@ -177,18 +185,26 @@ impl StreamReader {
         }
         self.offset += consumed as u64;
 
-        let parse_line = |(start, end): &(usize, usize)| -> Option<Value> {
+        let parse_line = |(start, end): &(usize, usize)| -> Result<Option<Value>> {
             let slice = &chunk[*start..*end];
             if slice.iter().all(|b| matches!(*b, b' ' | b'\t' | b'\r')) {
-                return None;
+                return Ok(None);
             }
-            serde_json::from_slice::<Value>(slice).ok()
+            match serde_json::from_slice::<Value>(slice) {
+                Ok(v) => Ok(Some(v)),
+                Err(e) => {
+                    let preview = String::from_utf8_lossy(&slice[..slice.len().min(120)]);
+                    Err(anyhow!(
+                        "Invalid JSON line — single object spread across multiple lines? {e}. Line: {preview:?}"
+                    ))
+                }
+            }
         };
 
         let parsed: Vec<Option<Value>> = if line_spans.len() >= MIN_PAR_PARSE_LINES {
-            line_spans.par_iter().map(parse_line).collect()
+            line_spans.par_iter().map(parse_line).collect::<Result<Vec<_>>>()?
         } else {
-            line_spans.iter().map(parse_line).collect()
+            line_spans.iter().map(parse_line).collect::<Result<Vec<_>>>()?
         };
         Ok(parsed.into_iter().flatten().collect())
     }
