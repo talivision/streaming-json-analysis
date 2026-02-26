@@ -44,7 +44,7 @@ pub struct PathStats {
     pub values: HashMap<String, u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PathOverride {
     ForcedOn,
     ForcedOff,
@@ -74,7 +74,96 @@ struct PeriodRateState {
     type_last_ts: HashMap<String, f64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+struct FilterTerm {
+    negated: bool,
+    value: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FilterExpr {
+    groups: Vec<Vec<FilterTerm>>,
+}
+
+impl FilterExpr {
+    fn parse(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Self::default();
+        }
+        let mut groups: Vec<Vec<FilterTerm>> = vec![Vec::new()];
+        let mut i = 0usize;
+        while i < trimmed.len() {
+            while i < trimmed.len() {
+                let ch = trimmed[i..].chars().next().unwrap_or('\0');
+                if !ch.is_whitespace() {
+                    break;
+                }
+                i += ch.len_utf8();
+            }
+            if i >= trimmed.len() {
+                break;
+            }
+
+            let start = i;
+            let mut in_quote: Option<char> = None;
+            let mut escaped = false;
+            while i < trimmed.len() {
+                let ch = trimmed[i..].chars().next().unwrap_or('\0');
+                if let Some(q) = in_quote {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == q {
+                        in_quote = None;
+                    }
+                    i += ch.len_utf8();
+                    continue;
+                }
+                if ch == '"' || ch == '\'' {
+                    in_quote = Some(ch);
+                    i += ch.len_utf8();
+                    continue;
+                }
+                if let Some(_) = read_expr_operator(trimmed, i) {
+                    break;
+                }
+                i += ch.len_utf8();
+            }
+
+            let raw_term = trimmed[start..i].trim();
+            if let Some(term) = parse_filter_term(raw_term) {
+                if let Some(group) = groups.last_mut() {
+                    group.push(term);
+                }
+            }
+
+            if let Some((is_or, consumed)) = read_expr_operator(trimmed, i) {
+                i += consumed;
+                if is_or {
+                    groups.push(Vec::new());
+                }
+            }
+        }
+        groups.retain(|g| !g.is_empty());
+        Self { groups }
+    }
+
+    fn matches(&self, mut predicate: impl FnMut(&str) -> bool) -> bool {
+        if self.groups.is_empty() {
+            return true;
+        }
+        self.groups.iter().any(|group| {
+            group.iter().all(|term| {
+                let hit = predicate(term.value.as_str());
+                if term.negated { !hit } else { hit }
+            })
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DataFilters {
     pub key_filter: String,
     pub type_filter: String,
@@ -134,6 +223,8 @@ pub struct AnalyzerModel {
     baseline_elapsed_secs: f64,
     baseline_counts: HashMap<String, u64>,
     baseline_last_ts: Option<f64>,
+    baseline_last_seen_by_type: HashMap<String, f64>,
+    last_seen_by_type: HashMap<String, f64>,
     period_rate_states: HashMap<u64, PeriodRateState>,
     last_rate_ts: Option<f64>,
     last_event_ts: Option<f64>,
@@ -150,6 +241,8 @@ impl AnalyzerModel {
             baseline_elapsed_secs: 0.0,
             baseline_counts: HashMap::new(),
             baseline_last_ts: None,
+            baseline_last_seen_by_type: HashMap::new(),
+            last_seen_by_type: HashMap::new(),
             period_rate_states: HashMap::new(),
             last_rate_ts: None,
             last_event_ts: None,
@@ -240,7 +333,8 @@ impl AnalyzerModel {
             }
             update_uniqueness(entry, &scalar_paths, in_action_period)
         };
-        let rate = self.update_rate_scores(&type_id, period_id);
+        let prev_seen_ts = self.last_seen_by_type.get(type_id.as_str()).copied();
+        let rate = self.update_rate_scores(&type_id, period_id, prev_seen_ts, ts);
         if let Some(entry) = self.types.get_mut(&type_id) {
             entry.latest_rate = rate;
             entry.latest_uniq = uniq;
@@ -249,7 +343,7 @@ impl AnalyzerModel {
         let size_bytes = obj.to_string().len() as u32;
         self.events.push_back(EventRecord {
             ts,
-            type_id,
+            type_id: type_id.clone(),
             obj,
             keys,
             size_bytes,
@@ -258,6 +352,7 @@ impl AnalyzerModel {
             live_rate_score: rate,
             live_uniq_score: uniq,
         });
+        self.last_seen_by_type.insert(type_id, ts);
     }
 
     pub fn ingest_baseline(&mut self, obj: Value, ts: f64) {
@@ -274,6 +369,7 @@ impl AnalyzerModel {
         let obj = &prepared.obj;
         let type_id = &prepared.type_id;
         *self.baseline_counts.entry(type_id.clone()).or_insert(0) += 1;
+        self.baseline_last_seen_by_type.insert(type_id.clone(), ts);
 
         let uniq = {
             let entry = self.get_or_create_type_profile(type_id, obj);
@@ -287,15 +383,19 @@ impl AnalyzerModel {
         if let Some(entry) = self.types.get_mut(type_id) {
             entry.latest_uniq = uniq;
         }
+        self.last_seen_by_type.insert(type_id.clone(), ts);
     }
 
     pub fn refresh_live_anomaly_scores(&mut self) {
         let mut updates = Vec::new();
+        let mut prev_seen_by_type: HashMap<String, f64> = self.baseline_last_seen_by_type.clone();
         for (idx, e) in self.events.iter().enumerate() {
+            let prev_seen = prev_seen_by_type.get(&e.type_id).copied();
+            prev_seen_by_type.insert(e.type_id.clone(), e.ts);
             let Some(period_id) = e.action_period_id else {
                 continue;
             };
-            let rate = self.recomputed_rate_for(&e.type_id, period_id);
+            let rate = self.recomputed_rate_for_event(&e.type_id, period_id, e.ts, prev_seen);
             let uniq = self.recomputed_uniq_for(&e.type_id, &e.obj);
             updates.push((idx, rate, uniq));
         }
@@ -307,7 +407,41 @@ impl AnalyzerModel {
         }
     }
 
-    fn update_rate_scores(&mut self, type_id: &str, active_period_id: Option<u64>) -> f64 {
+    fn recomputed_rate_for_event(
+        &self,
+        type_id: &str,
+        period_id: u64,
+        event_ts: f64,
+        prev_seen_ts: Option<f64>,
+    ) -> f64 {
+        let Some(pr) = self.period_rate_states.get(&period_id) else {
+            return 0.0;
+        };
+        if pr.elapsed_secs < MIN_ACTION_RATE_DURATION_SECS {
+            return self.interarrival_rate_fallback(type_id, prev_seen_ts, event_ts);
+        }
+        let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
+        if action_count < 2.0 {
+            return self.interarrival_rate_fallback(type_id, prev_seen_ts, event_ts);
+        }
+        let type_elapsed = pr.type_last_ts.get(type_id).copied().unwrap_or(0.0)
+            - pr.type_first_ts.get(type_id).copied().unwrap_or(0.0);
+        if type_elapsed <= 0.0 {
+            return self.interarrival_rate_fallback(type_id, prev_seen_ts, event_ts);
+        }
+        let action_rate = (action_count - 1.0) / type_elapsed;
+        let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
+        let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
+        normalized_rate_anomaly(action_rate, baseline_rate)
+    }
+
+    fn update_rate_scores(
+        &mut self,
+        type_id: &str,
+        active_period_id: Option<u64>,
+        prev_seen_ts: Option<f64>,
+        now_ts: f64,
+    ) -> f64 {
         if let Some(pid) = active_period_id {
             let ts = self.last_event_ts.unwrap_or_default();
             let pr = self.period_rate_states.entry(pid).or_default();
@@ -318,15 +452,15 @@ impl AnalyzerModel {
                 pr.first_event_ts = Some(ts);
             }
             if pr.elapsed_secs < MIN_ACTION_RATE_DURATION_SECS {
-                return 0.0;
+                return self.interarrival_rate_fallback(type_id, prev_seen_ts, now_ts);
             }
             let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
             if action_count < 2.0 {
-                return 0.0;
+                return self.interarrival_rate_fallback(type_id, prev_seen_ts, now_ts);
             }
             let type_elapsed = pr.type_last_ts[type_id] - pr.type_first_ts[type_id];
             if type_elapsed <= 0.0 {
-                return 0.0;
+                return self.interarrival_rate_fallback(type_id, prev_seen_ts, now_ts);
             }
             let action_rate = (action_count - 1.0) / type_elapsed;
             let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
@@ -336,6 +470,23 @@ impl AnalyzerModel {
             *self.baseline_counts.entry(type_id.to_string()).or_insert(0) += 1;
             0.0
         }
+    }
+
+    fn interarrival_rate_fallback(&self, type_id: &str, prev_seen_ts: Option<f64>, now_ts: f64) -> f64 {
+        let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
+        if baseline_count <= 0.0 {
+            return 1.0;
+        }
+        let Some(prev_ts) = prev_seen_ts else {
+            return 0.0;
+        };
+        let delta = now_ts - prev_ts;
+        if delta <= 0.0 {
+            return 1.0;
+        }
+        let action_rate = 1.0 / delta;
+        let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
+        normalized_rate_anomaly(action_rate, baseline_rate)
     }
 
     fn account_rate_elapsed(&mut self, now_ts: f64) {
@@ -383,43 +534,43 @@ impl AnalyzerModel {
         }
     }
 
-    fn recomputed_rate_for(&self, type_id: &str, period_id: u64) -> f64 {
-        let Some(pr) = self.period_rate_states.get(&period_id) else {
-            return 0.0;
-        };
-        if pr.elapsed_secs < MIN_ACTION_RATE_DURATION_SECS {
-            return 0.0;
-        }
-        let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
-        if action_count < 2.0 {
-            return 0.0;
-        }
-        let type_elapsed = pr.type_last_ts.get(type_id).copied().unwrap_or(0.0)
-            - pr.type_first_ts.get(type_id).copied().unwrap_or(0.0);
-        if type_elapsed <= 0.0 {
-            return 0.0;
-        }
-        let action_rate = (action_count - 1.0) / type_elapsed;
-        let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
+    pub fn rate_debug_info_for_event_index(&self, event_idx: usize) -> Option<(f64, f64)> {
+        let event = self.events.get(event_idx)?;
+        let period_id = event.action_period_id?;
+        let baseline_count = self.baseline_counts.get(&event.type_id).copied().unwrap_or(0) as f64;
         let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
-        normalized_rate_anomaly(action_rate, baseline_rate)
+
+        let pr = self.period_rate_states.get(&period_id)?;
+        let action_count = pr.counts.get(&event.type_id).copied().unwrap_or(0) as f64;
+        if action_count >= 2.0 {
+            let type_elapsed = pr.type_last_ts.get(&event.type_id).copied().unwrap_or(0.0)
+                - pr.type_first_ts.get(&event.type_id).copied().unwrap_or(0.0);
+            if type_elapsed > 0.0 {
+                let action_rate = (action_count - 1.0) / type_elapsed;
+                return Some((action_rate, baseline_rate));
+            }
+        }
+
+        let prev_seen = self.prev_seen_ts_for_event(event_idx, &event.type_id);
+        let action_rate = prev_seen
+            .and_then(|prev| {
+                let dt = event.ts - prev;
+                (dt > 0.0).then_some(1.0 / dt)
+            })
+            .unwrap_or(0.0);
+        Some((action_rate, baseline_rate))
     }
 
-    pub fn rate_debug_info(&self, type_id: &str, period_id: u64) -> Option<(f64, f64)> {
-        let pr = self.period_rate_states.get(&period_id)?;
-        let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
-        if action_count < 2.0 {
-            return None;
+    fn prev_seen_ts_for_event(&self, event_idx: usize, type_id: &str) -> Option<f64> {
+        if event_idx > 0 {
+            for i in (0..event_idx).rev() {
+                let e = self.events.get(i)?;
+                if e.type_id == type_id {
+                    return Some(e.ts);
+                }
+            }
         }
-        let type_elapsed = pr.type_last_ts.get(type_id).copied()?
-            - pr.type_first_ts.get(type_id).copied()?;
-        if type_elapsed <= 0.0 {
-            return None;
-        }
-        let action_rate = (action_count - 1.0) / type_elapsed;
-        let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
-        let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
-        Some((action_rate, baseline_rate))
+        self.baseline_last_seen_by_type.get(type_id).copied()
     }
 
     fn recomputed_uniq_for(&self, type_id: &str, obj: &Value) -> f64 {
@@ -483,6 +634,31 @@ impl AnalyzerModel {
                     tp.path_overrides.shift_remove(path);
                 }
             }
+            sync_type_considered_paths(tp);
+        }
+    }
+
+    pub fn manual_path_overrides(&self) -> Vec<(String, String, PathOverride)> {
+        let mut out = Vec::new();
+        for (type_id, tp) in &self.types {
+            for (path, mode) in &tp.path_overrides {
+                out.push((type_id.clone(), path.clone(), *mode));
+            }
+        }
+        out
+    }
+
+    pub fn apply_manual_path_overrides(&mut self, overrides: &[(String, String, PathOverride)]) {
+        for tp in self.types.values_mut() {
+            tp.path_overrides.clear();
+        }
+        for (type_id, path, mode) in overrides {
+            if let Some(tp) = self.types.get_mut(type_id) {
+                tp.path_overrides.insert(path.clone(), *mode);
+            }
+        }
+        for tp in self.types.values_mut() {
+            sync_type_considered_paths(tp);
         }
     }
 
@@ -593,75 +769,27 @@ impl AnalyzerModel {
         range: Option<(f64, f64)>,
     ) -> Vec<usize> {
         let mut out = Vec::new();
-        let type_query = filters.type_filter.to_lowercase();
-        let fuzzy_query = filters.fuzzy_filter.to_lowercase();
-        let substring_query = filters.substring_filter.to_lowercase();
-        let wanted_keys: Vec<&str> = if filters.key_filter.is_empty() {
-            Vec::new()
-        } else {
-            filters
-                .key_filter
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect()
-        };
-        let parsed_exact: Option<(String, String)> = if !filters.exact_filter.is_empty() {
-            parse_exact_filter(&filters.exact_filter).map(|(k, v)| (k.to_string(), v))
-        } else {
-            None
-        };
+        let type_expr = FilterExpr::parse(&filters.type_filter);
+        let key_expr = FilterExpr::parse(&filters.key_filter);
+        let substring_expr = FilterExpr::parse(&filters.substring_filter);
+        let fuzzy_expr = FilterExpr::parse(&filters.fuzzy_filter);
+        let exact_expr = FilterExpr::parse(&filters.exact_filter);
 
         for (idx, e) in self.events.iter().enumerate() {
-            if self
-                .types
-                .get(e.type_id.as_str())
-                .map(|tp| tp.known_unrelated)
-                .unwrap_or(false)
-            {
-                continue;
-            }
             if let Some((start, end)) = range {
                 if e.ts < start || e.ts > end {
                     continue;
                 }
             }
-            if !type_query.is_empty() {
-                let canonical = self.canonical_type_name(&e.type_id).to_lowercase();
-                if !canonical.contains(&type_query) {
-                    continue;
-                }
-            }
-            if !wanted_keys.is_empty()
-                && !wanted_keys
-                    .iter()
-                    .all(|k| e.keys.iter().any(|event_key| event_key == k))
-            {
+            if !self.matches_filters(
+                e,
+                &type_expr,
+                &key_expr,
+                &substring_expr,
+                &fuzzy_expr,
+                &exact_expr,
+            ) {
                 continue;
-            }
-            if !substring_query.is_empty() {
-                let obj = serde_json::to_string(&e.obj)
-                    .unwrap_or_default()
-                    .to_lowercase();
-                if !obj.contains(&substring_query) {
-                    continue;
-                }
-            }
-            if !fuzzy_query.is_empty() {
-                let obj = serde_json::to_string(&e.obj)
-                    .unwrap_or_default()
-                    .to_lowercase();
-                if !fuzzy_match(&obj, &fuzzy_query) {
-                    continue;
-                }
-            }
-            if let Some((ref k, ref v)) = parsed_exact {
-                let found = value_at_path(&e.obj, k)
-                    .map(|actual| exact_value_matches(actual, v))
-                    .unwrap_or(false);
-                if !found {
-                    continue;
-                }
             }
             out.push(idx);
         }
@@ -683,71 +811,83 @@ impl AnalyzerModel {
         range: Option<(f64, f64)>,
     ) -> Vec<&'a EventRecord> {
         let mut out = Vec::new();
-        let type_query = filters.type_filter.to_lowercase();
-        // Parse once outside the loop instead of per-event.
-        let parsed_exact: Option<(String, String)> = if !filters.exact_filter.is_empty() {
-            parse_exact_filter(&filters.exact_filter).map(|(k, v)| (k.to_string(), v))
-        } else {
-            None
-        };
+        let type_expr = FilterExpr::parse(&filters.type_filter);
+        let key_expr = FilterExpr::parse(&filters.key_filter);
+        let substring_expr = FilterExpr::parse(&filters.substring_filter);
+        let fuzzy_expr = FilterExpr::parse(&filters.fuzzy_filter);
+        let exact_expr = FilterExpr::parse(&filters.exact_filter);
         for e in iter {
-            if self
-                .types
-                .get(e.type_id.as_str())
-                .map(|tp| tp.known_unrelated)
-                .unwrap_or(false)
-            {
-                continue;
-            }
             if let Some((start, end)) = range {
                 if e.ts < start || e.ts > end {
                     continue;
                 }
             }
-            if !filters.type_filter.is_empty() {
-                let canonical = self.canonical_type_name(&e.type_id).to_lowercase();
-                if !canonical.contains(&type_query) {
-                    continue;
-                }
-            }
-            if !filters.key_filter.is_empty() {
-                let wanted: Vec<&str> = filters
-                    .key_filter
-                    .split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if !wanted.iter().all(|k| e.keys.iter().any(|ek| ek == k)) {
-                    continue;
-                }
-            }
-            if !filters.substring_filter.is_empty() {
-                let s = serde_json::to_string(&e.obj)
-                    .unwrap_or_default()
-                    .to_lowercase();
-                if !s.contains(&filters.substring_filter.to_lowercase()) {
-                    continue;
-                }
-            }
-            if !filters.fuzzy_filter.is_empty() {
-                let s = serde_json::to_string(&e.obj)
-                    .unwrap_or_default()
-                    .to_lowercase();
-                if !fuzzy_match(&s, &filters.fuzzy_filter.to_lowercase()) {
-                    continue;
-                }
-            }
-            if let Some((ref k, ref v)) = parsed_exact {
-                let found = value_at_path(&e.obj, k)
-                    .map(|actual| exact_value_matches(actual, v))
-                    .unwrap_or(false);
-                if !found {
-                    continue;
-                }
+            if !self.matches_filters(
+                e,
+                &type_expr,
+                &key_expr,
+                &substring_expr,
+                &fuzzy_expr,
+                &exact_expr,
+            ) {
+                continue;
             }
             out.push(e);
         }
         out
+    }
+
+    fn matches_filters(
+        &self,
+        e: &EventRecord,
+        type_expr: &FilterExpr,
+        key_expr: &FilterExpr,
+        substring_expr: &FilterExpr,
+        fuzzy_expr: &FilterExpr,
+        exact_expr: &FilterExpr,
+    ) -> bool {
+        let canonical = self.canonical_type_name(&e.type_id).to_lowercase();
+        if !type_expr.matches(|term| canonical.contains(&term.to_lowercase())) {
+            return false;
+        }
+
+        if !key_expr.matches(|term| {
+            let term_lc = term.to_lowercase();
+            e.keys
+                .iter()
+                .any(|event_key| event_key.to_lowercase() == term_lc)
+        }) {
+            return false;
+        }
+
+        let mut object_cache: Option<String> = None;
+        if !substring_expr.matches(|term| {
+            let obj_text = object_cache
+                .get_or_insert_with(|| serde_json::to_string(&e.obj).unwrap_or_default().to_lowercase());
+            obj_text.contains(&term.to_lowercase())
+        }) {
+            return false;
+        }
+        if !fuzzy_expr.matches(|term| {
+            let obj_text = object_cache
+                .get_or_insert_with(|| serde_json::to_string(&e.obj).unwrap_or_default().to_lowercase());
+            fuzzy_match(obj_text.as_str(), &term.to_lowercase())
+        }) {
+            return false;
+        }
+        if !exact_expr.matches(|term| {
+            parse_exact_filter(term)
+                .map(|(k, v)| {
+                    value_at_path(&e.obj, k)
+                        .map(|actual| exact_value_matches(actual, &v))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        }) {
+            return false;
+        }
+
+        true
     }
 
     pub fn closed_periods(&self) -> Vec<&ActionPeriod> {
@@ -827,6 +967,18 @@ fn update_uniqueness(
     }
 
     max_score
+}
+
+fn sync_type_considered_paths(tp: &mut TypeProfile) {
+    for (path, stats) in tp.path_stats.iter() {
+        let auto = auto_consider_path(path.as_str(), stats);
+        let considered = match tp.path_overrides.get(path.as_str()).copied() {
+            Some(PathOverride::ForcedOn) => true,
+            Some(PathOverride::ForcedOff) => false,
+            None => auto,
+        };
+        tp.considered_paths.insert(path.clone(), considered);
+    }
 }
 
 fn is_volatile_path(path: &str) -> bool {
@@ -951,6 +1103,103 @@ pub fn value_token(v: &Value) -> String {
 fn parse_exact_filter(filter: &str) -> Option<(&str, String)> {
     let (k, v) = filter.split_once('=')?;
     Some((k.trim(), v.trim().to_string()))
+}
+
+fn parse_filter_term(raw: &str) -> Option<FilterTerm> {
+    let mut s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut negated = false;
+    while let Some(rest) = s.strip_prefix('!') {
+        negated = !negated;
+        s = rest.trim_start();
+    }
+    let value = unquote_filter_literal(s);
+    if value.is_empty() {
+        return None;
+    }
+    Some(FilterTerm { negated, value })
+}
+
+fn unquote_filter_literal(s: &str) -> String {
+    let t = s.trim();
+    if t.len() < 2 {
+        return t.to_string();
+    }
+    let first = t.chars().next().unwrap_or('\0');
+    let last = t.chars().last().unwrap_or('\0');
+    if !((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+        return t.to_string();
+    }
+    let inner = &t[first.len_utf8()..t.len() - last.len_utf8()];
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn read_expr_operator(raw: &str, idx: usize) -> Option<(bool, usize)> {
+    let rest = &raw[idx..];
+    if rest.starts_with("&&") {
+        return Some((false, 2));
+    }
+    if rest.starts_with("||") {
+        return Some((true, 2));
+    }
+    if rest.starts_with(',') {
+        return Some((false, 1));
+    }
+    if rest.starts_with('|') {
+        return Some((true, 1));
+    }
+    if starts_word_op(raw, idx, "and") {
+        return Some((false, 3));
+    }
+    if starts_word_op(raw, idx, "or") {
+        return Some((true, 2));
+    }
+    None
+}
+
+fn starts_word_op(raw: &str, idx: usize, op: &str) -> bool {
+    let rest = &raw[idx..];
+    if !rest.starts_with(op) {
+        return false;
+    }
+    let before_ok = if idx == 0 {
+        true
+    } else {
+        raw[..idx]
+            .chars()
+            .last()
+            .map(is_expr_boundary)
+            .unwrap_or(true)
+    };
+    let end = idx + op.len();
+    let after_ok = if end >= raw.len() {
+        true
+    } else {
+        raw[end..]
+            .chars()
+            .next()
+            .map(is_expr_boundary)
+            .unwrap_or(true)
+    };
+    before_ok && after_ok
+}
+
+fn is_expr_boundary(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, ',' | '|' | '&' | '(' | ')' | '[' | ']')
 }
 
 fn exact_value_matches(actual: &Value, expected: &str) -> bool {
@@ -1228,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    fn known_unrelated_types_are_suppressed_from_filtered_events() {
+    fn known_unrelated_flag_no_longer_suppresses_events() {
         let mut model = AnalyzerModel::new();
         model.ingest(json!({"event":"noise","k":1}), 1.0);
         model.ingest(json!({"event":"signal","k":2,"ctx":{"source":"web"}}), 2.0);
@@ -1238,10 +1487,37 @@ mod tests {
 
         let filters = DataFilters::default();
         let events = model.filtered_events(&filters);
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn composed_and_negative_filters_work() {
+        let mut model = AnalyzerModel::new();
+        model.ingest(json!({"event":"login","user":"alice","host":"api"}), 1.0);
+        model.ingest(json!({"event":"login","user":"bob","host":"worker"}), 2.0);
+        model.ingest(json!({"event":"logout","user":"alice","host":"api"}), 3.0);
+
+        let filters = DataFilters {
+            exact_filter: "user=alice && !event=logout".to_string(),
+            ..DataFilters::default()
+        };
+        let events = model.filtered_events(&filters);
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            value_at_path(&events[0].obj, "event"),
-            Some(&json!("noise"))
-        );
+        assert_eq!(value_at_path(&events[0].obj, "user"), Some(&json!("alice")));
+    }
+
+    #[test]
+    fn quoted_terms_support_whitespace_and_negation() {
+        let mut model = AnalyzerModel::new();
+        model.ingest(json!({"msg":"alpha beta gamma"}), 1.0);
+        model.ingest(json!({"msg":"alpha and beta"}), 2.0);
+
+        let filters = DataFilters {
+            substring_filter: "!\"and beta\" && \"alpha beta\"".to_string(),
+            ..DataFilters::default()
+        };
+        let events = model.filtered_events(&filters);
+        assert_eq!(events.len(), 1);
+        assert_eq!(value_at_path(&events[0].obj, "msg"), Some(&json!("alpha beta gamma")));
     }
 }
