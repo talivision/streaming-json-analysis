@@ -852,11 +852,17 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
         } else {
             &[]
         };
+        let key_paths = app.data_selected_key_paths();
+        let selected_path = if app.data_key_focus {
+            key_paths.get(app.data_key_index)
+        } else {
+            None
+        };
         let rendered = render_json_keypicker(
             &sel.obj,
-            None,
-            false,
-            false,
+            selected_path,
+            app.data_key_focus,
+            app.data_value_focus,
             &app.event_filters.key_filter,
             &sub_lc,
             whitelist_terms,
@@ -874,7 +880,11 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
-                    .title("selected JSON")
+                    .title(selected_json_title(
+                        app.data_key_focus,
+                        app.data_value_focus,
+                        cols[1].width,
+                    ))
                     .borders(Borders::ALL),
             ),
         cols[1],
@@ -1205,8 +1215,12 @@ fn draw_full_help(frame: &mut Frame<'_>, app: &App) {
         Line::from("  u toggle selected type in negative type filter (!\"type name\")"),
         Line::from(""),
         Line::from("Baseline"),
-        Line::from("  up/down scroll | enter inspect"),
-        Line::from("  k keys filter, t type filter, / substring filter, z fuzzy filter, e exact path=value, w whitelist"),
+        Line::from("  up/down scroll events"),
+        Line::from("  right or enter focus key selection in selected-object pane"),
+        Line::from("  left returns from key/value focus to event list"),
+        Line::from("  with key focus: up/down select key, k apply key filter, t jump to type"),
+        Line::from("  with value focus: e apply exact path=value filter"),
+        Line::from("  / substring filter, z fuzzy filter, e exact filter input, w whitelist"),
     ];
     frame.render_widget(
         Paragraph::new(Text::from(body))

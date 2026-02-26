@@ -2,6 +2,7 @@ use crate::domain::{
     prepare_event, value_at_path, value_token, ActionPeriod, AnalyzerModel, DataFilters,
     EventRecord, FilterField, PreparedEvent,
 };
+use crate::control_http::{ControlCommand, ControlReply};
 use crate::io::StreamReader;
 use crate::persistence::{
     export_session, invalidate_state, load_state, save_profile, save_state, RestoredState,
@@ -22,12 +23,14 @@ use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::io::stdout;
 use std::path::PathBuf;
 use std::collections::{HashSet, HashSet as StdHashSet};
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -101,6 +104,9 @@ pub struct App {
     pub path_index: usize,
     pub types_path_focus: bool,
     pub data_index: usize,
+    pub data_key_index: usize,
+    pub data_key_focus: bool,
+    pub data_value_focus: bool,
     pub periods_index: usize,
     pub period_event_index: usize,
     pub period_json_key_index: usize,
@@ -146,6 +152,7 @@ pub struct App {
     pending_profile_override: Option<SourceProfile>,
     baseline_tab_enabled: bool,
     export_path: Option<PathBuf>,
+    control_rx: Option<Receiver<ControlCommand>>,
     whitelist_terms: Vec<String>,
     whitelist_mode: WhitelistMode,
     profile_renames: Vec<(String, String)>,
@@ -158,6 +165,10 @@ pub struct App {
 }
 
 impl App {
+    pub fn set_control_receiver(&mut self, rx: Receiver<ControlCommand>) {
+        self.control_rx = Some(rx);
+    }
+
     pub fn new(
         stream_path: PathBuf,
         baseline_path: Option<PathBuf>,
@@ -191,6 +202,9 @@ impl App {
             path_index: 0,
             types_path_focus: false,
             data_index: 0,
+            data_key_index: 0,
+            data_key_focus: false,
+            data_value_focus: false,
             periods_index: 0,
             period_event_index: 0,
             period_json_key_index: 0,
@@ -243,6 +257,7 @@ impl App {
             pending_profile_override: None,
             baseline_tab_enabled: baseline_enabled,
             export_path: None,
+            control_rx: None,
             whitelist_terms: Vec::new(),
             whitelist_mode: WhitelistMode::Off,
             profile_renames: Vec::new(),
@@ -294,6 +309,7 @@ impl App {
                 if !self.baseline_loaded {
                     self.ingest_baseline_corpus()?;
                 }
+                self.drain_control_commands();
 
                 let mut ingested_any = false;
                 if !self.offline || !self.offline_loaded {
@@ -394,6 +410,143 @@ impl App {
         }
         self.apply_profile_seeded(profile);
         self.status = "Loaded source profile".to_string();
+    }
+
+    fn drain_control_commands(&mut self) {
+        loop {
+            let next = match self.control_rx.as_ref() {
+                None => return,
+                Some(rx) => match rx.try_recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        self.control_rx = None;
+                        None
+                    }
+                },
+            };
+            let Some(cmd) = next else {
+                return;
+            };
+            self.apply_control_command(cmd);
+        }
+    }
+
+    fn apply_control_command(&mut self, cmd: ControlCommand) {
+        match cmd {
+            ControlCommand::Start { label, reply } => {
+                let response = self.control_start_action(label);
+                let _ = reply.send(response);
+            }
+            ControlCommand::Stop { reply } => {
+                let response = self.control_stop_action();
+                let _ = reply.send(response);
+            }
+            ControlCommand::Status { reply } => {
+                let response = self.control_status_response();
+                let _ = reply.send(response);
+            }
+        }
+    }
+
+    fn control_start_action(&mut self, label: Option<String>) -> ControlReply {
+        if self.offline {
+            return ControlReply {
+                status: 409,
+                body: json!({ "ok": false, "error": "cannot start action period in offline mode" }),
+            };
+        }
+        if let Some(period) = self.model.active_period() {
+            return ControlReply {
+                status: 200,
+                body: json!({
+                    "ok": true,
+                    "changed": false,
+                    "active": true,
+                    "period": {
+                        "id": period.id,
+                        "label": period.label,
+                        "start": period.start,
+                        "end": period.end
+                    }
+                }),
+            };
+        }
+        if let Some(next_label) = label {
+            let trimmed = next_label.trim();
+            if !trimmed.is_empty() {
+                self.model.current_label = trimmed.to_string();
+            }
+        }
+        if !self.model.toggle_period() {
+            return ControlReply {
+                status: 409,
+                body: json!({
+                    "ok": false,
+                    "error": "cannot start action period before first event timestamp is ingested"
+                }),
+            };
+        }
+        self.pending_live_recompute = true;
+        self.status = if let Some(p) = self.model.active_period() {
+            format!("Action started: {} #{} (HTTP)", p.label, p.id)
+        } else {
+            "Action started (HTTP)".to_string()
+        };
+        self.control_status_with_changed(true)
+    }
+
+    fn control_stop_action(&mut self) -> ControlReply {
+        if self.offline {
+            return ControlReply {
+                status: 409,
+                body: json!({ "ok": false, "error": "cannot stop action period in offline mode" }),
+            };
+        }
+        if self.model.active_period().is_none() {
+            return ControlReply {
+                status: 200,
+                body: json!({
+                    "ok": true,
+                    "changed": false,
+                    "active": false,
+                    "period": Value::Null
+                }),
+            };
+        }
+        if !self.model.toggle_period() {
+            return ControlReply {
+                status: 500,
+                body: json!({ "ok": false, "error": "failed to stop action period" }),
+            };
+        }
+        self.pending_live_recompute = true;
+        self.status = "Action ended (HTTP)".to_string();
+        self.control_status_with_changed(true)
+    }
+
+    fn control_status_response(&self) -> ControlReply {
+        self.control_status_with_changed(false)
+    }
+
+    fn control_status_with_changed(&self, changed: bool) -> ControlReply {
+        let active_period = self.model.active_period();
+        ControlReply {
+            status: 200,
+            body: json!({
+                "ok": true,
+                "changed": changed,
+                "active": active_period.is_some(),
+                "period": active_period.map(|p| json!({
+                    "id": p.id,
+                    "label": p.label,
+                    "start": p.start,
+                    "end": p.end
+                })).unwrap_or(Value::Null),
+                "events": self.model.total_objects(),
+                "offline": self.offline
+            }),
+        }
     }
 
     fn apply_profile_seeded(&mut self, profile: SourceProfile) {
@@ -1072,6 +1225,9 @@ impl App {
             KeyCode::Esc if self.mode == UiMode::Live && self.live_key_focus => {
                 self.exit_live_key_focus();
             }
+            KeyCode::Esc if self.mode == UiMode::Data && self.data_key_focus => {
+                self.exit_data_key_focus();
+            }
             KeyCode::Char('h') | KeyCode::Char('?') => {
                 self.show_help_overlay = !self.show_help_overlay;
             }
@@ -1193,10 +1349,18 @@ impl App {
             KeyCode::Char('k') if self.mode == UiMode::Live && self.live_key_focus => {
                 self.apply_live_selected_key_filter();
             }
+            KeyCode::Char('k') if self.mode == UiMode::Data && self.data_key_focus => {
+                self.apply_data_selected_key_filter();
+            }
             KeyCode::Char('e')
                 if self.mode == UiMode::Live && self.live_key_focus && self.live_value_focus =>
             {
                 self.apply_live_selected_value_filter();
+            }
+            KeyCode::Char('e')
+                if self.mode == UiMode::Data && self.data_key_focus && self.data_value_focus =>
+            {
+                self.apply_data_selected_value_filter();
             }
             KeyCode::Char('e')
                 if self.mode == UiMode::Periods
@@ -1210,6 +1374,9 @@ impl App {
             }
             KeyCode::Char('t') if self.mode == UiMode::Live && self.live_key_focus => {
                 self.jump_to_live_selected_event_type()
+            }
+            KeyCode::Char('t') if self.mode == UiMode::Data && self.data_key_focus => {
+                self.jump_to_data_selected_event_type()
             }
             KeyCode::Char('t')
                 if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Json =>
@@ -1268,6 +1435,13 @@ impl App {
                     self.apply_live_selected_key_filter();
                 }
             }
+            KeyCode::Enter if self.mode == UiMode::Data && self.data_key_focus => {
+                if self.data_value_focus {
+                    self.apply_data_selected_value_filter();
+                } else {
+                    self.apply_data_selected_key_filter();
+                }
+            }
             KeyCode::Enter
                 if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Json =>
             {
@@ -1278,6 +1452,7 @@ impl App {
                 }
             }
             KeyCode::Enter if self.mode == UiMode::Live => self.toggle_live_key_focus(),
+            KeyCode::Enter if self.mode == UiMode::Data => self.toggle_data_key_focus(),
             KeyCode::Enter if self.mode == UiMode::Types => self.enter_types_path_focus(),
             KeyCode::Enter if self.mode == UiMode::Periods => self.advance_periods_focus(),
             KeyCode::Enter => self.open_selected_event(),
@@ -1970,6 +2145,62 @@ impl App {
     }
 
     fn navigate_data(&mut self, intent: NavIntent) {
+        if self.data_key_focus {
+            match intent {
+                NavIntent::LineUp => {
+                    self.data_key_index = self.data_key_index.saturating_sub(1);
+                    self.data_value_focus = false;
+                    return;
+                }
+                NavIntent::LineDown => {
+                    let keys = self.data_selected_key_paths();
+                    if self.data_key_index + 1 < keys.len() {
+                        self.data_key_index += 1;
+                    }
+                    self.data_value_focus = false;
+                    return;
+                }
+                NavIntent::Left => {
+                    if self.data_value_focus {
+                        self.data_value_focus = false;
+                    } else {
+                        self.exit_data_key_focus();
+                    }
+                    return;
+                }
+                NavIntent::Right => {
+                    if self.selected_data_value_token().is_some() {
+                        self.data_value_focus = true;
+                    } else {
+                        self.status = "Selected path has no value".to_string();
+                    }
+                    return;
+                }
+                NavIntent::PageUp => {
+                    self.data_key_index = self.data_key_index.saturating_sub(MENU_PAGE_STEP);
+                    self.data_value_focus = false;
+                    return;
+                }
+                NavIntent::PageDown => {
+                    let keys = self.data_selected_key_paths();
+                    self.data_key_index =
+                        (self.data_key_index + MENU_PAGE_STEP).min(keys.len().saturating_sub(1));
+                    self.data_value_focus = false;
+                    return;
+                }
+                NavIntent::Home => {
+                    self.data_key_index = 0;
+                    self.data_value_focus = false;
+                    return;
+                }
+                NavIntent::End => {
+                    let keys = self.data_selected_key_paths();
+                    self.data_key_index = keys.len().saturating_sub(1);
+                    self.data_value_focus = false;
+                    return;
+                }
+            }
+        }
         self.ensure_baseline_cache();
         let total = self.visible_baseline_events().len();
         let page_step = MENU_PAGE_STEP;
@@ -1980,8 +2211,22 @@ impl App {
             NavIntent::PageDown => (self.data_index + page_step).min(total.saturating_sub(1)),
             NavIntent::Home => 0,
             NavIntent::End => total.saturating_sub(1),
-            NavIntent::Left | NavIntent::Right => self.data_index,
+            NavIntent::Left => {
+                self.exit_data_key_focus();
+                return;
+            }
+            NavIntent::Right => {
+                if self.data_selected_key_paths().is_empty() {
+                    self.status = "Selected event has no keys".to_string();
+                    self.data_key_focus = false;
+                } else {
+                    self.enter_data_key_focus();
+                }
+                return;
+            }
         };
+        self.data_value_focus = false;
+        self.clamp_data_key_selection();
     }
 
     fn live_selected_event(&self) -> Option<&EventRecord> {
@@ -2014,6 +2259,8 @@ impl App {
         self.type_preview_open = false;
         self.periods_focus = PeriodsFocus::Periods;
         self.period_value_focus = false;
+        self.data_key_focus = false;
+        self.data_value_focus = false;
         self.exit_live_key_focus();
     }
 
@@ -2062,12 +2309,41 @@ impl App {
         }
     }
 
+    fn apply_data_selected_key_filter(&mut self) {
+        let keys = self.data_selected_key_paths();
+        if let Some(path) = keys.get(self.data_key_index) {
+            self.apply_key_filter_in_place(path);
+        } else {
+            self.status = "Selected event has no keys".to_string();
+        }
+    }
+
     fn apply_period_selected_value_filter(&mut self) {
         let keys = self.period_selected_key_paths();
         let Some(path) = keys.get(self.period_json_key_index) else {
             return;
         };
         let Some(token) = self.selected_period_value_token() else {
+            self.status = "Selected path has no value".to_string();
+            return;
+        };
+        let exact = format!("{}={}", path, token);
+        if self.event_filters.exact_filter == exact {
+            self.event_filters.exact_filter.clear();
+            self.status = format!("Removed exact filter: {}", exact);
+        } else {
+            self.event_filters.exact_filter = exact.clone();
+            self.status = format!("Applied exact filter: {}", exact);
+        }
+        self.after_filter_change(None);
+    }
+
+    fn apply_data_selected_value_filter(&mut self) {
+        let keys = self.data_selected_key_paths();
+        let Some(path) = keys.get(self.data_key_index) else {
+            return;
+        };
+        let Some(token) = self.selected_data_value_token() else {
             self.status = "Selected path has no value".to_string();
             return;
         };
@@ -2124,8 +2400,12 @@ impl App {
                 let n = self.visible_baseline_events().len();
                 if n == 0 {
                     self.data_index = 0;
+                    self.data_key_index = 0;
+                    self.data_key_focus = false;
+                    self.data_value_focus = false;
                 } else {
                     self.data_index = self.data_index.min(n.saturating_sub(1));
+                    self.clamp_data_key_selection();
                 }
             }
             UiMode::Types => {}
@@ -2187,6 +2467,15 @@ impl App {
         value_at_path(&event.obj, &key).map(value_token)
     }
 
+    fn selected_data_value_token(&self) -> Option<String> {
+        let event = self.selected_data_event()?;
+        let key = self
+            .data_selected_key_paths()
+            .get(self.data_key_index)?
+            .clone();
+        value_at_path(&event.obj, &key).map(value_token)
+    }
+
     fn jump_to_live_selected_event_type(&mut self) {
         let Some(event) = self.live_selected_event() else {
             return;
@@ -2220,6 +2509,27 @@ impl App {
             self.types_path_focus = false;
             self.live_key_focus = false;
             self.live_value_focus = false;
+            self.return_to_live_object_on_types_esc = false;
+            self.status = format!("Jumped to type {}", type_name);
+        }
+    }
+
+    fn jump_to_data_selected_event_type(&mut self) {
+        let Some(event) = self.selected_data_event() else {
+            return;
+        };
+        let type_id = event.type_id.clone();
+        if let Some(idx) = self.model.find_type_index(&type_id) {
+            let type_name = self.model.type_display_name(&type_id);
+            self.mode = UiMode::Types;
+            self.return_to_types_on_live_esc = false;
+            self.type_index = idx;
+            self.path_index = 0;
+            self.types_path_focus = false;
+            self.live_key_focus = false;
+            self.live_value_focus = false;
+            self.data_key_focus = false;
+            self.data_value_focus = false;
             self.return_to_live_object_on_types_esc = false;
             self.status = format!("Jumped to type {}", type_name);
         }
@@ -2906,6 +3216,18 @@ impl App {
         event.keys.clone()
     }
 
+    pub fn selected_data_event(&self) -> Option<&EventRecord> {
+        let event_idx = *self.baseline_visible_indices.get(self.data_index)?;
+        self.baseline_events.get(event_idx)
+    }
+
+    pub fn data_selected_key_paths(&self) -> Vec<String> {
+        let Some(event) = self.selected_data_event() else {
+            return Vec::new();
+        };
+        event.keys.clone()
+    }
+
     pub fn baseline_tab_enabled(&self) -> bool {
         self.baseline_tab_enabled
     }
@@ -3084,6 +3406,45 @@ impl App {
             return;
         }
         self.period_json_key_index = self.period_json_key_index.min(key_count.saturating_sub(1));
+    }
+
+    fn clamp_data_key_selection(&mut self) {
+        let key_count = self.data_selected_key_paths().len();
+        if key_count == 0 {
+            self.data_key_index = 0;
+            self.data_key_focus = false;
+            self.data_value_focus = false;
+            return;
+        }
+        self.data_key_index = self.data_key_index.min(key_count.saturating_sub(1));
+    }
+
+    fn enter_data_key_focus(&mut self) {
+        self.data_key_focus = true;
+        self.data_value_focus = false;
+        self.clamp_data_key_selection();
+    }
+
+    fn exit_data_key_focus(&mut self) {
+        self.data_key_focus = false;
+        self.data_value_focus = false;
+    }
+
+    fn toggle_data_key_focus(&mut self) {
+        self.ensure_baseline_cache();
+        self.clamp_data_key_selection();
+        if self.data_selected_key_paths().is_empty() {
+            self.status = "Selected event has no keys".to_string();
+            self.data_key_focus = false;
+            return;
+        }
+        if self.data_key_focus {
+            self.exit_data_key_focus();
+            self.status = "Baseline JSON keys focus: OFF".to_string();
+        } else {
+            self.enter_data_key_focus();
+            self.status = "Baseline JSON keys focus: ON".to_string();
+        }
     }
 
     fn toggle_known_unrelated(&mut self) {
@@ -3491,11 +3852,11 @@ fn normalize_profile(mut profile: SourceProfile) -> SourceProfile {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_navigation_code, parse_event_timestamp_millis, App, NavIntent, PeriodsFocus,
+        normalize_navigation_code, parse_event_timestamp_millis, App, NavIntent, PeriodsFocus, UiMode,
         MENU_PAGE_STEP,
     };
+    use crate::domain::prepare_event;
     use crate::persistence::{SessionEvent, SessionExport, SourceProfile};
-    use crate::tui::UiMode;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::{json, Value};
 
@@ -3802,5 +4163,102 @@ mod tests {
 
         app.navigate_types(NavIntent::PageUp);
         assert_eq!(app.path_index, 0);
+    }
+
+    #[test]
+    fn baseline_key_focus_navigation_does_not_move_event_row() {
+        let mut app = test_app();
+        let prepared = prepare_event(json!({"a": 1, "b": 2}));
+        app.baseline_events.push(crate::domain::EventRecord {
+            ts: 1.0,
+            type_id: prepared.type_id.clone(),
+            obj: prepared.obj,
+            keys: prepared.keys,
+            size_bytes: 0,
+            action_period_id: None,
+            in_action_period: false,
+            live_rate_score: 0.0,
+            live_uniq_score: 0.0,
+        });
+        app.baseline_visible_indices = vec![0];
+        app.baseline_cache_dirty = false;
+        app.mode = UiMode::Data;
+        app.data_index = 0;
+        app.toggle_data_key_focus();
+
+        app.navigate_data(NavIntent::LineDown);
+        assert_eq!(app.data_index, 0);
+        assert_eq!(app.data_key_index, 1);
+    }
+
+    #[test]
+    fn baseline_value_focus_applies_exact_filter() {
+        let mut app = test_app();
+        let prepared = prepare_event(json!({"status": "ok"}));
+        app.baseline_events.push(crate::domain::EventRecord {
+            ts: 1.0,
+            type_id: prepared.type_id.clone(),
+            obj: prepared.obj,
+            keys: prepared.keys,
+            size_bytes: 0,
+            action_period_id: None,
+            in_action_period: false,
+            live_rate_score: 0.0,
+            live_uniq_score: 0.0,
+        });
+        app.baseline_visible_indices = vec![0];
+        app.baseline_cache_dirty = false;
+        app.mode = UiMode::Data;
+        app.data_index = 0;
+        app.toggle_data_key_focus();
+        app.navigate_data(NavIntent::Right);
+        assert!(app.data_value_focus);
+
+        app.apply_data_selected_value_filter();
+        assert_eq!(app.event_filters.exact_filter, "status=s:ok");
+    }
+
+    #[test]
+    fn control_start_stop_are_idempotent() {
+        let mut app = test_app();
+        app.model.ingest(json!({"_timestamp": 1_700_000_000_000u64}), 1.0);
+
+        let started = app.control_start_action(Some("api".to_string()));
+        assert_eq!(started.status, 200);
+        assert_eq!(started.body["changed"], json!(true));
+        assert_eq!(started.body["active"], json!(true));
+
+        let started_again = app.control_start_action(None);
+        assert_eq!(started_again.status, 200);
+        assert_eq!(started_again.body["changed"], json!(false));
+        assert_eq!(started_again.body["active"], json!(true));
+
+        let stopped = app.control_stop_action();
+        assert_eq!(stopped.status, 200);
+        assert_eq!(stopped.body["changed"], json!(true));
+        assert_eq!(stopped.body["active"], json!(false));
+
+        let stopped_again = app.control_stop_action();
+        assert_eq!(stopped_again.status, 200);
+        assert_eq!(stopped_again.body["changed"], json!(false));
+        assert_eq!(stopped_again.body["active"], json!(false));
+    }
+
+    #[test]
+    fn control_start_stop_rejected_in_offline_mode() {
+        let mut app = App::new(
+            std::path::PathBuf::from("/tmp/test_app.jsonl"),
+            None,
+            true,
+            false,
+            true,
+        );
+        let started = app.control_start_action(None);
+        assert_eq!(started.status, 409);
+        assert_eq!(started.body["ok"], json!(false));
+
+        let stopped = app.control_stop_action();
+        assert_eq!(stopped.status, 409);
+        assert_eq!(stopped.body["ok"], json!(false));
     }
 }

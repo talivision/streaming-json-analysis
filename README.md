@@ -11,6 +11,22 @@ source "$HOME/.cargo/env"
 cargo build --release
 ```
 
+### Fully static Linux build (MUSL)
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+Optional ARM64 target:
+
+```bash
+rustup target add aarch64-unknown-linux-musl
+cargo build --release --target aarch64-unknown-linux-musl
+```
+
+The output static binary will be written to `target/x86_64-unknown-linux-musl/release/json_analyzer`. This should be run-anywhere on all Linux boxes.
+
 ---
 
 ## Getting started
@@ -90,6 +106,21 @@ When something of interest happens — a deployment, a user action, an incident 
 Events inside the period are scored against the baseline:
 - **Rate anomaly** — is this event type arriving faster or slower than normal?
 - **Value uniqueness** — are the field values rare compared to what the baseline has seen?
+
+#### Optional: HTTP control for reproducible marking
+
+The keyboard flow (`m`) is the default and works well in normal interactive use. If you need reproducible, script-driven period boundaries (especially in high-volume environments), you can enable an optional local HTTP control API:
+
+```bash
+./target/release/json-analyzer stream.jsonl --control-http 127.0.0.1:8080
+```
+
+Endpoints:
+- `POST /action/start` (optional JSON body: `{"label":"deploy"}`)
+- `POST /action/stop`
+- `GET /action/status`
+
+`start`/`stop` are idempotent: repeated calls keep state stable instead of creating duplicate transitions.
 
 ### 3. Review the period
 
@@ -180,7 +211,7 @@ In the source terminal, press `l` (login), `p` (purchase), `s` (search), `c`/`t`
 ```
 json_analyzer [<path>] [--jsonl <path>] [--directory <path>] [--baseline <path>]
               [--import <path>] [--profile <path>] [--whitelist <path>]
-              [--offline] [--reset] [--debug-status]
+              [--offline] [--reset] [--debug-status] [--control-http <addr>]
 
   <path> / --jsonl    path to input JSONL file (live, tailed)
   --directory         path to a directory of JSON/JSONL files (offline only)
@@ -191,6 +222,7 @@ json_analyzer [<path>] [--jsonl <path>] [--directory <path>] [--baseline <path>]
   --offline           read file once without tailing; _timestamp not required
   --reset             start without loading persisted session state from disk
   --debug-status      show internal status line details continuously
+  --control-http      optional control API bind address (e.g. 127.0.0.1:8080)
 ```
 
 If your events are spread across many files, use `--directory`. Files are read in parallel and sorted by `_timestamp` before ingestion. Directory mode is offline-only — it reads the files once and does not tail for new additions. It is slower and less reliable than a single JSONL file, as ordering depends entirely on `_timestamp` being present and correct. Where you have control over the source, prefer writing to a single append-only JSONL file with monotonically increasing `_timestamp` values.

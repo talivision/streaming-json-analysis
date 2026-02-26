@@ -1,9 +1,11 @@
 use anyhow::{bail, Result};
 use argh::FromArgs;
 use json_analyzer::app::App;
+use json_analyzer::control_http::spawn_control_http_server;
 use json_analyzer::persistence::{import_session, load_profile};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 /// Analyze a JSONL stream in the terminal UI.
 #[derive(FromArgs)]
@@ -47,10 +49,15 @@ struct Args {
     /// switch, start without loading persisted state from disk
     #[argh(switch)]
     reset: bool,
+
+    /// bind address for optional control HTTP API (e.g. 127.0.0.1:8080)
+    #[argh(option)]
+    control_http: Option<String>,
 }
 
 fn main() -> Result<()> {
     let args: Args = argh::from_env();
+    let control_http = args.control_http.clone();
     if let Some(import_path) = args.import.as_ref() {
         if args.path.is_some() || args.jsonl.is_some() || args.directory.is_some() {
             bail!("--import cannot be combined with <path>, --jsonl, or --directory");
@@ -72,6 +79,12 @@ fn main() -> Result<()> {
             None
         };
         app.import_session(session, profile_override)?;
+        let mut _control_server = None;
+        if let Some(bind_addr) = control_http.clone() {
+            let (control_tx, control_rx) = mpsc::channel();
+            _control_server = Some(spawn_control_http_server(bind_addr, control_tx)?);
+            app.set_control_receiver(control_rx);
+        }
         return app.run();
     }
 
@@ -102,6 +115,12 @@ fn main() -> Result<()> {
     if let Some(profile_path) = args.profile.as_ref() {
         let profile = load_profile(profile_path)?;
         app.apply_profile(profile, true);
+    }
+    let mut _control_server = None;
+    if let Some(bind_addr) = control_http {
+        let (control_tx, control_rx) = mpsc::channel();
+        _control_server = Some(spawn_control_http_server(bind_addr, control_tx)?);
+        app.set_control_receiver(control_rx);
     }
     app.run()
 }
