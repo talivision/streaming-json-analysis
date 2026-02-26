@@ -32,15 +32,15 @@ struct Args {
     #[argh(option)]
     whitelist: Option<PathBuf>,
 
-    /// run without persisting baseline updates
+    /// switch, run without persisting baseline updates
     #[argh(switch)]
     offline: bool,
 
-    /// show internal status line details continuously
+    /// switch, show internal status line details continuously
     #[argh(switch)]
     debug_status: bool,
 
-    /// start without loading persisted state from disk
+    /// switch, start without loading persisted state from disk
     #[argh(switch)]
     reset: bool,
 }

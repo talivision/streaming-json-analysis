@@ -241,7 +241,7 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
     } else {
         (Text::from("No event selected"), 0)
     };
-    let title = selected_json_title(app.live_key_focus, cols[1].width);
+    let title = selected_json_title(app.live_key_focus, app.live_value_focus, cols[1].width);
     let preview = Paragraph::new(preview_text)
         .scroll((preview_scroll, 0))
         .wrap(Wrap { trim: false })
@@ -301,24 +301,15 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
     let index_width = app.model.total_objects().max(1).to_string().len().max(3);
     let max_period_rows = (cols[1].height as usize).saturating_sub(2);
     let mut selected_event: Option<&EventRecord> = None;
-    if let Some(period) = periods.get(app.periods_index) {
-        let start = period.start;
-        let end = period.end.unwrap_or(period.start);
-        let event_indices = app
-            .model
-            .filtered_event_indices(&app.event_filters, Some((start, end)));
-        let events: Vec<(usize, &EventRecord)> = event_indices
-            .iter()
-            .rev()
-            .filter_map(|idx| app.model.events.get(*idx).map(|e| (*idx, e)))
-            .collect();
+    if periods.get(app.periods_index).is_some() {
+        let events = app.visible_period_event_rows();
         let type_col_width = events
             .iter()
             .map(|(_, e)| app.model.canonical_type_name(&e.type_id).chars().count() + 2)
             .max()
             .unwrap_or(16)
             .clamp(12, 36);
-        let first_period_ts = events.last().map(|(_, e)| e.ts).unwrap_or(start);
+        let first_period_ts = events.first().map(|(_, e)| e.ts).unwrap_or(0.0);
         let total = events.len();
         let window = max_period_rows.max(1);
         let start_idx = if total <= window {
@@ -381,7 +372,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
             &sel.obj,
             selected_path,
             app.periods_focus == PeriodsFocus::Json,
-            false,
+            app.period_value_focus,
             &app.event_filters.key_filter,
             &sub_lc,
             whitelist_terms,
@@ -401,6 +392,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
                 Block::default()
                     .title(selected_json_title(
                         app.periods_focus == PeriodsFocus::Json,
+                        app.period_value_focus,
                         cols[2].width,
                     ))
                     .borders(Borders::ALL),
@@ -510,9 +502,31 @@ fn action_periods_title(pane_width: u16) -> Line<'static> {
     ])
 }
 
-fn selected_json_title(is_key_focus: bool, pane_width: u16) -> Line<'static> {
+fn selected_json_title(is_key_focus: bool, value_focus: bool, pane_width: u16) -> Line<'static> {
     if !is_key_focus {
         return Line::from("selected JSON");
+    }
+    if value_focus {
+        if pane_width < 64 {
+            return Line::from(vec![
+                Span::raw("selected JSON ("),
+                styled_hotkey("↵"),
+                Span::raw("/"),
+                styled_hotkey("e"),
+                Span::raw(", "),
+                styled_hotkey("t"),
+                Span::raw(")"),
+            ]);
+        }
+        return Line::from(vec![
+            Span::raw("selected JSON ("),
+            styled_hotkey("↵"),
+            Span::raw("/"),
+            styled_hotkey("e"),
+            Span::raw(" apply value filter, "),
+            styled_hotkey("t"),
+            Span::raw(" jump type)"),
+        ]);
     }
     let narrow = pane_width < 56;
     if narrow {
@@ -528,6 +542,8 @@ fn selected_json_title(is_key_focus: bool, pane_width: u16) -> Line<'static> {
             Span::raw("selected JSON ("),
             styled_hotkey("↵"),
             Span::raw(" apply filter, "),
+            styled_hotkey("→"),
+            Span::raw(" value, "),
             styled_hotkey("t"),
             Span::raw(" jump type)"),
         ])

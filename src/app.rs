@@ -104,6 +104,7 @@ pub struct App {
     pub periods_index: usize,
     pub period_event_index: usize,
     pub period_json_key_index: usize,
+    pub period_value_focus: bool,
     pub periods_focus: PeriodsFocus,
     pub live_event_index: usize, // absolute index in full live rows
     pub live_view_start: usize,
@@ -180,6 +181,7 @@ impl App {
             periods_index: 0,
             period_event_index: 0,
             period_json_key_index: 0,
+            period_value_focus: false,
             periods_focus: PeriodsFocus::Periods,
             live_event_index: 0,
             live_view_start: 0,
@@ -1176,6 +1178,13 @@ impl App {
             {
                 self.apply_live_selected_value_filter();
             }
+            KeyCode::Char('e')
+                if self.mode == UiMode::Periods
+                    && self.periods_focus == PeriodsFocus::Json
+                    && self.period_value_focus =>
+            {
+                self.apply_period_selected_value_filter();
+            }
             KeyCode::Char('k') if self.mode != UiMode::Types => {
                 self.start_event_filter_input(FilterField::Key)
             }
@@ -1242,7 +1251,11 @@ impl App {
             KeyCode::Enter
                 if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Json =>
             {
-                self.apply_period_selected_key_filter();
+                if self.period_value_focus {
+                    self.apply_period_selected_value_filter();
+                } else {
+                    self.apply_period_selected_key_filter();
+                }
             }
             KeyCode::Enter if self.mode == UiMode::Live => self.toggle_live_key_focus(),
             KeyCode::Enter if self.mode == UiMode::Types => self.enter_types_path_focus(),
@@ -1679,6 +1692,7 @@ impl App {
             self.periods_index = 0;
             self.period_event_index = 0;
             self.period_json_key_index = 0;
+            self.period_value_focus = false;
             self.periods_focus = PeriodsFocus::Periods;
             return;
         }
@@ -1687,6 +1701,7 @@ impl App {
         if event_count == 0 {
             self.period_event_index = 0;
             self.period_json_key_index = 0;
+            self.period_value_focus = false;
             if self.periods_focus != PeriodsFocus::Periods {
                 self.periods_focus = PeriodsFocus::Periods;
             }
@@ -1700,11 +1715,26 @@ impl App {
                 self.periods_focus = match self.periods_focus {
                     PeriodsFocus::Periods => PeriodsFocus::Periods,
                     PeriodsFocus::Events => PeriodsFocus::Periods,
-                    PeriodsFocus::Json => PeriodsFocus::Events,
+                    PeriodsFocus::Json => {
+                        if self.period_value_focus {
+                            self.period_value_focus = false;
+                            PeriodsFocus::Json
+                        } else {
+                            PeriodsFocus::Events
+                        }
+                    }
                 };
             }
             NavIntent::Right => {
-                self.advance_periods_focus();
+                if self.periods_focus == PeriodsFocus::Json {
+                    if self.selected_period_value_token().is_some() {
+                        self.period_value_focus = true;
+                    } else {
+                        self.status = "Selected path has no value".to_string();
+                    }
+                } else {
+                    self.advance_periods_focus();
+                }
             }
             NavIntent::LineUp => match self.periods_focus {
                 PeriodsFocus::Periods => {
@@ -1712,14 +1742,17 @@ impl App {
                         self.periods_index -= 1;
                         self.period_event_index = 0;
                         self.period_json_key_index = 0;
+                        self.period_value_focus = false;
                     }
                 }
                 PeriodsFocus::Events => {
                     self.period_event_index = self.period_event_index.saturating_sub(1);
                     self.period_json_key_index = 0;
+                    self.period_value_focus = false;
                 }
                 PeriodsFocus::Json => {
                     self.period_json_key_index = self.period_json_key_index.saturating_sub(1);
+                    self.period_value_focus = false;
                 }
             },
             NavIntent::LineDown => match self.periods_focus {
@@ -1728,6 +1761,7 @@ impl App {
                         self.periods_index += 1;
                         self.period_event_index = 0;
                         self.period_json_key_index = 0;
+                        self.period_value_focus = false;
                     }
                 }
                 PeriodsFocus::Events => {
@@ -1735,12 +1769,14 @@ impl App {
                         self.period_event_index += 1;
                     }
                     self.period_json_key_index = 0;
+                    self.period_value_focus = false;
                 }
                 PeriodsFocus::Json => {
                     let keys = self.period_selected_key_paths();
                     if self.period_json_key_index + 1 < keys.len() {
                         self.period_json_key_index += 1;
                     }
+                    self.period_value_focus = false;
                 }
             },
             NavIntent::Home => match self.periods_focus {
@@ -1748,13 +1784,16 @@ impl App {
                     self.periods_index = 0;
                     self.period_event_index = 0;
                     self.period_json_key_index = 0;
+                    self.period_value_focus = false;
                 }
                 PeriodsFocus::Events => {
                     self.period_event_index = 0;
                     self.period_json_key_index = 0;
+                    self.period_value_focus = false;
                 }
                 PeriodsFocus::Json => {
                     self.period_json_key_index = 0;
+                    self.period_value_focus = false;
                 }
             },
             NavIntent::End => match self.periods_focus {
@@ -1762,18 +1801,21 @@ impl App {
                     self.periods_index = periods_len.saturating_sub(1);
                     self.period_event_index = 0;
                     self.period_json_key_index = 0;
+                    self.period_value_focus = false;
                 }
                 PeriodsFocus::Events => {
                     if event_count > 0 {
                         self.period_event_index = event_count.saturating_sub(1);
                     }
                     self.period_json_key_index = 0;
+                    self.period_value_focus = false;
                 }
                 PeriodsFocus::Json => {
                     let keys = self.period_selected_key_paths();
                     if !keys.is_empty() {
                         self.period_json_key_index = keys.len().saturating_sub(1);
                     }
+                    self.period_value_focus = false;
                 }
             },
             NavIntent::PageUp => match self.periods_focus {
@@ -1782,16 +1824,19 @@ impl App {
                         self.periods_index = self.periods_index.saturating_sub(MENU_PAGE_STEP);
                         self.period_event_index = 0;
                         self.period_json_key_index = 0;
+                        self.period_value_focus = false;
                     }
                 }
                 PeriodsFocus::Events => {
                     self.period_event_index =
                         self.period_event_index.saturating_sub(MENU_PAGE_STEP);
                     self.period_json_key_index = 0;
+                    self.period_value_focus = false;
                 }
                 PeriodsFocus::Json => {
                     self.period_json_key_index =
                         self.period_json_key_index.saturating_sub(MENU_PAGE_STEP);
+                    self.period_value_focus = false;
                 }
             },
             NavIntent::PageDown => match self.periods_focus {
@@ -1801,6 +1846,7 @@ impl App {
                             .min(periods_len.saturating_sub(1));
                         self.period_event_index = 0;
                         self.period_json_key_index = 0;
+                        self.period_value_focus = false;
                     }
                 }
                 PeriodsFocus::Events => {
@@ -1809,6 +1855,7 @@ impl App {
                             .min(event_count.saturating_sub(1));
                     }
                     self.period_json_key_index = 0;
+                    self.period_value_focus = false;
                 }
                 PeriodsFocus::Json => {
                     let keys = self.period_selected_key_paths();
@@ -1816,6 +1863,7 @@ impl App {
                         self.period_json_key_index = (self.period_json_key_index + MENU_PAGE_STEP)
                             .min(keys.len().saturating_sub(1));
                     }
+                    self.period_value_focus = false;
                 }
             },
         }
@@ -1944,6 +1992,7 @@ impl App {
         self.types_path_focus = false;
         self.type_preview_open = false;
         self.periods_focus = PeriodsFocus::Periods;
+        self.period_value_focus = false;
         self.exit_live_key_focus();
     }
 
@@ -1990,6 +2039,26 @@ impl App {
         } else {
             self.status = "Selected event has no keys".to_string();
         }
+    }
+
+    fn apply_period_selected_value_filter(&mut self) {
+        let keys = self.period_selected_key_paths();
+        let Some(path) = keys.get(self.period_json_key_index) else {
+            return;
+        };
+        let Some(token) = self.selected_period_value_token() else {
+            self.status = "Selected path has no value".to_string();
+            return;
+        };
+        let exact = format!("{}={}", path, token);
+        if self.event_filters.exact_filter == exact {
+            self.event_filters.exact_filter.clear();
+            self.status = format!("Removed exact filter: {}", exact);
+        } else {
+            self.event_filters.exact_filter = exact.clone();
+            self.status = format!("Applied exact filter: {}", exact);
+        }
+        self.after_filter_change(None);
     }
 
     fn exit_live_key_focus(&mut self) {
@@ -2083,6 +2152,15 @@ impl App {
         let key = self
             .live_selected_key_paths()
             .get(self.live_key_index)?
+            .clone();
+        value_at_path(&event.obj, &key).map(value_token)
+    }
+
+    fn selected_period_value_token(&self) -> Option<String> {
+        let event = self.selected_period_event()?;
+        let key = self
+            .period_selected_key_paths()
+            .get(self.period_json_key_index)?
             .clone();
         value_at_path(&event.obj, &key).map(value_token)
     }
@@ -2635,43 +2713,54 @@ impl App {
         self.reposition_live_selection_n(total);
     }
 
-    fn visible_period_events(&self) -> Vec<&EventRecord> {
+    pub fn visible_period_event_rows(&self) -> Vec<(usize, &EventRecord)> {
         let periods = self.model.closed_periods();
         if let Some(p) = periods.get(self.periods_index) {
             let start = p.start;
             let end = p.end.unwrap_or(p.start);
             let base = self
                 .model
-                .filtered_events_in_range(&self.event_filters, Some((start, end)));
-            match self.whitelist_mode {
+                .filtered_event_indices(&self.event_filters, Some((start, end)));
+            let indices = match self.whitelist_mode {
                 WhitelistMode::Off => base,
                 WhitelistMode::OnlyWhitelist => self
                     .model
                     .events
                     .iter()
-                    .rev()
-                    .filter(|e| e.ts >= start && e.ts <= end && self.event_matches_whitelist(e))
+                    .enumerate()
+                    .filter(|(_, e)| {
+                        e.ts >= start && e.ts <= end && self.event_matches_whitelist(e)
+                    })
+                    .map(|(idx, _)| idx)
                     .collect(),
                 WhitelistMode::AlwaysShow => {
                     let mut out = base;
-                    for e in self.model.events.iter().rev() {
+                    for (idx, e) in self.model.events.iter().enumerate() {
                         if e.ts < start || e.ts > end {
                             continue;
                         }
-                        if self.event_matches_whitelist(e)
-                            && !out.iter().any(|existing| {
-                                existing.ts == e.ts && existing.type_id == e.type_id
-                            })
-                        {
-                            out.push(e);
+                        if self.event_matches_whitelist(e) && !out.contains(&idx) {
+                            out.push(idx);
                         }
                     }
+                    out.sort_unstable();
                     out
                 }
-            }
+            };
+            indices
+                .into_iter()
+                .filter_map(|idx| self.model.events.get(idx).map(|e| (idx, e)))
+                .collect()
         } else {
             Vec::new()
         }
+    }
+
+    fn visible_period_events(&self) -> Vec<&EventRecord> {
+        self.visible_period_event_rows()
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect()
     }
 
     pub fn visible_types(&self) -> Vec<String> {
@@ -2939,6 +3028,7 @@ impl App {
             PeriodsFocus::Events => PeriodsFocus::Json,
             PeriodsFocus::Json => PeriodsFocus::Json,
         };
+        self.period_value_focus = false;
         self.period_event_index = self.period_event_index.min(n.saturating_sub(1));
         self.clamp_period_key_selection();
     }
@@ -3307,6 +3397,7 @@ mod tests {
         normalize_navigation_code, parse_event_timestamp_millis, App, NavIntent, PeriodsFocus,
         MENU_PAGE_STEP,
     };
+    use crate::persistence::{SessionEvent, SessionExport, SourceProfile};
     use crate::tui::UiMode;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::{json, Value};
@@ -3426,6 +3517,77 @@ mod tests {
         app.clamp_live_indices_n(0);
         assert_eq!(app.live_event_index, 0);
         assert_eq!(app.live_view_start, 0);
+    }
+
+    #[test]
+    fn periods_events_are_chronological_with_global_indices() {
+        let mut app = test_app();
+        app.model.ingest(json!({"_timestamp": 1_700_000_000_000u64, "x": 1}), 1.0);
+        app.model.ingest(json!({"_timestamp": 1_700_000_001_000u64, "x": 2}), 2.0);
+        app.model.ingest(json!({"_timestamp": 1_700_000_002_000u64, "x": 3}), 3.0);
+        app.model.set_periods(vec![crate::domain::ActionPeriod {
+            id: 1,
+            label: "p".to_string(),
+            start: 1.0,
+            end: Some(3.0),
+        }]);
+        let rows = app.visible_period_event_rows();
+        let ts: Vec<f64> = rows.iter().map(|(_, e)| e.ts).collect();
+        let idxs: Vec<usize> = rows.iter().map(|(i, _)| *i).collect();
+        assert_eq!(ts, vec![1.0, 2.0, 3.0]);
+        assert_eq!(idxs, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn import_same_override_profile_does_not_prompt() {
+        let mut app = test_app();
+        let mut session = SessionExport::new("/tmp/test_app.jsonl".to_string());
+        session.event_filters.type_filter = "t".to_string();
+        session.events = vec![SessionEvent {
+            ts: 1.0,
+            obj: json!({"_timestamp": 1_700_000_000_000u64, "k":"v"}),
+        }];
+        let profile = SourceProfile {
+            renames: vec![],
+            known_unrelated_types: vec![],
+            normalized_field_overrides: vec![],
+            negative_filters: session.event_filters.clone(),
+            whitelist_terms: vec![],
+        };
+        session.profile = Some(profile.clone());
+        app.import_session(session, Some(profile)).expect("import");
+        assert!(app.pending_profile_override.is_none());
+    }
+
+    #[test]
+    fn import_different_override_profile_prompts() {
+        let mut app = test_app();
+        let mut session = SessionExport::new("/tmp/test_app.jsonl".to_string());
+        session.event_filters.type_filter = "a".to_string();
+        session.events = vec![SessionEvent {
+            ts: 1.0,
+            obj: json!({"_timestamp": 1_700_000_000_000u64, "k":"v"}),
+        }];
+        session.profile = Some(SourceProfile {
+            renames: vec![],
+            known_unrelated_types: vec![],
+            normalized_field_overrides: vec![],
+            negative_filters: crate::domain::DataFilters::default(),
+            whitelist_terms: vec![],
+        });
+        let override_profile = SourceProfile {
+            renames: vec![],
+            known_unrelated_types: vec![],
+            normalized_field_overrides: vec![],
+            negative_filters: crate::domain::DataFilters {
+                type_filter: "b".to_string(),
+                ..crate::domain::DataFilters::default()
+            },
+            whitelist_terms: vec![],
+        };
+        app.import_session(session, Some(override_profile))
+            .expect("import");
+        assert!(app.pending_profile_override.is_some());
     }
 
     #[test]
