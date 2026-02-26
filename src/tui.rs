@@ -745,10 +745,6 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
 
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Press j to preview first-seen JSON sample",
-            Style::default().fg(Color::Gray),
-        )));
     }
 
     frame.render_widget(

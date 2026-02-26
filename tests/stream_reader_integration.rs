@@ -117,3 +117,45 @@ fn stream_reader_reads_directory_in_timestamp_order() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn stream_reader_streams_large_directory_across_polls() {
+    let dir = temp_stream_dir();
+    fs::create_dir_all(&dir).expect("create test dir");
+
+    // MAX_FILES_PER_POLL is 2000 in src/io.rs; use more than that to verify streaming.
+    let total_files = 2_105usize;
+    for i in 0..total_files {
+        let path = dir.join(format!("f{:04}.json", i));
+        fs::write(
+            path,
+            format!("{{\"_timestamp\": {}, \"id\": {}}}\n", i, i),
+        )
+        .expect("write file");
+    }
+
+    let mut reader = StreamReader::new(dir.clone());
+    let first = reader.poll().expect("first directory poll succeeds");
+    assert_eq!(first.len(), 2_000);
+    assert_eq!(first.first().cloned(), Some(json!({"_timestamp":0,"id":0})));
+    assert_eq!(
+        first.last().cloned(),
+        Some(json!({"_timestamp":1999,"id":1999}))
+    );
+
+    let second = reader.poll().expect("second directory poll succeeds");
+    assert_eq!(second.len(), 105);
+    assert_eq!(
+        second.first().cloned(),
+        Some(json!({"_timestamp":2000,"id":2000}))
+    );
+    assert_eq!(
+        second.last().cloned(),
+        Some(json!({"_timestamp":2104,"id":2104}))
+    );
+
+    let third = reader.poll().expect("third directory poll succeeds");
+    assert!(third.is_empty());
+
+    let _ = fs::remove_dir_all(dir);
+}

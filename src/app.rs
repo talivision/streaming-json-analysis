@@ -135,6 +135,8 @@ pub struct App {
     live_cache_dirty: bool,
     initial_load_target_bytes: Option<u64>,
     initial_load_complete: bool,
+    initial_load_is_directory: bool,
+    initial_load_polled_once: bool,
     pending_live_recompute: bool,
     show_status_debug: bool,
     quit_pending_until: Option<Instant>,
@@ -162,11 +164,20 @@ impl App {
         reset_state: bool,
     ) -> Self {
         let baseline_enabled = baseline_path.is_some();
-        let initial_load_target_bytes = fs::metadata(&stream_path)
-            .ok()
-            .map(|m| m.len())
-            .filter(|len| *len > 0);
-        let initial_load_complete = initial_load_target_bytes.is_none();
+        let is_directory_input = stream_path.is_dir();
+        let initial_load_target_bytes = if is_directory_input {
+            None
+        } else {
+            fs::metadata(&stream_path)
+                .ok()
+                .map(|m| m.len())
+                .filter(|len| *len > 0)
+        };
+        let initial_load_complete = if is_directory_input {
+            false
+        } else {
+            initial_load_target_bytes.is_none()
+        };
         let mut app = Self {
             model: AnalyzerModel::new(),
             mode: UiMode::Live,
@@ -219,6 +230,8 @@ impl App {
             live_cache_dirty: true,
             initial_load_target_bytes,
             initial_load_complete,
+            initial_load_is_directory: is_directory_input,
+            initial_load_polled_once: false,
             pending_live_recompute: false,
             show_status_debug,
             quit_pending_until: None,
@@ -542,6 +555,7 @@ impl App {
     }
 
     fn ingest_new_events(&mut self) -> Result<bool> {
+        self.initial_load_polled_once = true;
         self.rebuild_live_cache_if_needed();
         let use_snapshot_parallel = self.offline || self.loading_locked();
         let events = if use_snapshot_parallel {
@@ -3089,6 +3103,9 @@ impl App {
             }
         });
         let Some(target) = target else {
+            if self.initial_load_is_directory && !self.initial_load_complete {
+                return true;
+            }
             return false;
         };
         self.reader.progress().loaded_bytes < target
@@ -3120,7 +3137,19 @@ impl App {
             }
         });
         let Some(target) = target else {
-            self.initial_load_complete = true;
+            if self.initial_load_is_directory {
+                if self.initial_load_polled_once {
+                    self.initial_load_complete = true;
+                    self.status = format!(
+                        "Initial load complete: {} objects",
+                        self.model.total_objects()
+                    );
+                } else {
+                    self.status = "Initial load: scanning directory...".to_string();
+                }
+            } else {
+                self.initial_load_complete = true;
+            }
             return;
         };
         if self.initial_load_target_bytes.is_none() {
