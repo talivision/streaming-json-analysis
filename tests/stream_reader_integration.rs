@@ -20,6 +20,18 @@ fn temp_stream_path() -> PathBuf {
     ))
 }
 
+fn temp_stream_dir() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after epoch")
+        .as_nanos();
+    let seq = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!(
+        "json_analyzer_stream_reader_dir_{pid}_{nanos}_{seq}"
+    ))
+}
+
 #[test]
 fn stream_reader_fails_fast_on_invalid_json_line() {
     let path = temp_stream_path();
@@ -84,4 +96,24 @@ fn stream_reader_resets_offset_after_truncate() {
     assert_eq!(second[0], json!({"id":9}));
 
     let _ = fs::remove_file(path);
+}
+
+#[test]
+fn stream_reader_reads_directory_in_timestamp_order() {
+    let dir = temp_stream_dir();
+    fs::create_dir_all(&dir).expect("create test dir");
+
+    fs::write(dir.join("a.json"), "{\"_timestamp\": 2000, \"id\": 2}\n").expect("write a");
+    fs::write(dir.join("b.json"), "{\"_timestamp\": 1000, \"id\": 1}\n").expect("write b");
+
+    let mut reader = StreamReader::new(dir.clone());
+    let rows = reader.poll().expect("directory poll succeeds");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], json!({"_timestamp":1000,"id":1}));
+    assert_eq!(rows[1], json!({"_timestamp":2000,"id":2}));
+
+    let second = reader.poll().expect("second directory poll succeeds");
+    assert!(second.is_empty());
+
+    let _ = fs::remove_dir_all(dir);
 }
