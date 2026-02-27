@@ -32,6 +32,28 @@ A 2× rate change scores 0.5. A 10× change scores 0.9.
 - Returns 0 if less than 1 second of period wall-clock time has elapsed.
 - Returns 1.0 if the type never appeared in the baseline (no reference to compare against).
 
+### Inter-arrival fallback
+
+When the action period is too short or the in-period count for a type is < 2, the rate score falls back to an inter-arrival estimate:
+
+- **Actual inter-arrival**: time elapsed since the previous occurrence of the same type (regardless of period membership).
+- **Baseline rate**: `baseline_count / baseline_elapsed_secs`, converted to the same rate units.
+
+Fallback scoring rules:
+- If the type has never appeared in the baseline (`baseline_count == 0`): returns `1.0`.
+- If there is no prior occurrence in loaded history but the baseline has seen the type: returns `0.0` (insufficient temporal evidence).
+- If a prior occurrence exists: computes `1 / inter_arrival_secs` as the action rate and applies the same symmetric rate-difference formula as above.
+
+This fallback is active when:
+- The action-period elapsed time is below the minimum threshold (1 s), or
+- The in-period count for the type is < 2, or
+- The in-period elapsed time for that type is non-positive.
+
+**Known limits of the fallback:**
+- If baseline has seen a type but there is no prior occurrence in loaded history, the fallback is conservative (returns `0.0`).
+- Precision depends on baseline-rate quality; noisy baselines reduce signal.
+- A richer model (per-type inter-arrival distribution with quantiles) could improve sparse-type handling further.
+
 ---
 
 ## Value Uniqueness

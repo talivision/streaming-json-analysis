@@ -18,6 +18,7 @@ pub enum UiMode {
     Periods,
     Types,
     Data,
+    Values,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,7 @@ pub fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
         UiMode::Periods => draw_periods(frame, root[1], app, max_type_count),
         UiMode::Types => draw_types(frame, root[1], app),
         UiMode::Data => draw_data(frame, root[1], app, max_type_count),
+        UiMode::Values => draw_values(frame, root[1], app),
     }
     let modal = app.modal_confirmation();
     draw_controls(frame, root[2], app);
@@ -80,7 +82,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, mode: UiMode, baseline_enabled: 
         titles.push(tab_title("4", "Baseline"));
     }
     let selected = match mode {
-        UiMode::Live => 0,
+        UiMode::Live | UiMode::Values => 0,
         UiMode::Periods => 1,
         UiMode::Types => 2,
         UiMode::Data => {
@@ -214,6 +216,9 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
         } else {
             None
         };
+        if let Some(path) = selected_path {
+            lines.push(values_hint_line(path, cols[1].width));
+        }
         let considered_paths = app
             .model
             .types
@@ -362,6 +367,9 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         } else {
             None
         };
+        if let Some(path) = selected_path {
+            lines.push(values_hint_line(path, cols[2].width));
+        }
         let sub_lc = app.event_filters.substring_filter.to_lowercase();
         let whitelist_terms = if app.whitelist_highlight_enabled() {
             app.whitelist_terms()
@@ -540,26 +548,68 @@ fn selected_json_title(is_key_focus: bool, value_focus: bool, pane_width: u16) -
             Span::raw(" jump type)"),
         ]);
     }
-    let narrow = pane_width < 56;
-    if narrow {
-        Line::from(vec![
+    if pane_width < 56 {
+        return Line::from(vec![
             Span::raw("selected JSON ("),
             styled_hotkey("↵"),
             Span::raw(", "),
+            styled_hotkey("v"),
+            Span::raw(", "),
             styled_hotkey("t"),
             Span::raw(")"),
-        ])
-    } else {
-        Line::from(vec![
+        ]);
+    }
+    if pane_width < 80 {
+        return Line::from(vec![
             Span::raw("selected JSON ("),
             styled_hotkey("↵"),
-            Span::raw(" apply filter, "),
+            Span::raw(" filter, "),
             styled_hotkey("→"),
             Span::raw(" value, "),
+            styled_hotkey("v"),
+            Span::raw(" browse, "),
             styled_hotkey("t"),
-            Span::raw(" jump type)"),
-        ])
+            Span::raw(" type)"),
+        ]);
     }
+    Line::from(vec![
+        Span::raw("selected JSON ("),
+        styled_hotkey("↵"),
+        Span::raw(" apply filter, "),
+        styled_hotkey("→"),
+        Span::raw(" value, "),
+        styled_hotkey("v"),
+        Span::raw(" browse values, "),
+        styled_hotkey("t"),
+        Span::raw(" jump type)"),
+    ])
+}
+
+/// Hint line shown at the top of a JSON pane when a key is focused.
+/// Collapses (returns None) when no key is selected.
+fn values_hint_line(selected_path: &str, pane_width: u16) -> Line<'static> {
+    let path = selected_path.to_string();
+    if pane_width < 16 {
+        return Line::from(vec![styled_hotkey("v")]);
+    }
+    if pane_width < 44 {
+        return Line::from(vec![
+            styled_hotkey("v"),
+            Span::styled("  browse values", Style::default().fg(Color::DarkGray)),
+        ]);
+    }
+    let display = if path.len() > 28 {
+        format!("{}…", &path[..28])
+    } else {
+        path
+    };
+    Line::from(vec![
+        styled_hotkey("v"),
+        Span::styled(
+            format!("  browse all values for '{display}'"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
 }
 
 fn type_details_title(app: &App, pane_width: u16) -> Line<'static> {
@@ -771,6 +821,68 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+fn draw_values(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let entries = app.collect_key_values();
+    let total = entries.len();
+    let selected = if total == 0 {
+        0
+    } else {
+        app.values_index.min(total - 1)
+    };
+
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let half = inner_height / 2;
+    let view_start = if selected > half {
+        (selected - half).min(total.saturating_sub(inner_height))
+    } else {
+        0
+    };
+
+    let count_width = entries
+        .first()
+        .map(|(_, _, c)| c.to_string().len())
+        .unwrap_or(1)
+        .max(3);
+
+    let items: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .skip(view_start)
+        .take(inner_height)
+        .map(|(idx, (display, _token, count))| {
+            let is_sel = idx == selected;
+            let count_style = if is_sel {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            let text_style = if is_sel {
+                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default()
+            };
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{:>width$}", count, width = count_width),
+                    count_style,
+                ),
+                Span::raw("  "),
+                Span::styled(display.clone(), text_style),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let title = format!(
+        "Values for: {}  ({} unique)  ↑↓ navigate  enter/e apply exact filter  esc back",
+        app.values_key, total,
+    );
+    let list = List::new(items).block(Block::default().title(title).borders(Borders::ALL));
+    frame.render_widget(list, area);
+}
+
 fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f64) {
     app.ensure_baseline_cache();
     let cols = Layout::default()
@@ -858,6 +970,9 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
         } else {
             None
         };
+        if let Some(path) = selected_path {
+            lines.push(values_hint_line(path, cols[1].width));
+        }
         let rendered = render_json_keypicker(
             &sel.obj,
             selected_path,
@@ -1836,20 +1951,30 @@ fn render_event_line(
         .unwrap_or(0);
 
     let size_str = format_size_bytes(e.size_bytes);
-    let fixed_prefix = 2
+    // Fixed-width columns that cannot be trimmed (everything except the type name).
+    let non_type_prefix = 2
         + 1
         + 3
         + row_label.chars().count()
         + 1
-        + type_col_width
         + 1
         + size_str.chars().count()
         + 1
         + diff_label.chars().count()
         + 1;
-    let short_name = truncate_text(&type_block, type_col_width.max(4));
-    let type_cell = if short_name.chars().count() < type_col_width {
-        format!("{:<width$}", short_name, width = type_col_width)
+    // Give R/V metrics display priority: shrink the type column before letting
+    // metrics overflow off the right edge.
+    let effective_type_col = if tail_len > 0 {
+        type_col_width
+            .min(row_width.saturating_sub(non_type_prefix + tail_len))
+            .max(4)
+    } else {
+        type_col_width
+    };
+    let fixed_prefix = non_type_prefix + effective_type_col;
+    let short_name = truncate_text(&type_block, effective_type_col.max(4));
+    let type_cell = if short_name.chars().count() < effective_type_col {
+        format!("{:<width$}", short_name, width = effective_type_col)
     } else {
         short_name
     };

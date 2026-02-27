@@ -124,6 +124,9 @@ pub struct App {
     pub return_to_types_on_live_esc: bool,
     pub live_key_index: usize,
     pub show_help_overlay: bool,
+    pub values_key: String,
+    pub values_index: usize,
+    pub values_return_mode: UiMode,
 
     pub offline: bool,
     pub status: String,
@@ -222,6 +225,9 @@ impl App {
             return_to_types_on_live_esc: false,
             live_key_index: 0,
             show_help_overlay: false,
+            values_key: String::new(),
+            values_index: 0,
+            values_return_mode: UiMode::Live,
 
             offline,
             status: if offline {
@@ -1222,6 +1228,17 @@ impl App {
         }
 
         match code {
+            KeyCode::Esc if self.mode == UiMode::Values => {
+                self.mode = self.values_return_mode;
+                if self.values_return_mode == UiMode::Live {
+                    self.live_key_focus = true;
+                    self.clamp_live_key_selection();
+                } else if self.values_return_mode == UiMode::Periods {
+                    self.periods_focus = PeriodsFocus::Json;
+                } else if self.values_return_mode == UiMode::Data {
+                    self.data_key_focus = true;
+                }
+            }
             KeyCode::Esc if self.mode == UiMode::Live && self.live_key_focus => {
                 self.exit_live_key_focus();
             }
@@ -1346,11 +1363,26 @@ impl App {
             {
                 self.start_delete_selected_period_confirmation();
             }
+            KeyCode::Char('v') if self.mode == UiMode::Live && self.live_key_focus => {
+                self.enter_values_from_live();
+            }
+            KeyCode::Char('v')
+                if self.mode == UiMode::Periods
+                    && self.periods_focus == PeriodsFocus::Json =>
+            {
+                self.enter_values_from_periods();
+            }
+            KeyCode::Char('v') if self.mode == UiMode::Data && self.data_key_focus => {
+                self.enter_values_from_data();
+            }
             KeyCode::Char('k') if self.mode == UiMode::Live && self.live_key_focus => {
                 self.apply_live_selected_key_filter();
             }
             KeyCode::Char('k') if self.mode == UiMode::Data && self.data_key_focus => {
                 self.apply_data_selected_key_filter();
+            }
+            KeyCode::Char('e') if self.mode == UiMode::Values => {
+                self.apply_values_selection();
             }
             KeyCode::Char('e')
                 if self.mode == UiMode::Live && self.live_key_focus && self.live_value_focus =>
@@ -1428,6 +1460,9 @@ impl App {
             KeyCode::PageDown => self.handle_navigation_intent(NavIntent::PageDown),
             KeyCode::Left => self.handle_navigation_intent(NavIntent::Left),
             KeyCode::Right => self.handle_navigation_intent(NavIntent::Right),
+            KeyCode::Enter if self.mode == UiMode::Values => {
+                self.apply_values_selection();
+            }
             KeyCode::Enter if self.mode == UiMode::Live && self.live_key_focus => {
                 if self.live_value_focus {
                     self.apply_live_selected_value_filter();
@@ -1760,6 +1795,7 @@ impl App {
             UiMode::Periods => self.navigate_periods(intent),
             UiMode::Types => self.navigate_types(intent),
             UiMode::Data => self.navigate_data(intent),
+            UiMode::Values => self.navigate_values(intent),
         }
     }
 
@@ -2241,6 +2277,99 @@ impl App {
         event.keys.clone()
     }
 
+    /// Collect unique values for `values_key` across all currently filtered events.
+    /// Returns (display_str, filter_token, count) sorted by count descending.
+    pub fn collect_key_values(&self) -> Vec<(String, String, usize)> {
+        use std::collections::HashMap;
+        let mut counts: HashMap<String, (String, usize)> = HashMap::new();
+        for e in self.model.filtered_events(&self.event_filters) {
+            if let Some(v) = value_at_path(&e.obj, &self.values_key) {
+                let token = value_token(v);
+                let display = v.to_string();
+                let entry = counts.entry(token.clone()).or_insert((display, 0));
+                entry.1 += 1;
+            }
+        }
+        let mut result: Vec<(String, String, usize)> = counts
+            .into_iter()
+            .map(|(token, (display, count))| (display, token, count))
+            .collect();
+        result.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        result
+    }
+
+    fn enter_values_mode_for_key(&mut self, key: String, return_mode: UiMode) {
+        self.values_key = key;
+        self.values_index = 0;
+        self.values_return_mode = return_mode;
+        self.mode = UiMode::Values;
+        let count = self.collect_key_values().len();
+        self.status = format!("{} unique values for '{}'", count, self.values_key);
+    }
+
+    fn enter_values_from_live(&mut self) {
+        let keys = self.live_selected_key_paths();
+        let Some(key) = keys.get(self.live_key_index).cloned() else {
+            self.status = "No key selected".to_string();
+            return;
+        };
+        self.enter_values_mode_for_key(key, UiMode::Live);
+    }
+
+    fn enter_values_from_periods(&mut self) {
+        let keys = self.period_selected_key_paths();
+        let Some(key) = keys.get(self.period_json_key_index).cloned() else {
+            self.status = "No key selected".to_string();
+            return;
+        };
+        self.enter_values_mode_for_key(key, UiMode::Periods);
+    }
+
+    fn enter_values_from_data(&mut self) {
+        let keys = self.data_selected_key_paths();
+        let Some(key) = keys.get(self.data_key_index).cloned() else {
+            self.status = "No key selected".to_string();
+            return;
+        };
+        self.enter_values_mode_for_key(key, UiMode::Data);
+    }
+
+    fn apply_values_selection(&mut self) {
+        let entries = self.collect_key_values();
+        let Some((_, token, _)) = entries.get(self.values_index) else {
+            return;
+        };
+        let exact = format!("{}={}", self.values_key, token.clone());
+        // Switch to Live first so after_filter_change positions correctly.
+        self.mode = UiMode::Live;
+        self.exit_live_key_focus();
+        self.event_filters.exact_filter = exact.clone();
+        self.status = format!("Applied exact filter: {}", exact);
+        self.after_filter_change(None);
+    }
+
+    fn navigate_values(&mut self, intent: NavIntent) {
+        let count = self.collect_key_values().len();
+        match intent {
+            NavIntent::LineUp => self.values_index = self.values_index.saturating_sub(1),
+            NavIntent::LineDown => {
+                if self.values_index + 1 < count {
+                    self.values_index += 1;
+                }
+            }
+            NavIntent::Home => self.values_index = 0,
+            NavIntent::End => self.values_index = count.saturating_sub(1),
+            NavIntent::PageUp => {
+                self.values_index = self.values_index.saturating_sub(MENU_PAGE_STEP)
+            }
+            NavIntent::PageDown => {
+                self.values_index =
+                    (self.values_index + MENU_PAGE_STEP).min(count.saturating_sub(1))
+            }
+            NavIntent::Left | NavIntent::Right => {}
+        }
+    }
+
     fn clamp_live_key_selection(&mut self) {
         let key_count = self.live_selected_key_paths().len();
         if key_count == 0 {
@@ -2408,7 +2537,7 @@ impl App {
                     self.clamp_data_key_selection();
                 }
             }
-            UiMode::Types => {}
+            UiMode::Types | UiMode::Values => {}
         }
     }
 
@@ -2788,7 +2917,7 @@ impl App {
                     .cloned()
                     .cloned()
             }
-            UiMode::Types => None,
+            UiMode::Types | UiMode::Values => None,
         };
 
         if let Some(event) = selected {

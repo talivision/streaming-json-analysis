@@ -1,6 +1,10 @@
 use anyhow::{bail, Result};
 use argh::FromArgs;
 use json_analyzer::app::App;
+
+#[cfg(not(target_os = "windows"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use json_analyzer::control_http::spawn_control_http_server;
 use json_analyzer::persistence::{import_session, load_profile};
 use std::fs;

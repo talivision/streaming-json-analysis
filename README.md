@@ -13,9 +13,20 @@ cargo build --release
 
 ### Fully static Linux build (MUSL)
 
+MUSL builds use mimalloc to work around the slow musl allocator. This requires a musl-capable C compiler for the mimalloc build script.
+
+On Debian/Ubuntu:
+
 ```bash
+sudo apt-get install musl-tools
 rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
+CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --target x86_64-unknown-linux-musl
+```
+
+On macOS (via `cargo-zigbuild`, which handles the C cross-compilation automatically):
+
+```bash
+cargo zigbuild --release --target x86_64-unknown-linux-musl
 ```
 
 Optional ARM64 target:
@@ -26,6 +37,29 @@ cargo build --release --target aarch64-unknown-linux-musl
 ```
 
 The output static binary will be written to `target/x86_64-unknown-linux-musl/release/json_analyzer`. This should be run-anywhere on all Linux boxes.
+
+### Standard Linux build (dynamically linked)
+
+If you are building for your own machine or a system with a compatible glibc:
+
+```bash
+cargo build --release
+```
+
+This is noticeably faster to compile than the MUSL build, but the binary will not run on older Linux distributions.
+
+### Linux build for old glibc (portable without MUSL)
+
+To target systems with glibc ≥ 2.17 (e.g. CentOS 7, RHEL 7) without requiring a fully static binary, use [`cargo-zigbuild`](https://github.com/messense/cargo-zigbuild):
+
+```bash
+pip install ziglang  # or install zig from https://ziglang.org
+cargo install cargo-zigbuild
+rustup target add x86_64-unknown-linux-gnu
+cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
+```
+
+**Known limitation:** MUSL builds are subject to a `memcpy` performance regression in older MUSL versions. This is a known upstream issue with no fix at this time — it has negligible impact on interactive terminal workloads but may matter for bulk ingestion at very high throughput. The zigbuild glibc approach avoids this issue while still targeting a wide range of Linux systems.
 
 ### Windows build
 
@@ -283,7 +317,16 @@ If your events are spread across many files, use `--directory`. Files are read i
 | `esc` / `←` | Back to event list |
 | (key-focused) `k` | Set key filter |
 | (key-focused) `t` | Jump to type |
+| (key-focused) `v` | Browse all unique values for this key |
 | (value-focused) `e` | Set exact filter |
+
+### Values view
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Select value |
+| `enter` / `e` | Apply as exact filter and return to Live |
+| `esc` | Return to Live without filtering |
 
 ### Types view
 

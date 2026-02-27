@@ -15,3 +15,6 @@ indexmap = "2"
 sha2 = "0.10"
 rayon = "1"
 tiny_http = "0.12"
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
