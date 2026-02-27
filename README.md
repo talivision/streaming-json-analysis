@@ -38,6 +38,8 @@ cargo build --release --target aarch64-unknown-linux-musl
 
 The output static binary will be written to `target/x86_64-unknown-linux-musl/release/json_analyzer`. This should be run-anywhere on all Linux boxes.
 
+**Known limitation:** MUSL's `memcpy` is slower than glibc's. Negligible for interactive use; may matter at very high ingest throughput.
+
 ### Standard Linux build (dynamically linked)
 
 If you are building for your own machine or a system with a compatible glibc:
@@ -58,8 +60,6 @@ cargo install cargo-zigbuild
 rustup target add x86_64-unknown-linux-gnu
 cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
 ```
-
-**Known limitation:** MUSL builds are subject to a `memcpy` performance regression in older MUSL versions. This is a known upstream issue with no fix at this time — it has negligible impact on interactive terminal workloads but may matter for bulk ingestion at very high throughput. The zigbuild glibc approach avoids this issue while still targeting a wide range of Linux systems.
 
 ### Windows build
 
