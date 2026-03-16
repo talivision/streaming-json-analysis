@@ -1138,6 +1138,87 @@ pub fn value_token(v: &Value) -> String {
     }
 }
 
+pub fn type_is_negated_in_filter(filter: &str, canonical_name: &str) -> bool {
+    let expr = FilterExpr::parse(filter);
+    let canonical = canonical_name.to_lowercase();
+    !expr.groups.is_empty()
+        && expr.groups.iter().all(|group| {
+            group.iter()
+                .any(|term| term.negated && term.value.to_lowercase() == canonical)
+        })
+}
+
+pub fn toggle_negated_type_in_filter(filter: &str, canonical_name: &str) -> String {
+    let canonical = canonical_name.trim();
+    if canonical.is_empty() {
+        return filter.trim().to_string();
+    }
+    let mut expr = FilterExpr::parse(filter);
+    let needle = canonical.to_lowercase();
+    let present = !expr.groups.is_empty()
+        && expr.groups.iter().all(|group| {
+            group.iter()
+                .any(|term| term.negated && term.value.to_lowercase() == needle)
+        });
+    if present {
+        for group in &mut expr.groups {
+            group.retain(|term| !(term.negated && term.value.to_lowercase() == needle));
+        }
+        expr.groups.retain(|group| !group.is_empty());
+    } else if expr.groups.is_empty() {
+        expr.groups.push(vec![FilterTerm {
+            negated: true,
+            value: canonical.to_string(),
+        }]);
+    } else {
+        for group in &mut expr.groups {
+            group.push(FilterTerm {
+                negated: true,
+                value: canonical.to_string(),
+            });
+        }
+    }
+    format_filter_expr(&expr)
+}
+
+pub fn replace_positive_type_filters(filter: &str, canonical_name: &str) -> String {
+    let canonical = canonical_name.trim();
+    let mut terms = common_negated_type_terms(filter);
+    if !canonical.is_empty() {
+        terms.push(FilterTerm {
+            negated: false,
+            value: canonical.to_string(),
+        });
+    }
+    format_filter_expr(&FilterExpr {
+        groups: if terms.is_empty() { Vec::new() } else { vec![terms] },
+    })
+}
+
+pub fn clear_positive_type_filters(filter: &str) -> String {
+    let terms = common_negated_type_terms(filter);
+    format_filter_expr(&FilterExpr {
+        groups: if terms.is_empty() { Vec::new() } else { vec![terms] },
+    })
+}
+
+pub fn rename_type_terms_in_filter(filter: &str, old_name: &str, new_name: &str) -> String {
+    let old_name = old_name.trim();
+    let new_name = new_name.trim();
+    if old_name.is_empty() || old_name == new_name {
+        return filter.trim().to_string();
+    }
+    let mut expr = FilterExpr::parse(filter);
+    for group in &mut expr.groups {
+        for term in group {
+            if term.value == old_name {
+                term.value = new_name.to_string();
+            }
+        }
+    }
+    format_filter_expr(&expr)
+}
+
 fn parse_exact_filter(filter: &str) -> Option<(&str, String)> {
     let (k, v) = filter.split_once('=')?;
     Some((k.trim(), v.trim().to_string()))
@@ -1234,6 +1315,63 @@ fn starts_word_op(raw: &str, idx: usize, op: &str) -> bool {
             .unwrap_or(true)
     };
     before_ok && after_ok
+}
+
+fn format_filter_expr(expr: &FilterExpr) -> String {
+    expr.groups
+        .iter()
+        .map(|group| {
+            group.iter()
+                .map(format_filter_term)
+                .collect::<Vec<_>>()
+                .join(" && ")
+        })
+        .collect::<Vec<_>>()
+        .join(" || ")
+}
+
+fn common_negated_type_terms(filter: &str) -> Vec<FilterTerm> {
+    let expr = FilterExpr::parse(filter);
+    let Some(first_group) = expr.groups.first() else {
+        return Vec::new();
+    };
+    first_group
+        .iter()
+        .filter(|term| term.negated)
+        .filter(|term| {
+            expr.groups.iter().all(|group| {
+                group.iter().any(|candidate| {
+                    candidate.negated
+                        && candidate.value.eq_ignore_ascii_case(term.value.as_str())
+                })
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn format_filter_term(term: &FilterTerm) -> String {
+    let value = quote_filter_literal(&term.value);
+    if term.negated {
+        format!("!{}", value)
+    } else {
+        value
+    }
+}
+
+fn quote_filter_literal(raw: &str) -> String {
+    let needs_quotes = raw.is_empty()
+        || raw.chars().any(|ch| {
+            ch.is_whitespace()
+                || matches!(ch, '"' | '\'' | '\\' | ',' | '|' | '&' | '!' | '(' | ')')
+        })
+        || raw.contains("and")
+        || raw.contains("or");
+    if !needs_quotes {
+        return raw.to_string();
+    }
+    let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", escaped)
 }
 
 fn is_expr_boundary(ch: char) -> bool {
@@ -1560,5 +1698,55 @@ mod tests {
             value_at_path(&events[0].obj, "msg"),
             Some(&json!("alpha beta gamma"))
         );
+    }
+
+    #[test]
+    fn toggle_negated_type_in_filter_adds_term_to_empty_filter() {
+        let filter = toggle_negated_type_in_filter("", "Order");
+        assert_eq!(filter, "!Order");
+        assert!(type_is_negated_in_filter(&filter, "Order"));
+    }
+
+    #[test]
+    fn toggle_negated_type_in_filter_round_trips_across_or_groups() {
+        let filter = toggle_negated_type_in_filter("foo || bar", "Order");
+        assert_eq!(filter, "foo && !Order || bar && !Order");
+        assert!(type_is_negated_in_filter(&filter, "Order"));
+
+        let cleared = toggle_negated_type_in_filter(&filter, "Order");
+        assert_eq!(cleared, "foo || bar");
+    }
+
+    #[test]
+    fn positive_type_filter_is_not_treated_as_explicit_negation() {
+        assert!(!type_is_negated_in_filter("Order", "Other"));
+        assert!(!type_is_negated_in_filter("foo || bar", "Order"));
+    }
+
+    #[test]
+    fn replace_and_clear_positive_type_filters_preserve_negations() {
+        let filter = replace_positive_type_filters("!Noise && OldType", "Order");
+        assert_eq!(filter, "!Noise && Order");
+
+        let cleared = clear_positive_type_filters(&filter);
+        assert_eq!(cleared, "!Noise");
+    }
+
+    #[test]
+    fn replace_positive_type_filters_drops_positive_terms_even_when_mixed_in_middle() {
+        let filter = replace_positive_type_filters("!Noise && OldType && !Other", "Order");
+        assert_eq!(filter, "!Noise && !Other && Order");
+
+        let cleared = clear_positive_type_filters(&filter);
+        assert_eq!(cleared, "!Noise && !Other");
+    }
+
+    #[test]
+    fn replace_positive_type_filters_collapses_multiple_positive_terms() {
+        let filter = replace_positive_type_filters("Foo && !Noise && Bar && Baz", "Order");
+        assert_eq!(filter, "!Noise && Order");
+
+        let cleared = clear_positive_type_filters(&filter);
+        assert_eq!(cleared, "!Noise");
     }
 }

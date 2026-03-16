@@ -1,4 +1,4 @@
-use crate::app::{App, ModalConfirmation, ObjectInspector, PeriodsFocus};
+use crate::app::{App, ModalConfirmation, PeriodsFocus};
 use crate::domain::{EventRecord, FilterField, PathOverride, RateDebugInfo};
 use indexmap::IndexMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -58,9 +58,6 @@ pub fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     let modal = app.modal_confirmation();
     draw_controls(frame, root[2], app);
 
-    if let Some(inspector) = app.inspector.as_ref() {
-        draw_inspector(frame, inspector, app);
-    }
     if app.show_help_overlay {
         draw_full_help(frame, app);
     }
@@ -258,9 +255,13 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
     let events_inner_width = cols[1].width.saturating_sub(2) as usize;
     let index_width = app.model.total_objects().max(1).to_string().len().max(3);
     let max_period_rows = (cols[1].height as usize).saturating_sub(2);
+    let events = if periods.get(app.periods_index).is_some() {
+        app.visible_period_event_rows()
+    } else {
+        Vec::new()
+    };
     let mut selected_event: Option<&EventRecord> = None;
-    if periods.get(app.periods_index).is_some() {
-        let events = app.visible_period_event_rows();
+    if !events.is_empty() {
         let type_col_width = events
             .iter()
             .map(|(_, e)| app.model.canonical_type_name(&e.type_id).chars().count() + 2)
@@ -313,8 +314,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         } else {
             None
         };
-        let rate_info = app
-            .visible_period_event_rows()
+        let rate_info = events
             .get(app.period_event_index)
             .and_then(|(event_idx, _)| app.model.rate_debug_info_for_event_index(*event_idx));
         build_event_preview(
@@ -980,9 +980,11 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
             InputMode::ExportSessionPath => "export session path (Enter to write)",
             InputMode::ExportProfilePath => "export profile path (Enter to write)",
         };
+        let prefix = format!("{}: ", title);
+        let available = inner_width.saturating_sub(prefix.chars().count());
         text.push(Line::from(vec![
-            Span::styled(format!("{}: ", title), Style::default().fg(Color::Yellow)),
-            Span::raw(app.input_buffer.clone()),
+            Span::styled(prefix, Style::default().fg(Color::Yellow)),
+            Span::raw(truncate_left(&app.input_buffer, available)),
         ]));
     } else if app.should_show_status_line() && !app.status.is_empty() {
         let max_status = inner_width.saturating_sub(10).max(16);
@@ -1007,7 +1009,7 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         let mut row = Vec::new();
         let action_on = app.model.active_period().is_some();
-        let filters_active = app.event_filters.active_count();
+        let filters_active = app.displayed_event_filters().active_count();
         let wide = inner_width >= 130;
         let medium = inner_width >= 105;
         let export_state = if medium { "ready" } else { "ok" };
@@ -1121,21 +1123,23 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
         text.push(Line::from(row));
     }
     let width = area.width.saturating_sub(2) as usize;
-    let filters_active = app.event_filters.active_count();
+    let displayed_filters = app.displayed_event_filters();
+    let filters_active = displayed_filters.active_count();
+    let filters_dimmed = app.filters_suspended();
     let show_long_names = width >= 100;
-    let key = display_filter(&app.event_filters.key_filter);
-    let typ = if app.event_filters.type_filter.is_empty() {
+    let key = display_filter(&displayed_filters.key_filter);
+    let typ = if displayed_filters.type_filter.is_empty() {
         "off".to_string()
     } else {
         truncate_text(
             &app.model
-                .display_type_filter_value(&app.event_filters.type_filter),
+                .display_type_filter_value(&displayed_filters.type_filter),
             20,
         )
     };
-    let substring = display_filter(&app.event_filters.substring_filter);
-    let fuzzy = display_filter(&app.event_filters.fuzzy_filter);
-    let exact = display_filter(&app.event_filters.exact_filter);
+    let substring = display_filter(&displayed_filters.substring_filter);
+    let fuzzy = display_filter(&displayed_filters.fuzzy_filter);
+    let exact = display_filter(&displayed_filters.exact_filter);
     let mut row = vec![Span::raw(" ")];
     let mut push_value = |label: &str, value: String, active: bool, idx: usize| {
         if idx > 0 {
@@ -1150,7 +1154,11 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
         row.push(Span::styled(
             value,
             Style::default().fg(if active {
-                Color::LightGreen
+                if filters_dimmed {
+                    Color::Gray
+                } else {
+                    Color::LightGreen
+                }
             } else {
                 Color::DarkGray
             }),
@@ -1162,24 +1170,24 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         ["k", "t", "/", "z", "e"]
     };
-    push_value(labels[0], key, !app.event_filters.key_filter.is_empty(), 0);
-    push_value(labels[1], typ, !app.event_filters.type_filter.is_empty(), 1);
+    push_value(labels[0], key, !displayed_filters.key_filter.is_empty(), 0);
+    push_value(labels[1], typ, !displayed_filters.type_filter.is_empty(), 1);
     push_value(
         labels[2],
         substring,
-        !app.event_filters.substring_filter.is_empty(),
+        !displayed_filters.substring_filter.is_empty(),
         2,
     );
     push_value(
         labels[3],
         fuzzy,
-        !app.event_filters.fuzzy_filter.is_empty(),
+        !displayed_filters.fuzzy_filter.is_empty(),
         3,
     );
     push_value(
         labels[4],
         exact,
-        !app.event_filters.exact_filter.is_empty(),
+        !displayed_filters.exact_filter.is_empty(),
         4,
     );
     row.push(Span::raw("  "));
@@ -1216,6 +1224,22 @@ fn display_filter(value: &str) -> String {
     } else {
         truncate_text(value, 20)
     }
+}
+
+fn truncate_left(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let tail_len = max_chars.saturating_sub(1);
+    let tail: String = chars[chars.len().saturating_sub(tail_len)..].iter().collect();
+    format!("…{}", tail)
 }
 
 fn draw_full_help(frame: &mut Frame<'_>, app: &App) {
@@ -1297,71 +1321,6 @@ fn draw_full_help(frame: &mut Frame<'_>, app: &App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .title("Commands by Mode"),
-            ),
-        rows[1],
-    );
-}
-
-fn draw_inspector(frame: &mut Frame<'_>, inspector: &ObjectInspector, app: &App) {
-    let popup = centered_rect(80, 80, frame.area());
-    frame.render_widget(Clear, popup);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(8)])
-        .split(popup);
-
-    let name = app.model.type_display_name(&inspector.event.type_id);
-    frame.render_widget(
-        Paragraph::new(Text::from(vec![
-            Line::from(Span::styled(
-                name,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(
-                "Select key and press k to filter events by key, t to jump to type, esc to close",
-            ),
-        ]))
-        .block(
-            Block::default()
-                .title("Object Inspector")
-                .borders(Borders::ALL),
-        ),
-        rows[0],
-    );
-
-    let selected_path = inspector.key_paths.get(inspector.key_index);
-    let sub_lc = app.event_filters.substring_filter.to_lowercase();
-    let whitelist_terms = if app.whitelist_highlight_enabled() {
-        app.whitelist_terms()
-    } else {
-        &[]
-    };
-    let rendered = render_json_keypicker(
-        &inspector.event.obj,
-        selected_path,
-        true,
-        false,
-        &app.event_filters.key_filter,
-        &sub_lc,
-        whitelist_terms,
-        app.model
-            .types
-            .get(&inspector.event.type_id)
-            .map(|tp| &tp.considered_paths),
-    );
-    let scroll = selected_json_scroll(rendered.selected_line, rows[1].height);
-    frame.render_widget(
-        Paragraph::new(Text::from(rendered.lines))
-            .scroll((scroll, 0))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title("Object")
-                    .borders(Borders::ALL)
-                    .border_style(pane_focus_style(true)),
             ),
         rows[1],
     );
