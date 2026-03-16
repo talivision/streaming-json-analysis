@@ -56,8 +56,7 @@ fn stream_reader_fails_fast_on_invalid_json_line() {
 #[test]
 fn stream_reader_polls_incrementally() {
     let path = temp_stream_path();
-    fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\",\"n\":1}\n")
-        .expect("write initial file");
+    fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\",\"n\":1}\n").expect("write initial file");
 
     let mut reader = StreamReader::new(path.clone());
     let first = reader.poll().expect("first poll succeeds");
@@ -119,6 +118,68 @@ fn stream_reader_reads_directory_in_timestamp_order() {
 }
 
 #[test]
+fn stream_reader_waits_for_partial_jsonl_line_until_newline_arrives() {
+    let path = temp_stream_path();
+    fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"par").expect("write partial file");
+
+    let mut reader = StreamReader::new(path.clone());
+    let first = reader.poll().expect("first poll succeeds");
+    assert_eq!(first, vec![json!({"event":"a"})]);
+    assert!(
+        reader.has_incomplete_final_line(),
+        "reader should retain the incomplete tail"
+    );
+
+    let mut f = OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open for append");
+    f.write_all(b"tial\",\"n\":1}\n")
+        .expect("finish partial line");
+
+    let second = reader.poll().expect("second poll succeeds");
+    assert_eq!(second, vec![json!({"event":"partial","n":1})]);
+    assert!(!reader.has_incomplete_final_line());
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn stream_reader_skips_whitespace_only_tail_at_eof() {
+    let path = temp_stream_path();
+    fs::write(&path, "{\"event\":\"a\"}\n   \t\r").expect("write whitespace tail");
+
+    let mut reader = StreamReader::new(path.clone());
+    let rows = reader.poll().expect("poll succeeds");
+    assert_eq!(rows, vec![json!({"event":"a"})]);
+    assert!(!reader.has_incomplete_final_line());
+    assert!(reader.poll().expect("second poll succeeds").is_empty());
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn stream_reader_fails_fast_on_oversized_line_without_newline() {
+    let path = temp_stream_path();
+    let giant = format!("{{\"payload\":\"{}\"", "x".repeat(16 * 1024 * 1024));
+    fs::write(&path, giant).expect("write oversized partial line");
+
+    let mut reader = StreamReader::new(path.clone());
+    let err = reader.poll().expect_err("oversized line should fail fast");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeded"),
+        "error should mention overflow: {msg}"
+    );
+    assert!(
+        msg.contains("line 1"),
+        "error should include line number: {msg}"
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn stream_reader_streams_large_directory_across_polls() {
     let dir = temp_stream_dir();
     fs::create_dir_all(&dir).expect("create test dir");
@@ -127,11 +188,7 @@ fn stream_reader_streams_large_directory_across_polls() {
     let total_files = 2_105usize;
     for i in 0..total_files {
         let path = dir.join(format!("f{:04}.json", i));
-        fs::write(
-            path,
-            format!("{{\"_timestamp\": {}, \"id\": {}}}\n", i, i),
-        )
-        .expect("write file");
+        fs::write(path, format!("{{\"_timestamp\": {}, \"id\": {}}}\n", i, i)).expect("write file");
     }
 
     let mut reader = StreamReader::new(dir.clone());
