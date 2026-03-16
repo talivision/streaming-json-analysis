@@ -93,13 +93,13 @@ fn main() -> Result<()> {
     }
 
     let input_path = match (args.path, args.jsonl, args.directory) {
-        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => bail!(
-            "provide exactly one input source: <path>, --jsonl <path>, or --directory <path>"
-        ),
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
+            bail!("provide exactly one input source: <path>, --jsonl <path>, or --directory <path>")
+        }
         (Some(path), None, None) | (None, Some(path), None) | (None, None, Some(path)) => path,
-        (None, None, None) => bail!(
-            "an input is required: provide <path>, --jsonl <path>, or --directory <path>"
-        ),
+        (None, None, None) => {
+            bail!("an input is required: provide <path>, --jsonl <path>, or --directory <path>")
+        }
     };
 
     if input_path.is_dir() && !args.offline {

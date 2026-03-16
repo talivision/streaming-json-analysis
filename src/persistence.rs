@@ -302,7 +302,8 @@ pub fn export_session(path: &Path, session: &SessionExport) -> Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
     }
-    let payload = serde_json::to_vec_pretty(session).context("failed to serialize session export")?;
+    let payload =
+        serde_json::to_vec_pretty(session).context("failed to serialize session export")?;
     let mut file =
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     file.write_all(&payload)?;
@@ -318,8 +319,8 @@ pub fn import_session(path: &Path) -> Result<SessionExport> {
 }
 
 pub fn load_profile(path: &Path) -> Result<SourceProfile> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read profile {}", path.display()))?;
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read profile {}", path.display()))?;
     let profile: SourceProfile =
         serde_json::from_slice(&bytes).context("invalid source profile payload")?;
     Ok(profile)

@@ -1,12 +1,12 @@
+use crate::control_http::{ControlCommand, ControlReply};
 use crate::domain::{
     prepare_event, value_at_path, value_token, ActionPeriod, AnalyzerModel, DataFilters,
     EventRecord, FilterField, PreparedEvent,
 };
-use crate::control_http::{ControlCommand, ControlReply};
 use crate::io::StreamReader;
 use crate::persistence::{
-    export_session, invalidate_state, load_state, save_profile, save_state, RestoredState,
-    SessionEvent, SessionExport, SourceProfile, NormalizedFieldOverride,
+    export_session, invalidate_state, load_state, save_profile, save_state,
+    NormalizedFieldOverride, RestoredState, SessionEvent, SessionExport, SourceProfile,
 };
 use crate::tui::{draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
@@ -22,13 +22,13 @@ use crossterm::terminal::{
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{HashSet, HashSet as StdHashSet};
 use std::env;
 use std::fs;
 use std::io::stdout;
 use std::path::PathBuf;
-use std::collections::{HashSet, HashSet as StdHashSet};
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::TryRecvError;
 use std::thread;
@@ -393,6 +393,20 @@ impl App {
             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         }
         terminal.show_cursor()?;
+        if self.reader.has_incomplete_final_line() {
+            eprintln!(
+                "warning: incomplete JSON line remained at shutdown in {}",
+                self.reader.path().display()
+            );
+        }
+        if let Some(reader) = self.baseline_reader.as_ref() {
+            if reader.has_incomplete_final_line() {
+                eprintln!(
+                    "warning: incomplete JSON line remained at shutdown in {}",
+                    reader.path().display()
+                );
+            }
+        }
         self.model.close_open_period(unix_ts());
         if let Err(err) = self.persist_state() {
             eprintln!("warning: failed to persist session state: {err}");
@@ -411,7 +425,9 @@ impl App {
         }
         if prompt_on_conflict && self.has_nonempty_profile_state() {
             self.pending_profile_override = Some(profile);
-            self.status = "Apply profile over restored session state? (y/N, whitelist merges additively)".to_string();
+            self.status =
+                "Apply profile over restored session state? (y/N, whitelist merges additively)"
+                    .to_string();
             return;
         }
         self.apply_profile_seeded(profile);
@@ -850,7 +866,8 @@ impl App {
         self.baseline_tab_enabled = !self.baseline_events.is_empty();
         let progress = reader.progress();
         let baseline_path_display = reader.path().display().to_string();
-        self.baseline_loaded = progress.total_bytes == 0 || progress.loaded_bytes >= progress.total_bytes;
+        self.baseline_loaded =
+            progress.total_bytes == 0 || progress.loaded_bytes >= progress.total_bytes;
         self.pending_live_recompute = true;
         self.mark_live_cache_dirty();
         if self.baseline_loaded {
@@ -1266,7 +1283,8 @@ impl App {
                 if self.baseline_tab_enabled {
                     self.set_ui_mode(UiMode::Data)
                 } else {
-                    self.status = "Baseline view is unavailable (start with --baseline)".to_string();
+                    self.status =
+                        "Baseline view is unavailable (start with --baseline)".to_string();
                 }
             }
             KeyCode::Esc if self.mode == UiMode::Live && self.return_to_types_on_live_esc => {
@@ -1367,8 +1385,7 @@ impl App {
                 self.enter_values_from_live();
             }
             KeyCode::Char('v')
-                if self.mode == UiMode::Periods
-                    && self.periods_focus == PeriodsFocus::Json =>
+                if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Json =>
             {
                 self.enter_values_from_periods();
             }
@@ -1765,11 +1782,7 @@ impl App {
     fn has_nonempty_profile_state(&self) -> bool {
         self.event_filters.has_active()
             || !self.model.renamed_types().is_empty()
-            || self
-                .model
-                .types
-                .values()
-                .any(|tp| tp.known_unrelated)
+            || self.model.types.values().any(|tp| tp.known_unrelated)
             || !self.model.normalized_field_overrides().is_empty()
             || !self.whitelist_terms.is_empty()
     }
@@ -2610,7 +2623,11 @@ impl App {
             return;
         };
         let type_id = event.type_id.clone();
-        if let Some(idx) = self.model.find_type_index(&type_id) {
+        if let Some(idx) = self
+            .visible_types()
+            .iter()
+            .position(|candidate| candidate == &type_id)
+        {
             let type_name = self.model.type_display_name(&type_id);
             self.mode = UiMode::Types;
             self.return_to_types_on_live_esc = false;
@@ -2629,7 +2646,11 @@ impl App {
             return;
         };
         let type_id = event.type_id.clone();
-        if let Some(idx) = self.model.find_type_index(&type_id) {
+        if let Some(idx) = self
+            .visible_types()
+            .iter()
+            .position(|candidate| candidate == &type_id)
+        {
             let type_name = self.model.type_display_name(&type_id);
             self.mode = UiMode::Types;
             self.return_to_types_on_live_esc = false;
@@ -2648,7 +2669,11 @@ impl App {
             return;
         };
         let type_id = event.type_id.clone();
-        if let Some(idx) = self.model.find_type_index(&type_id) {
+        if let Some(idx) = self
+            .visible_types()
+            .iter()
+            .position(|candidate| candidate == &type_id)
+        {
             let type_name = self.model.type_display_name(&type_id);
             self.mode = UiMode::Types;
             self.return_to_types_on_live_esc = false;
@@ -3000,7 +3025,8 @@ impl App {
                     }
                 }
                 for idx in (0..self.baseline_events.len()).rev() {
-                    if self.event_matches_whitelist(&self.baseline_events[idx]) && seen.insert(idx) {
+                    if self.event_matches_whitelist(&self.baseline_events[idx]) && seen.insert(idx)
+                    {
                         out.push(idx);
                     }
                 }
@@ -3398,8 +3424,12 @@ impl App {
         if self.whitelist_terms.is_empty() {
             return false;
         }
-        let obj = serde_json::to_string(&event.obj).unwrap_or_default().to_lowercase();
-        self.whitelist_terms.iter().any(|needle| obj.contains(needle))
+        let obj = serde_json::to_string(&event.obj)
+            .unwrap_or_default()
+            .to_lowercase();
+        self.whitelist_terms
+            .iter()
+            .any(|needle| obj.contains(needle))
     }
 
     fn apply_whitelist_to_indices(
@@ -3953,7 +3983,9 @@ fn profile_fingerprint(profile: &SourceProfile) -> String {
 }
 
 fn normalize_profile(mut profile: SourceProfile) -> SourceProfile {
-    profile.renames.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    profile
+        .renames
+        .sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     profile.renames.dedup();
     profile.known_unrelated_types.sort();
     profile.known_unrelated_types.dedup();
@@ -3963,9 +3995,9 @@ fn normalize_profile(mut profile: SourceProfile) -> SourceProfile {
             .then(a.path.cmp(&b.path))
             .then((a.mode as u8).cmp(&(b.mode as u8)))
     });
-    profile.normalized_field_overrides.dedup_by(|a, b| {
-        a.type_id == b.type_id && a.path == b.path && a.mode == b.mode
-    });
+    profile
+        .normalized_field_overrides
+        .dedup_by(|a, b| a.type_id == b.type_id && a.path == b.path && a.mode == b.mode);
     let mut wl: Vec<String> = profile
         .whitelist_terms
         .into_iter()
@@ -3981,8 +4013,8 @@ fn normalize_profile(mut profile: SourceProfile) -> SourceProfile {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_navigation_code, parse_event_timestamp_millis, App, NavIntent, PeriodsFocus, UiMode,
-        MENU_PAGE_STEP,
+        normalize_navigation_code, parse_event_timestamp_millis, App, NavIntent, PeriodsFocus,
+        UiMode, MENU_PAGE_STEP,
     };
     use crate::domain::prepare_event;
     use crate::persistence::{SessionEvent, SessionExport, SourceProfile};
@@ -4109,9 +4141,12 @@ mod tests {
     #[test]
     fn periods_events_are_chronological_with_global_indices() {
         let mut app = test_app();
-        app.model.ingest(json!({"_timestamp": 1_700_000_000_000u64, "x": 1}), 1.0);
-        app.model.ingest(json!({"_timestamp": 1_700_000_001_000u64, "x": 2}), 2.0);
-        app.model.ingest(json!({"_timestamp": 1_700_000_002_000u64, "x": 3}), 3.0);
+        app.model
+            .ingest(json!({"_timestamp": 1_700_000_000_000u64, "x": 1}), 1.0);
+        app.model
+            .ingest(json!({"_timestamp": 1_700_000_001_000u64, "x": 2}), 2.0);
+        app.model
+            .ingest(json!({"_timestamp": 1_700_000_002_000u64, "x": 3}), 3.0);
         app.model.set_periods(vec![crate::domain::ActionPeriod {
             id: 1,
             label: "p".to_string(),
@@ -4350,7 +4385,8 @@ mod tests {
     #[test]
     fn control_start_stop_are_idempotent() {
         let mut app = test_app();
-        app.model.ingest(json!({"_timestamp": 1_700_000_000_000u64}), 1.0);
+        app.model
+            .ingest(json!({"_timestamp": 1_700_000_000_000u64}), 1.0);
 
         let started = app.control_start_action(Some("api".to_string()));
         assert_eq!(started.status, 200);

@@ -73,7 +73,10 @@ fn handle_request(mut req: Request, command_tx: &Sender<ControlCommand>) {
                     }
                 }
             };
-            dispatch_command(req, command_tx, |reply| ControlCommand::Start { label, reply });
+            dispatch_command(req, command_tx, |reply| ControlCommand::Start {
+                label,
+                reply,
+            });
         }
         (Method::Post, "/action/stop") => {
             dispatch_command(req, command_tx, |reply| ControlCommand::Stop { reply });

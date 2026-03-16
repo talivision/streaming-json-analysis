@@ -1,5 +1,5 @@
 use crate::app::{App, ModalConfirmation, ObjectInspector, PeriodsFocus};
-use crate::domain::{EventRecord, FilterField, PathOverride};
+use crate::domain::{EventRecord, FilterField, PathOverride, RateDebugInfo};
 use indexmap::IndexMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -161,88 +161,35 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
         app.model.total_objects(),
         app.model.types.len()
     );
-    let stream = List::new(items).block(Block::default().title(live_title).borders(Borders::ALL));
+    let stream = List::new(items).block(
+        Block::default()
+            .title(live_title)
+            .borders(Borders::ALL)
+            .border_style(pane_focus_style(
+                !app.live_key_focus && !app.live_value_focus,
+            )),
+    );
     frame.render_widget(stream, cols[0]);
 
     let (preview_text, preview_scroll) = if let Some(sel) = live.selected {
-        let mut lines = vec![Line::from(Span::styled(
-            app.model.type_display_name(&sel.type_id),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))];
-        let show_uniq = sel.live_uniq_score;
-        let show_rate = sel.live_rate_score;
-        let value_color = value_anomaly_color(anomaly_norm(show_uniq));
-        let rate_color = rate_anomaly_color(anomaly_norm(show_rate));
-        if sel.in_action_period {
-            lines.push(Line::from(vec![
-                Span::styled("value anomaly ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    format_score(show_uniq),
-                    Style::default()
-                        .fg(value_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled("rate anomaly ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    format_score(show_rate),
-                    Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
-                ),
-            ]));
-            if let Some(event_idx) = selected_event_abs_index {
-                if let Some((actual, expected)) = app.model.rate_debug_info_for_event_index(event_idx)
-                {
-                    lines.push(Line::from(vec![
-                        Span::styled("rate  expected ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            format!("{:.4}/s", expected),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled("  actual ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            format!("{:.4}/s", actual),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
-                }
-            }
-        }
-        lines.push(Line::from(""));
         let key_paths = app.live_selected_key_paths();
         let selected_path = if app.live_key_focus {
             key_paths.get(app.live_key_index)
         } else {
             None
         };
-        if let Some(path) = selected_path {
-            lines.push(values_hint_line(path, cols[1].width));
-        }
-        let considered_paths = app
-            .model
-            .types
-            .get(&sel.type_id)
-            .map(|tp| &tp.considered_paths);
-        let sub_lc = app.event_filters.substring_filter.to_lowercase();
-        let whitelist_terms = if app.whitelist_highlight_enabled() {
-            app.whitelist_terms()
-        } else {
-            &[]
-        };
-        let rendered = render_json_keypicker(
-            &sel.obj,
+        build_event_preview(
+            app,
+            sel,
             selected_path,
             app.live_key_focus,
             app.live_value_focus,
-            &app.event_filters.key_filter,
-            &sub_lc,
-            whitelist_terms,
-            considered_paths,
-        );
-        let scroll = selected_json_scroll(rendered.selected_line, cols[1].height);
-        lines.extend(rendered.lines);
-        (Text::from(lines), scroll)
+            selected_event_abs_index.and_then(|event_idx| {
+                app.model.rate_debug_info_for_event_index(event_idx)
+            }),
+            cols[1].width,
+            cols[1].height,
+        )
     } else {
         (Text::from("No event selected"), 0)
     };
@@ -250,7 +197,12 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
     let preview = Paragraph::new(preview_text)
         .scroll((preview_scroll, 0))
         .wrap(Wrap { trim: false })
-        .block(Block::default().title(title).borders(Borders::ALL));
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(pane_focus_style(app.live_key_focus || app.live_value_focus)),
+        );
     frame.render_widget(preview, cols[1]);
 }
 
@@ -296,7 +248,8 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         List::new(p_items).block(
             Block::default()
                 .title(action_periods_title(cols[0].width))
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(pane_focus_style(app.periods_focus == PeriodsFocus::Periods)),
         ),
         cols[0],
     );
@@ -344,51 +297,36 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         selected_event = events.get(app.period_event_index).map(|(_, e)| *e);
     }
     frame.render_widget(
-        List::new(rows).block(Block::default().title("Events").borders(Borders::ALL)),
+        List::new(rows).block(
+            Block::default()
+                .title("Events")
+                .borders(Borders::ALL)
+                .border_style(pane_focus_style(app.periods_focus == PeriodsFocus::Events)),
+        ),
         cols[1],
     );
 
     let (preview_text, preview_scroll) = if let Some(sel) = selected_event {
-        let mut lines = vec![Line::from(Span::styled(
-            app.model.type_display_name(&sel.type_id),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))];
-        lines.push(Line::from(""));
-        let considered_paths = app
-            .model
-            .types
-            .get(&sel.type_id)
-            .map(|tp| &tp.considered_paths);
         let key_paths = app.period_selected_key_paths();
         let selected_path = if app.periods_focus == PeriodsFocus::Json {
             key_paths.get(app.period_json_key_index)
         } else {
             None
         };
-        if let Some(path) = selected_path {
-            lines.push(values_hint_line(path, cols[2].width));
-        }
-        let sub_lc = app.event_filters.substring_filter.to_lowercase();
-        let whitelist_terms = if app.whitelist_highlight_enabled() {
-            app.whitelist_terms()
-        } else {
-            &[]
-        };
-        let rendered = render_json_keypicker(
-            &sel.obj,
+        let rate_info = app
+            .visible_period_event_rows()
+            .get(app.period_event_index)
+            .and_then(|(event_idx, _)| app.model.rate_debug_info_for_event_index(*event_idx));
+        build_event_preview(
+            app,
+            sel,
             selected_path,
             app.periods_focus == PeriodsFocus::Json,
             app.period_value_focus,
-            &app.event_filters.key_filter,
-            &sub_lc,
-            whitelist_terms,
-            considered_paths,
-        );
-        let scroll = selected_json_scroll(rendered.selected_line, cols[2].height);
-        lines.extend(rendered.lines);
-        (Text::from(lines), scroll)
+            rate_info,
+            cols[2].width,
+            cols[2].height,
+        )
     } else {
         (Text::from("No event selected"), 0)
     };
@@ -403,7 +341,8 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
                         app.period_value_focus,
                         cols[2].width,
                     ))
-                    .borders(Borders::ALL),
+                    .borders(Borders::ALL)
+                    .border_style(pane_focus_style(app.periods_focus == PeriodsFocus::Json)),
             ),
         cols[2],
     );
@@ -418,7 +357,14 @@ fn styled_hotkey(label: &str) -> Span<'static> {
     )
 }
 
-fn types_list_title(row: usize, total: usize, unfiltered: usize, path_focus: bool, search: &str, pane_width: u16) -> Line<'static> {
+fn types_list_title(
+    row: usize,
+    total: usize,
+    unfiltered: usize,
+    path_focus: bool,
+    search: &str,
+    pane_width: u16,
+) -> Line<'static> {
     let focus = if path_focus { "details" } else { "list" };
     let (counter_len, counter_spans) = if search.is_empty() {
         let counter = format!("Types {}/{} ({focus}) ", row, total);
@@ -427,9 +373,16 @@ fn types_list_title(row: usize, total: usize, unfiltered: usize, path_focus: boo
         let omitted = unfiltered.saturating_sub(total);
         let search = truncate_text(search, 16);
         (
-            format!("Types {}/{} ({omitted} omitted, filter: {}) ", row, total, search).len(),
+            format!(
+                "Types {}/{} ({omitted} omitted, filter: {}) ",
+                row, total, search
+            )
+            .len(),
             vec![
-                Span::raw(format!("Types {}/{} ({omitted} omitted, filter: ", row, total)),
+                Span::raw(format!(
+                    "Types {}/{} ({omitted} omitted, filter: ",
+                    row, total
+                )),
                 Span::styled(search, Style::default().fg(Color::LightGreen)),
                 Span::raw(") "),
             ],
@@ -721,7 +674,11 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )])));
     }
     let type_title = types_list_title(
-        if total_types == 0 { 0 } else { selected_type + 1 },
+        if total_types == 0 {
+            0
+        } else {
+            selected_type + 1
+        },
         total_types,
         app.model.types.len(),
         app.types_path_focus,
@@ -729,7 +686,12 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         cols[0].width,
     );
     frame.render_widget(
-        List::new(type_items).block(Block::default().title(type_title).borders(Borders::ALL)),
+        List::new(type_items).block(
+            Block::default()
+                .title(type_title)
+                .borders(Borders::ALL)
+                .border_style(pane_focus_style(!app.types_path_focus)),
+        ),
         cols[0],
     );
 
@@ -815,7 +777,8 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .title(type_details_title(app, cols[1].width))
-                    .borders(Borders::ALL),
+                    .borders(Borders::ALL)
+                    .border_style(pane_focus_style(app.types_path_focus)),
             ),
         cols[1],
     );
@@ -879,7 +842,12 @@ fn draw_values(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "Values for: {}  ({} unique)  ↑↓ navigate  enter/e apply exact filter  esc back",
         app.values_key, total,
     );
-    let list = List::new(items).block(Block::default().title(title).borders(Borders::ALL));
+    let list = List::new(items).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(pane_focus_style(true)),
+    );
     frame.render_widget(list, area);
 }
 
@@ -940,52 +908,31 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
                     selected.saturating_add(1),
                     total
                 ))
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(pane_focus_style(
+                    !app.data_key_focus && !app.data_value_focus,
+                )),
         ),
         cols[0],
     );
 
     let (preview_text, preview_scroll) = if let Some(sel) = rows.get(selected) {
-        let mut lines = vec![Line::from(Span::styled(
-            app.model.type_display_name(&sel.type_id),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))];
-        lines.push(Line::from(""));
-        let considered_paths = app
-            .model
-            .types
-            .get(&sel.type_id)
-            .map(|tp| &tp.considered_paths);
-        let sub_lc = app.event_filters.substring_filter.to_lowercase();
-        let whitelist_terms = if app.whitelist_highlight_enabled() {
-            app.whitelist_terms()
-        } else {
-            &[]
-        };
         let key_paths = app.data_selected_key_paths();
         let selected_path = if app.data_key_focus {
             key_paths.get(app.data_key_index)
         } else {
             None
         };
-        if let Some(path) = selected_path {
-            lines.push(values_hint_line(path, cols[1].width));
-        }
-        let rendered = render_json_keypicker(
-            &sel.obj,
+        build_event_preview(
+            app,
+            sel,
             selected_path,
             app.data_key_focus,
             app.data_value_focus,
-            &app.event_filters.key_filter,
-            &sub_lc,
-            whitelist_terms,
-            considered_paths,
-        );
-        let scroll = selected_json_scroll(rendered.selected_line, cols[1].height);
-        lines.extend(rendered.lines);
-        (Text::from(lines), scroll)
+            None,
+            cols[1].width,
+            cols[1].height,
+        )
     } else {
         (Text::from("No baseline event selected"), 0)
     };
@@ -1000,7 +947,8 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
                         app.data_value_focus,
                         cols[1].width,
                     ))
-                    .borders(Borders::ALL),
+                    .borders(Borders::ALL)
+                    .border_style(pane_focus_style(app.data_key_focus || app.data_value_focus)),
             ),
         cols[1],
     );
@@ -1146,7 +1094,10 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             Color::LightGreen
         };
-        row.push(Span::styled(app.whitelist_mode_label(), Style::default().fg(w_color)));
+        row.push(Span::styled(
+            app.whitelist_mode_label(),
+            Style::default().fg(w_color),
+        ));
         row.push(Span::raw("  "));
         row.push(Span::styled(
             if wide { "export session (x)" } else { "x" },
@@ -1252,7 +1203,8 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
     text.push(Line::from(row));
 
     frame.render_widget(
-        Paragraph::new(Text::from(text)).block(Block::default().title("Controls").borders(Borders::ALL)),
+        Paragraph::new(Text::from(text))
+            .block(Block::default().title("Controls").borders(Borders::ALL)),
         area,
     );
 }
@@ -1404,7 +1356,12 @@ fn draw_inspector(frame: &mut Frame<'_>, inspector: &ObjectInspector, app: &App)
         Paragraph::new(Text::from(rendered.lines))
             .scroll((scroll, 0))
             .wrap(Wrap { trim: false })
-            .block(Block::default().title("Object").borders(Borders::ALL)),
+            .block(
+                Block::default()
+                    .title("Object")
+                    .borders(Borders::ALL)
+                    .border_style(pane_focus_style(true)),
+            ),
         rows[1],
     );
 }
@@ -1424,7 +1381,9 @@ fn draw_type_preview_modal(frame: &mut Frame<'_>, app: &App) {
     if let Some((type_id, sample)) = selected {
         lines.push(Line::from(Span::styled(
             app.model.canonical_type_name(type_id),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
         let rendered = render_json_keypicker(&sample, None, false, false, "", "", &[], None);
@@ -1474,6 +1433,99 @@ fn render_json_keypicker(
         lines,
         selected_line,
     }
+}
+
+fn pane_focus_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Rgb(125, 155, 160))
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn rate_debug_line(info: RateDebugInfo) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("rate  expected ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:.4}/s", info.expected_rate),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled("  actual ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:.4}/s", info.actual_rate),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn build_event_preview(
+    app: &App,
+    event: &EventRecord,
+    selected_path: Option<&String>,
+    key_focus: bool,
+    value_focus: bool,
+    rate_info: Option<RateDebugInfo>,
+    pane_width: u16,
+    pane_height: u16,
+) -> (Text<'static>, u16) {
+    let mut lines = vec![Line::from(Span::styled(
+        app.model.type_display_name(&event.type_id),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if event.in_action_period {
+        let show_uniq = event.live_uniq_score;
+        let show_rate = event.live_rate_score;
+        let value_color = value_anomaly_color(anomaly_norm(show_uniq));
+        let rate_color = rate_anomaly_color(anomaly_norm(show_rate));
+        lines.push(Line::from(vec![
+            Span::styled("rate anomaly ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format_score(show_rate),
+                Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("value anomaly ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format_score(show_uniq),
+                Style::default()
+                    .fg(value_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        if let Some(info) = rate_info {
+            lines.push(rate_debug_line(info));
+        }
+    }
+    lines.push(Line::from(""));
+    if let Some(path) = selected_path {
+        lines.push(values_hint_line(path, pane_width));
+    }
+    let considered_paths = app
+        .model
+        .types
+        .get(&event.type_id)
+        .map(|tp| &tp.considered_paths);
+    let sub_lc = app.event_filters.substring_filter.to_lowercase();
+    let whitelist_terms = if app.whitelist_highlight_enabled() {
+        app.whitelist_terms()
+    } else {
+        &[]
+    };
+    let rendered = render_json_keypicker(
+        &event.obj,
+        selected_path,
+        key_focus,
+        value_focus,
+        &app.event_filters.key_filter,
+        &sub_lc,
+        whitelist_terms,
+        considered_paths,
+    );
+    let scroll = selected_json_scroll(rendered.selected_line, pane_height);
+    lines.extend(rendered.lines);
+    (Text::from(lines), scroll)
 }
 
 fn render_json_value_lines(
@@ -1635,7 +1687,9 @@ fn render_json_keyed_value_line(
     let filtered = !active_key_filter.is_empty() && active_key_filter == path;
     let normalized_out = is_path_normalized_out(considered_paths, path);
     let key_highlight = !substring_filter.is_empty()
-        && key.map(|k| k.to_lowercase().contains(substring_filter)).unwrap_or(false);
+        && key
+            .map(|k| k.to_lowercase().contains(substring_filter))
+            .unwrap_or(false);
     let key_whitelist_highlight = key
         .map(|k| matches_any_term(&k.to_lowercase(), whitelist_terms))
         .unwrap_or(false);
@@ -1809,7 +1863,11 @@ fn highlight_text_spans(
             if let Some(pos) = lower[i..].find(substring_filter) {
                 let start = i + pos;
                 let end = start + substring_filter.len();
-                best = Some((start, end, Style::default().fg(Color::Black).bg(Color::Yellow)));
+                best = Some((
+                    start,
+                    end,
+                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                ));
             }
         }
         for needle in whitelist_terms {
@@ -1819,7 +1877,13 @@ fn highlight_text_spans(
             if let Some(pos) = lower[i..].find(needle) {
                 let start = i + pos;
                 let end = start + needle.len();
-                let candidate = (start, end, Style::default().fg(Color::Black).bg(Color::Rgb(255, 140, 0)));
+                let candidate = (
+                    start,
+                    end,
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Rgb(255, 140, 0)),
+                );
                 best = match best {
                     None => Some(candidate),
                     Some(cur) => {
@@ -2136,7 +2200,10 @@ fn centered_rect_abs(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 fn tab_title(hotkey: &'static str, label: &'static str) -> Line<'static> {
-    Line::from(vec![styled_hotkey(hotkey), Span::raw(format!(" {}", label))])
+    Line::from(vec![
+        styled_hotkey(hotkey),
+        Span::raw(format!(" {}", label)),
+    ])
 }
 
 fn stylize_modal_line(s: &str) -> Line<'static> {

@@ -74,6 +74,13 @@ struct PeriodRateState {
     type_last_ts: HashMap<String, f64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RateDebugInfo {
+    pub actual_rate: f64,
+    pub expected_rate: f64,
+    pub anomaly_score: f64,
+}
+
 #[derive(Debug, Clone)]
 struct FilterTerm {
     negated: bool,
@@ -157,7 +164,11 @@ impl FilterExpr {
         self.groups.iter().any(|group| {
             group.iter().all(|term| {
                 let hit = predicate(term.value.as_str());
-                if term.negated { !hit } else { hit }
+                if term.negated {
+                    !hit
+                } else {
+                    hit
+                }
             })
         })
     }
@@ -414,25 +425,9 @@ impl AnalyzerModel {
         event_ts: f64,
         prev_seen_ts: Option<f64>,
     ) -> f64 {
-        let Some(pr) = self.period_rate_states.get(&period_id) else {
-            return 0.0;
-        };
-        if pr.elapsed_secs < MIN_ACTION_RATE_DURATION_SECS {
-            return self.interarrival_rate_fallback(type_id, prev_seen_ts, event_ts);
-        }
-        let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
-        if action_count < 2.0 {
-            return self.interarrival_rate_fallback(type_id, prev_seen_ts, event_ts);
-        }
-        let type_elapsed = pr.type_last_ts.get(type_id).copied().unwrap_or(0.0)
-            - pr.type_first_ts.get(type_id).copied().unwrap_or(0.0);
-        if type_elapsed <= 0.0 {
-            return self.interarrival_rate_fallback(type_id, prev_seen_ts, event_ts);
-        }
-        let action_rate = (action_count - 1.0) / type_elapsed;
-        let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
-        let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
-        normalized_rate_anomaly(action_rate, baseline_rate)
+        self.rate_debug_info(type_id, period_id, prev_seen_ts, event_ts)
+            .map(|info| info.anomaly_score)
+            .unwrap_or(0.0)
     }
 
     fn update_rate_scores(
@@ -451,42 +446,13 @@ impl AnalyzerModel {
             if pr.first_event_ts.is_none() {
                 pr.first_event_ts = Some(ts);
             }
-            if pr.elapsed_secs < MIN_ACTION_RATE_DURATION_SECS {
-                return self.interarrival_rate_fallback(type_id, prev_seen_ts, now_ts);
-            }
-            let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
-            if action_count < 2.0 {
-                return self.interarrival_rate_fallback(type_id, prev_seen_ts, now_ts);
-            }
-            let type_elapsed = pr.type_last_ts[type_id] - pr.type_first_ts[type_id];
-            if type_elapsed <= 0.0 {
-                return self.interarrival_rate_fallback(type_id, prev_seen_ts, now_ts);
-            }
-            let action_rate = (action_count - 1.0) / type_elapsed;
-            let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
-            let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
-            normalized_rate_anomaly(action_rate, baseline_rate)
+            self.rate_debug_info(type_id, pid, prev_seen_ts, now_ts)
+                .map(|info| info.anomaly_score)
+                .unwrap_or(0.0)
         } else {
             *self.baseline_counts.entry(type_id.to_string()).or_insert(0) += 1;
             0.0
         }
-    }
-
-    fn interarrival_rate_fallback(&self, type_id: &str, prev_seen_ts: Option<f64>, now_ts: f64) -> f64 {
-        let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
-        if baseline_count <= 0.0 {
-            return 1.0;
-        }
-        let Some(prev_ts) = prev_seen_ts else {
-            return 0.0;
-        };
-        let delta = now_ts - prev_ts;
-        if delta <= 0.0 {
-            return 1.0;
-        }
-        let action_rate = 1.0 / delta;
-        let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
-        normalized_rate_anomaly(action_rate, baseline_rate)
     }
 
     fn account_rate_elapsed(&mut self, now_ts: f64) {
@@ -534,31 +500,11 @@ impl AnalyzerModel {
         }
     }
 
-    pub fn rate_debug_info_for_event_index(&self, event_idx: usize) -> Option<(f64, f64)> {
+    pub fn rate_debug_info_for_event_index(&self, event_idx: usize) -> Option<RateDebugInfo> {
         let event = self.events.get(event_idx)?;
         let period_id = event.action_period_id?;
-        let baseline_count = self.baseline_counts.get(&event.type_id).copied().unwrap_or(0) as f64;
-        let baseline_rate = baseline_count / self.baseline_elapsed_secs.max(0.001);
-
-        let pr = self.period_rate_states.get(&period_id)?;
-        let action_count = pr.counts.get(&event.type_id).copied().unwrap_or(0) as f64;
-        if action_count >= 2.0 {
-            let type_elapsed = pr.type_last_ts.get(&event.type_id).copied().unwrap_or(0.0)
-                - pr.type_first_ts.get(&event.type_id).copied().unwrap_or(0.0);
-            if type_elapsed > 0.0 {
-                let action_rate = (action_count - 1.0) / type_elapsed;
-                return Some((action_rate, baseline_rate));
-            }
-        }
-
         let prev_seen = self.prev_seen_ts_for_event(event_idx, &event.type_id);
-        let action_rate = prev_seen
-            .and_then(|prev| {
-                let dt = event.ts - prev;
-                (dt > 0.0).then_some(1.0 / dt)
-            })
-            .unwrap_or(0.0);
-        Some((action_rate, baseline_rate))
+        self.rate_debug_info(&event.type_id, period_id, prev_seen, event.ts)
     }
 
     fn prev_seen_ts_for_event(&self, event_idx: usize, type_id: &str) -> Option<f64> {
@@ -571,6 +517,61 @@ impl AnalyzerModel {
             }
         }
         self.baseline_last_seen_by_type.get(type_id).copied()
+    }
+
+    fn rate_debug_info(
+        &self,
+        type_id: &str,
+        period_id: u64,
+        prev_seen_ts: Option<f64>,
+        event_ts: f64,
+    ) -> Option<RateDebugInfo> {
+        let _ = self.period_rate_states.get(&period_id)?;
+        let expected_rate = self.baseline_rate_for_type(type_id);
+        let observed_rate = self
+            .period_action_rate(type_id, period_id)
+            .or_else(|| self.interarrival_action_rate(prev_seen_ts, event_ts));
+        let actual_rate = observed_rate.unwrap_or(0.0);
+
+        let anomaly_score = if self.baseline_counts.get(type_id).copied().unwrap_or(0) == 0 {
+            1.0
+        } else if observed_rate.is_none()
+        {
+            0.0
+        } else {
+            normalized_rate_anomaly(actual_rate, expected_rate)
+        };
+
+        Some(RateDebugInfo {
+            actual_rate,
+            expected_rate,
+            anomaly_score,
+        })
+    }
+
+    fn baseline_rate_for_type(&self, type_id: &str) -> f64 {
+        let baseline_count = self.baseline_counts.get(type_id).copied().unwrap_or(0) as f64;
+        baseline_count / self.baseline_elapsed_secs.max(0.001)
+    }
+
+    fn period_action_rate(&self, type_id: &str, period_id: u64) -> Option<f64> {
+        let pr = self.period_rate_states.get(&period_id)?;
+        if pr.elapsed_secs < MIN_ACTION_RATE_DURATION_SECS {
+            return None;
+        }
+        let action_count = pr.counts.get(type_id).copied().unwrap_or(0) as f64;
+        if action_count < 2.0 {
+            return None;
+        }
+        let type_elapsed = pr.type_last_ts.get(type_id).copied().unwrap_or(0.0)
+            - pr.type_first_ts.get(type_id).copied().unwrap_or(0.0);
+        (type_elapsed > 0.0).then_some((action_count - 1.0) / type_elapsed)
+    }
+
+    fn interarrival_action_rate(&self, prev_seen_ts: Option<f64>, event_ts: f64) -> Option<f64> {
+        let prev_ts = prev_seen_ts?;
+        let delta = event_ts - prev_ts;
+        (delta > 0.0).then_some(1.0 / delta)
     }
 
     fn recomputed_uniq_for(&self, type_id: &str, obj: &Value) -> f64 {
@@ -648,7 +649,10 @@ impl AnalyzerModel {
         out
     }
 
-    pub fn apply_normalized_field_overrides(&mut self, overrides: &[(String, String, PathOverride)]) {
+    pub fn apply_normalized_field_overrides(
+        &mut self,
+        overrides: &[(String, String, PathOverride)],
+    ) {
         for tp in self.types.values_mut() {
             tp.path_overrides.clear();
         }
@@ -890,15 +894,21 @@ impl AnalyzerModel {
 
         let mut object_cache: Option<String> = None;
         if !substring_expr.matches(|term| {
-            let obj_text = object_cache
-                .get_or_insert_with(|| serde_json::to_string(&e.obj).unwrap_or_default().to_lowercase());
+            let obj_text = object_cache.get_or_insert_with(|| {
+                serde_json::to_string(&e.obj)
+                    .unwrap_or_default()
+                    .to_lowercase()
+            });
             obj_text.contains(&term.to_lowercase())
         }) {
             return false;
         }
         if !fuzzy_expr.matches(|term| {
-            let obj_text = object_cache
-                .get_or_insert_with(|| serde_json::to_string(&e.obj).unwrap_or_default().to_lowercase());
+            let obj_text = object_cache.get_or_insert_with(|| {
+                serde_json::to_string(&e.obj)
+                    .unwrap_or_default()
+                    .to_lowercase()
+            });
             fuzzy_match(obj_text.as_str(), &term.to_lowercase())
         }) {
             return false;
@@ -1546,6 +1556,9 @@ mod tests {
         };
         let events = model.filtered_events(&filters);
         assert_eq!(events.len(), 1);
-        assert_eq!(value_at_path(&events[0].obj, "msg"), Some(&json!("alpha beta gamma")));
+        assert_eq!(
+            value_at_path(&events[0].obj, "msg"),
+            Some(&json!("alpha beta gamma"))
+        );
     }
 }
