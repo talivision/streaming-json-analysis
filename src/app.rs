@@ -127,6 +127,7 @@ pub struct App {
     pub values_key: String,
     pub values_index: usize,
     pub values_return_mode: UiMode,
+    values_cache: Option<Vec<(String, String, usize)>>,
 
     pub offline: bool,
     pub status: String,
@@ -228,6 +229,7 @@ impl App {
             values_key: String::new(),
             values_index: 0,
             values_return_mode: UiMode::Live,
+            values_cache: None,
 
             offline,
             status: if offline {
@@ -2292,29 +2294,41 @@ impl App {
 
     /// Collect unique values for `values_key` across all currently filtered events.
     /// Returns (display_str, filter_token, count) sorted by count descending.
-    pub fn collect_key_values(&self) -> Vec<(String, String, usize)> {
+    fn ensure_values_cache(&mut self) {
         use std::collections::HashMap;
-        let mut counts: HashMap<String, (String, usize)> = HashMap::new();
-        for e in self.model.filtered_events(&self.event_filters) {
-            if let Some(v) = value_at_path(&e.obj, &self.values_key) {
-                let token = value_token(v);
-                let display = v.to_string();
-                let entry = counts.entry(token.clone()).or_insert((display, 0));
-                entry.1 += 1;
+        if self.values_cache.is_none() {
+            let mut counts: HashMap<String, (String, usize)> = HashMap::new();
+            for e in self.model.filtered_events(&self.event_filters) {
+                if let Some(v) = value_at_path(&e.obj, &self.values_key) {
+                    let token = value_token(v);
+                    let display = v.to_string();
+                    let entry = counts.entry(token.clone()).or_insert((display, 0));
+                    entry.1 += 1;
+                }
             }
+            let mut result: Vec<(String, String, usize)> = counts
+                .into_iter()
+                .map(|(token, (display, count))| (display, token, count))
+                .collect();
+            result.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+            self.values_cache = Some(result);
         }
-        let mut result: Vec<(String, String, usize)> = counts
-            .into_iter()
-            .map(|(token, (display, count))| (display, token, count))
-            .collect();
-        result.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-        result
+    }
+
+    pub fn collect_key_values(&mut self) -> &[(String, String, usize)] {
+        self.ensure_values_cache();
+        self.values_cache.as_deref().unwrap_or(&[])
+    }
+
+    pub fn cached_key_values(&self) -> &[(String, String, usize)] {
+        self.values_cache.as_deref().unwrap_or(&[])
     }
 
     fn enter_values_mode_for_key(&mut self, key: String, return_mode: UiMode) {
         self.values_key = key;
         self.values_index = 0;
         self.values_return_mode = return_mode;
+        self.values_cache = None;
         self.mode = UiMode::Values;
         let count = self.collect_key_values().len();
         self.status = format!("{} unique values for '{}'", count, self.values_key);
@@ -2348,7 +2362,8 @@ impl App {
     }
 
     fn apply_values_selection(&mut self) {
-        let entries = self.collect_key_values();
+        self.ensure_values_cache();
+        let entries = self.cached_key_values();
         let Some((_, token, _)) = entries.get(self.values_index) else {
             return;
         };
@@ -2362,7 +2377,8 @@ impl App {
     }
 
     fn navigate_values(&mut self, intent: NavIntent) {
-        let count = self.collect_key_values().len();
+        self.ensure_values_cache();
+        let count = self.cached_key_values().len();
         match intent {
             NavIntent::LineUp => self.values_index = self.values_index.saturating_sub(1),
             NavIntent::LineDown => {
@@ -2960,6 +2976,7 @@ impl App {
     fn mark_live_cache_dirty(&mut self) {
         self.live_cache_dirty = true;
         self.baseline_cache_dirty = true;
+        self.values_cache = None;
     }
 
     fn rebuild_live_cache_if_needed(&mut self) {

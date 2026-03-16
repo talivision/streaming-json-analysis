@@ -784,8 +784,9 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn draw_values(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let entries = app.collect_key_values();
+fn draw_values(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    app.collect_key_values();
+    let entries = app.cached_key_values();
     let total = entries.len();
     let selected = if total == 0 {
         0
