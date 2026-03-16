@@ -145,6 +145,67 @@ fn stream_reader_waits_for_partial_jsonl_line_until_newline_arrives() {
 }
 
 #[test]
+fn stream_reader_does_not_report_incomplete_tail_for_unread_complete_jsonl_lines() {
+    let path = temp_stream_path();
+    fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\"}\n{\"event\":\"c\"}\n")
+        .expect("write complete jsonl file");
+
+    let mut reader = StreamReader::new(path.clone());
+    let first = reader.poll().expect("first poll succeeds");
+    assert_eq!(
+        first,
+        vec![
+            json!({"event":"a"}),
+            json!({"event":"b"}),
+            json!({"event":"c"})
+        ]
+    );
+    assert!(!reader.has_incomplete_final_line());
+
+    fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\"}\n{\"event\":\"c\"}\n")
+        .expect("rewrite complete jsonl file");
+    let mut reader = StreamReader::new(path.clone());
+    reader.poll().expect("poll succeeds");
+    fs::write(
+        &path,
+        "{\"event\":\"a\"}\n{\"event\":\"b\"}\n{\"event\":\"c\"}\n{\"event\":\"d\"}\n",
+    )
+    .expect("append complete newline-terminated record");
+    assert!(
+        !reader.has_incomplete_final_line(),
+        "unread complete lines should not count as an incomplete final line"
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn stream_reader_reports_unterminated_final_json_object() {
+    let path = temp_stream_path();
+    fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\"}").expect("write unterminated file");
+
+    let mut reader = StreamReader::new(path.clone());
+    let rows = reader.poll().expect("poll succeeds");
+    assert_eq!(rows, vec![json!({"event":"a"}), json!({"event":"b"})]);
+    assert!(!reader.has_incomplete_final_line());
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn stream_reader_reports_unparseable_trailing_fragment() {
+    let path = temp_stream_path();
+    fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\"").expect("write partial final object");
+
+    let mut reader = StreamReader::new(path.clone());
+    let rows = reader.poll().expect("poll succeeds");
+    assert_eq!(rows, vec![json!({"event":"a"})]);
+    assert!(reader.has_incomplete_final_line());
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn stream_reader_skips_whitespace_only_tail_at_eof() {
     let path = temp_stream_path();
     fs::write(&path, "{\"event\":\"a\"}\n   \t\r").expect("write whitespace tail");

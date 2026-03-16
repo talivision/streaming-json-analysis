@@ -44,6 +44,7 @@ const UI_FRAME_SLEEP: Duration = Duration::from_millis(16);
 const UI_BURST_SLEEP: Duration = Duration::from_millis(1);
 const MENU_PAGE_STEP: usize = 30;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
+const WARNING_PREFIX_ORANGE: &str = "\x1b[38;5;208mwarning:\x1b[0m";
 
 pub struct LiveRenderData<'a> {
     pub rows: Vec<&'a EventRecord>,
@@ -389,24 +390,26 @@ impl App {
         terminal.show_cursor()?;
         if self.reader.has_incomplete_final_line() {
             eprintln!(
-                "warning: incomplete JSON line remained at shutdown in {}",
+                "{} incomplete JSON line remained at shutdown in {}",
+                WARNING_PREFIX_ORANGE,
                 self.reader.path().display()
             );
         }
         if let Some(reader) = self.baseline_reader.as_ref() {
             if reader.has_incomplete_final_line() {
                 eprintln!(
-                    "warning: incomplete JSON line remained at shutdown in {}",
+                    "{} incomplete JSON line remained at shutdown in {}",
+                    WARNING_PREFIX_ORANGE,
                     reader.path().display()
                 );
             }
         }
         self.model.close_open_period(unix_ts());
         if let Err(err) = self.persist_state() {
-            eprintln!("warning: failed to persist session state: {err}");
+            eprintln!("{WARNING_PREFIX_ORANGE} failed to persist session state: {err}");
         }
         if let Err(err) = self.export_session_if_configured() {
-            eprintln!("warning: failed to export session: {err}");
+            eprintln!("{WARNING_PREFIX_ORANGE} failed to export session: {err}");
         }
         loop_result
     }

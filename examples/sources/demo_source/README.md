@@ -1,6 +1,7 @@
 # demo_source
 
 Interactive JSONL stream demo.
+The writer appends one complete JSON object per line and terminates every object with `\n`.
 
 Run:
 

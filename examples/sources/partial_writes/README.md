@@ -2,6 +2,7 @@
 
 This demo source writes JSONL continuously and intentionally emits partial lines before finishing them.
 It uses live 13-digit epoch-millisecond `_timestamp` values so it can be used directly in live mode.
+Every complete object is terminated by `\n`; partial objects are intentionally withheld until that newline is written.
 
 It exists to validate the stream reader behavior for:
 

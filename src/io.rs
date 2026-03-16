@@ -98,21 +98,30 @@ impl StreamReader {
         let Ok(len) = file.metadata().map(|m| m.len()) else {
             return false;
         };
-        if len <= self.offset {
+        if len == 0 {
             return false;
         }
         let mut reader = BufReader::new(file);
-        if reader.seek(SeekFrom::Start(self.offset)).is_err() {
+        let start = len.saturating_sub(8192);
+        if reader.seek(SeekFrom::Start(start)).is_err() {
             return false;
         }
         let mut tail = Vec::new();
         if reader.read_to_end(&mut tail).is_err() {
             return false;
         }
-        if tail.iter().all(|b| matches!(*b, b' ' | b'\t' | b'\r' | b'\n')) {
+        let Some(last_significant_idx) = tail
+            .iter()
+            .rposition(|b| !matches!(*b, b' ' | b'\t' | b'\r' | b'\n'))
+        else {
             return false;
-        }
-        serde_json::from_slice::<Value>(&tail).is_err()
+        };
+        let fragment_start = tail[..=last_significant_idx]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |idx| idx + 1);
+        let final_fragment = &tail[fragment_start..=last_significant_idx];
+        serde_json::from_slice::<Value>(final_fragment).is_err()
     }
 
     pub fn poll(&mut self) -> Result<Vec<Value>> {

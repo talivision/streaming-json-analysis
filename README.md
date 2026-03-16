@@ -94,11 +94,13 @@ For static archives where you want to read the whole file at once rather than ta
 ./target/release/json-analyzer --offline archive.jsonl
 ```
 
+Offline mode is for read-once analysis of existing data. It does not tail for new events and does not support marking action periods.
+
 ---
 
 ## Writing a source
 
-If you control the event producer, the format is simple — one JSON object per line, flushed immediately. The only required field is **`_timestamp`**: epoch milliseconds as a 13-digit integer.
+If you control the event producer, the format is simple — one JSON object per line, flushed immediately. For live/tailing mode, the required field is **`_timestamp`**: epoch milliseconds as a 13-digit integer.
 
 ```python
 import json, time
@@ -115,24 +117,19 @@ with open("/tmp/stream.jsonl", "a") as f:
         time.sleep(1)
 ```
 
-Rules:
+Rules for live/tailing mode:
 - One JSON object per line, no pretty-printing.
 - `_timestamp` must be an integer, not a string, and not seconds — 13 digits (milliseconds).
 - `_timestamp` must be monotonically non-decreasing across lines — each event must have a timestamp equal to or greater than the one before it.
 
+In `--offline` mode, `_timestamp` is optional. If it is missing, the analyzer assigns synthetic timestamps so static files can still be inspected, but offline mode does not support action-period marking.
+
 ### Enrichment fields
 
-Any `_`-prefixed field beyond `_timestamp` is treated as enrichment or deployment context and behaves like any other field:
+Any `_`-prefixed field beyond `_timestamp` is treated as enrichment or deployment context and behaves like any other field. In JSONL, each complete object must end with `\n`, including the last one in the file.
 
-```json
-{
-  "_timestamp": 1739952000123,
-  "_env":       "prod",
-  "_service":   "auth",
-  "_region":    "us-east-1",
-  "event":      "login",
-  "user_id":    42
-}
+```jsonl
+{"_timestamp":1739952000123,"_env":"prod","_service":"auth","_region":"us-east-1","event":"login","user_id":42}
 ```
 
 - Two events that differ only in the *value* of `_env` have the same structural type. Two that differ in whether `_env` is *present* have different types.
@@ -153,6 +150,8 @@ Rename unfamiliar types with `r` to give them human-readable labels — these pe
 ### 2. Mark an action period
 
 When something of interest happens — a deployment, a user action, an incident — press **`m`** to open an action period. Press **`m`** again to close it. Label it with **`n`** before closing if you want a name on the period.
+
+This is only available in live mode. Offline analysis, including `--directory`, does not support opening or closing action periods.
 
 Events inside the period are scored against the baseline:
 - **Rate anomaly** — is this event type arriving faster or slower than normal?
@@ -247,7 +246,7 @@ The bundled Python demo source writes background noise plus action-triggered eve
 
 ```bash
 # Terminal 1
-python3 examples/sources/demo-source/demo_source.py
+python3 examples/sources/demo_source/demo_source.py
 
 # Terminal 2
 ./target/release/json-analyzer /tmp/json_demo/stream.jsonl
@@ -280,83 +279,9 @@ If your events are spread across many files, use `--directory`. Files are read i
 
 ---
 
-## Keybindings
+## UI help
 
-### Global
-
-| Key | Action |
-|-----|--------|
-| `q` (×2) | Quit |
-| `h` / `?` | Toggle help overlay |
-| `1` `2` `3` `4` | Live / Periods / Types / Baseline |
-| `m` | Open / close action period |
-| `n` | Set action label |
-| `x` | Export session |
-| `p` | Export profile |
-
-### Filters
-
-| Key | Filter |
-|-----|--------|
-| `k` | Keys |
-| `t` | Type |
-| `/` | Substring |
-| `z` | Fuzzy |
-| `e` | Exact `path=value` |
-| `c` | Clear all |
-| `y` | Suspend / restore |
-| `w` | Cycle whitelist mode |
-
-### Live view
-
-| Key | Action |
-|-----|--------|
-| `↑` / `↓` | Select event |
-| `f` | Toggle follow |
-| `→` / `enter` | Focus key picker |
-| `esc` / `←` | Back to event list |
-| (key-focused) `k` | Set key filter |
-| (key-focused) `t` | Jump to type |
-| (key-focused) `v` | Browse all unique values for this key |
-| (value-focused) `e` | Set exact filter |
-
-### Values view
-
-| Key | Action |
-|-----|--------|
-| `↑` / `↓` | Select value |
-| `enter` / `e` | Apply as exact filter and return to Live |
-| `esc` | Return to Live without filtering |
-
-### Types view
-
-| Key | Action |
-|-----|--------|
-| `↑` / `↓` | Select type |
-| `r` | Rename |
-| `j` | Preview sample event |
-| `t` | Filter to type and jump to Live |
-| `u` | Toggle negative type filter |
-| `/` | Search type list |
-| `enter` / `→` | Focus path list |
-| (path-focused) `space` | Toggle path on / off |
-
-### Periods view
-
-| Key | Action |
-|-----|--------|
-| `↑` / `↓` | Select period |
-| `enter` / `→` | Browse period events |
-| `del` | Delete period |
-
-### Object inspector
-
-| Key | Action |
-|-----|--------|
-| `↑` / `↓` | Select key |
-| `k` | Set key filter |
-| `t` | Jump to type |
-| `esc` | Close |
+The terminal UI is the source of truth for navigation and shortcuts. Most relevant hotkeys are surfaced directly in the interface, and `h` or `?` opens the built-in help overlay for the current workflow.
 
 ---
 
