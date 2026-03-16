@@ -184,7 +184,6 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
             selected_event_abs_index.and_then(|event_idx| {
                 app.model.rate_debug_info_for_event_index(event_idx)
             }),
-            cols[1].width,
             cols[1].height,
         )
     } else {
@@ -324,7 +323,6 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
             app.periods_focus == PeriodsFocus::Json,
             app.period_value_focus,
             rate_info,
-            cols[2].width,
             cols[2].height,
         )
     } else {
@@ -540,30 +538,6 @@ fn selected_json_title(is_key_focus: bool, value_focus: bool, pane_width: u16) -
 
 /// Hint line shown at the top of a JSON pane when a key is focused.
 /// Collapses (returns None) when no key is selected.
-fn values_hint_line(selected_path: &str, pane_width: u16) -> Line<'static> {
-    let path = selected_path.to_string();
-    if pane_width < 16 {
-        return Line::from(vec![styled_hotkey("v")]);
-    }
-    if pane_width < 44 {
-        return Line::from(vec![
-            styled_hotkey("v"),
-            Span::styled("  browse values", Style::default().fg(Color::DarkGray)),
-        ]);
-    }
-    let display = if path.len() > 28 {
-        format!("{}…", &path[..28])
-    } else {
-        path
-    };
-    Line::from(vec![
-        styled_hotkey("v"),
-        Span::styled(
-            format!("  browse all values for '{display}'"),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ])
-}
 
 fn type_details_title(app: &App, pane_width: u16) -> Line<'static> {
     if !app.types_path_focus {
@@ -931,7 +905,6 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
             app.data_key_focus,
             app.data_value_focus,
             None,
-            cols[1].width,
             cols[1].height,
         )
     } else {
@@ -1425,7 +1398,6 @@ fn build_event_preview(
     key_focus: bool,
     value_focus: bool,
     rate_info: Option<RateDebugInfo>,
-    pane_width: u16,
     pane_height: u16,
 ) -> (Text<'static>, u16) {
     let mut lines = vec![Line::from(Span::styled(
@@ -1459,9 +1431,6 @@ fn build_event_preview(
         }
     }
     lines.push(Line::from(""));
-    if let Some(path) = selected_path {
-        lines.push(values_hint_line(path, pane_width));
-    }
     let considered_paths = app
         .model
         .types
