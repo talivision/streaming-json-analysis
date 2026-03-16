@@ -65,6 +65,55 @@ impl StreamReader {
         }
     }
 
+    fn current_line_number(&self) -> usize {
+        if self.is_directory || self.offset == 0 || !self.path.exists() {
+            return 1;
+        }
+        let Ok(file) = File::open(&self.path) else {
+            return 1;
+        };
+        let mut reader = BufReader::new(file);
+        let mut remaining = self.offset;
+        let mut buf = vec![0_u8; 8192];
+        let mut line = 1usize;
+        while remaining > 0 {
+            let to_read = remaining.min(buf.len() as u64) as usize;
+            let Ok(n) = reader.read(&mut buf[..to_read]) else {
+                return line;
+            };
+            if n == 0 {
+                break;
+            }
+            line += buf[..n].iter().filter(|b| **b == b'\n').count();
+            remaining -= n as u64;
+        }
+        line
+    }
+
+    pub fn has_incomplete_final_line(&self) -> bool {
+        if self.is_directory || !self.path.exists() {
+            return false;
+        }
+        let Ok(file) = File::open(&self.path) else {
+            return false;
+        };
+        let Ok(len) = file.metadata().map(|m| m.len()) else {
+            return false;
+        };
+        if len <= self.offset {
+            return false;
+        }
+        let mut reader = BufReader::new(file);
+        if reader.seek(SeekFrom::Start(self.offset)).is_err() {
+            return false;
+        }
+        let mut tail = Vec::new();
+        if reader.read_to_end(&mut tail).is_err() {
+            return false;
+        }
+        !tail.iter().all(|b| matches!(*b, b' ' | b'\t' | b'\r' | b'\n'))
+    }
+
     pub fn poll(&mut self) -> Result<Vec<Value>> {
         if self.is_directory {
             return self.poll_directory_parallel();
@@ -117,13 +166,29 @@ impl StreamReader {
         }
 
         if line_spans.len() < MAX_LINES_PER_POLL && at_eof && line_start < chunk.len() {
-            line_spans.push((line_start, chunk.len()));
-            consumed = chunk.len();
+            let tail = &chunk[line_start..];
+            // Whitespace-only trailing tails can be ignored.
+            if tail.iter().all(|b| matches!(*b, b' ' | b'\t' | b'\r')) {
+                line_spans.push((line_start, chunk.len()));
+                consumed = chunk.len();
+            // A parseable final JSON value can be ingested immediately.
+            } else if serde_json::from_slice::<Value>(tail).is_ok() {
+                line_spans.push((line_start, chunk.len()));
+                consumed = chunk.len();
+            // Otherwise assume the trailing line is unfinished and retry it next poll.
+            } else {
+                consumed = line_start;
+            }
         }
 
-        // Avoid stalling forever on a very long unterminated line.
-        if consumed == 0 && !chunk.is_empty() {
-            consumed = chunk.len();
+        if consumed == 0 && !chunk.is_empty() && chunk.len() >= MAX_BYTES_PER_POLL {
+            let line_number = self.current_line_number();
+            return Err(anyhow!(
+                "JSON line in {} line {} exceeded {} bytes before a newline was seen; aborting read",
+                self.path.display(),
+                line_number,
+                MAX_BYTES_PER_POLL
+            ));
         }
 
         let chunk_base_offset = self.offset;
@@ -206,12 +271,28 @@ impl StreamReader {
 
         let at_snapshot_end = read_cap == snapshot_remaining;
         if line_spans.len() < MAX_SNAPSHOT_LINES_PER_POLL && line_start < chunk.len() && at_snapshot_end {
-            line_spans.push((line_start, chunk.len()));
-            consumed = chunk.len();
+            let tail = &chunk[line_start..];
+            // Whitespace-only trailing tails can be ignored.
+            if tail.iter().all(|b| matches!(*b, b' ' | b'\t' | b'\r')) {
+                line_spans.push((line_start, chunk.len()));
+                consumed = chunk.len();
+            // A parseable final JSON value can be ingested immediately.
+            } else if serde_json::from_slice::<Value>(tail).is_ok() {
+                line_spans.push((line_start, chunk.len()));
+                consumed = chunk.len();
+            // Otherwise leave the trailing line unread and retry it next poll.
+            } else {
+                consumed = line_start;
+            }
         }
-        if consumed == 0 {
-            // Avoid stalling forever on a very long unterminated line.
-            consumed = chunk.len();
+        if consumed == 0 && !chunk.is_empty() && chunk.len() >= MAX_SNAPSHOT_BYTES_PER_POLL {
+            let line_number = self.current_line_number();
+            return Err(anyhow!(
+                "JSON line in {} line {} exceeded {} bytes before a newline was seen; aborting read",
+                self.path.display(),
+                line_number,
+                MAX_SNAPSHOT_BYTES_PER_POLL
+            ));
         }
         let chunk_base_offset = self.offset;
         self.offset += consumed as u64;
@@ -314,12 +395,8 @@ fn parse_directory_file(path: &PathBuf) -> Result<(f64, PathBuf, usize, Vec<Valu
     }
 
     if trimmed.starts_with('[') {
-        let arr: Vec<Value> = serde_json::from_str(trimmed).map_err(|e| {
-            anyhow!(
-                "Invalid JSON array in {}: {e}",
-                path.display()
-            )
-        })?;
+        let arr: Vec<Value> = serde_json::from_str(trimmed)
+            .map_err(|e| anyhow!("Invalid JSON array in {}: {e}", path.display()))?;
         let ts_key = arr
             .iter()
             .filter_map(extract_timestamp_millis)
@@ -330,12 +407,8 @@ fn parse_directory_file(path: &PathBuf) -> Result<(f64, PathBuf, usize, Vec<Valu
 
     let mut values = Vec::new();
     if trimmed.starts_with('{') && !trimmed.contains('\n') {
-        let v: Value = serde_json::from_str(trimmed).map_err(|e| {
-            anyhow!(
-                "Invalid JSON object in {}: {e}",
-                path.display()
-            )
-        })?;
+        let v: Value = serde_json::from_str(trimmed)
+            .map_err(|e| anyhow!("Invalid JSON object in {}: {e}", path.display()))?;
         let ts_key = extract_timestamp_millis(&v).unwrap_or(f64::INFINITY);
         return Ok((ts_key, path.clone(), 0, vec![v], file_len));
     }
@@ -345,12 +418,8 @@ fn parse_directory_file(path: &PathBuf) -> Result<(f64, PathBuf, usize, Vec<Valu
         if line.is_empty() {
             continue;
         }
-        let v: Value = serde_json::from_str(line).map_err(|e| {
-            anyhow!(
-                "Invalid JSON line in {}: {e}",
-                path.display()
-            )
-        })?;
+        let v: Value = serde_json::from_str(line)
+            .map_err(|e| anyhow!("Invalid JSON line in {}: {e}", path.display()))?;
         values.push(v);
     }
     let ts_key = values
