@@ -75,7 +75,6 @@ struct LiveAnchor {
 enum FilterOrigin {
     TypedInput,
     KeyShortcut { anchor: Option<LiveAnchor> },
-    Clear,
     TypeView,
 }
 
@@ -1343,6 +1342,19 @@ impl App {
                     "Live follow: OFF".to_string()
                 };
             }
+            KeyCode::Char('n')
+                if self.mode == UiMode::Periods
+                    && self.periods_focus == PeriodsFocus::Periods =>
+            {
+                let label = self
+                    .model
+                    .periods
+                    .get(self.periods_index)
+                    .map(|p| p.label.clone())
+                    .unwrap_or_default();
+                self.input_mode = InputMode::RenamePeriod;
+                self.input_buffer = label;
+            }
             KeyCode::Char('n') => {
                 self.input_mode = InputMode::Label;
                 self.input_buffer = self.model.current_label.clone();
@@ -1451,8 +1463,13 @@ impl App {
                 }
             }
             KeyCode::Char('c') if self.mode != UiMode::Types => {
+                let anchor = if self.mode == UiMode::Live {
+                    self.live_anchor_at(self.live_event_index)
+                } else {
+                    None
+                };
                 self.event_filters = DataFilters::default();
-                self.commit_filter_change(FilterOrigin::Clear);
+                self.commit_filter_change(FilterOrigin::KeyShortcut { anchor });
                 self.status = "Event filters cleared".to_string();
             }
             KeyCode::Up => self.handle_navigation_intent(NavIntent::LineUp),
@@ -1513,6 +1530,19 @@ impl App {
                         if !self.input_buffer.trim().is_empty() {
                             self.model.current_label = self.input_buffer.trim().to_string();
                             self.status = format!("Current label: {}", self.model.current_label);
+                        }
+                    }
+                    InputMode::RenamePeriod => {
+                        let label = self.input_buffer.trim().to_string();
+                        let periods = self.model.periods.clone();
+                        if let Some(period) = periods.get(self.periods_index) {
+                            let id = period.id;
+                            let mut updated = self.model.periods.clone();
+                            if let Some(p) = updated.iter_mut().find(|p| p.id == id) {
+                                p.label = label.clone();
+                            }
+                            self.apply_periods_update(updated);
+                            self.status = format!("Renamed period to '{}'", label);
                         }
                     }
                     InputMode::EventFilter(field) => {
@@ -1635,10 +1665,15 @@ impl App {
     }
 
     fn toggle_event_filters_enabled(&mut self) {
+        let anchor = if self.mode == UiMode::Live {
+            self.live_anchor_at(self.live_event_index)
+        } else {
+            None
+        };
         if let Some(saved) = self.stashed_event_filters.take() {
             self.event_filters = saved;
             self.mark_live_cache_dirty();
-            self.refresh_live_position();
+            self.after_filter_change(anchor);
             self.status = "Event filters restored".to_string();
             return;
         }
@@ -1651,7 +1686,7 @@ impl App {
         self.stashed_event_filters = Some(self.event_filters.clone());
         self.event_filters = DataFilters::default();
         self.mark_live_cache_dirty();
-        self.refresh_live_position();
+        self.after_filter_change(anchor);
         self.status = "Event filters suspended (press y to restore)".to_string();
     }
 
@@ -2172,16 +2207,30 @@ impl App {
 
     /// Collect unique values for `values_key` across all currently filtered events.
     /// Returns (display_str, filter_token, count) sorted by count descending.
+    /// When opened from Baseline view, aggregates over baseline events instead of live.
     fn ensure_values_cache(&mut self) {
         use std::collections::HashMap;
         if self.values_cache.is_none() {
             let mut counts: HashMap<String, (String, usize)> = HashMap::new();
-            for e in self.model.filtered_events(&self.event_filters) {
-                if let Some(v) = value_at_path(&e.obj, &self.values_key) {
-                    let token = value_token(v);
-                    let display = v.to_string();
-                    let entry = counts.entry(token.clone()).or_insert((display, 0));
-                    entry.1 += 1;
+            if self.values_return_mode == UiMode::Data {
+                self.ensure_baseline_cache();
+                let events: Vec<&EventRecord> = self.visible_baseline_events();
+                for e in events {
+                    if let Some(v) = value_at_path(&e.obj, &self.values_key) {
+                        let token = value_token(v);
+                        let display = v.to_string();
+                        let entry = counts.entry(token.clone()).or_insert((display, 0));
+                        entry.1 += 1;
+                    }
+                }
+            } else {
+                for e in self.model.filtered_events(&self.event_filters) {
+                    if let Some(v) = value_at_path(&e.obj, &self.values_key) {
+                        let token = value_token(v);
+                        let display = v.to_string();
+                        let entry = counts.entry(token.clone()).or_insert((display, 0));
+                        entry.1 += 1;
+                    }
                 }
             }
             let mut result: Vec<(String, String, usize)> = counts
@@ -2267,9 +2316,6 @@ impl App {
             return;
         };
         let token = token.clone();
-        // Switch to Live first so after_filter_change positions correctly.
-        self.mode = UiMode::Live;
-        self.exit_live_key_focus();
         let key = self.values_key.clone();
         self.apply_exact_filter_toggle(&key, &token);
     }
@@ -2462,6 +2508,9 @@ impl App {
                     if let Some(idx) = self.find_live_index(anchor) {
                         self.live_event_index = idx;
                         self.ensure_live_selection_visible();
+                    } else {
+                        self.live_event_index = 0;
+                        self.live_view_start = 0;
                     }
                 }
                 self.clamp_live_key_selection();
@@ -2488,7 +2537,12 @@ impl App {
                     self.clamp_data_key_selection();
                 }
             }
-            UiMode::Types | UiMode::Values => {}
+            UiMode::Types => {}
+            UiMode::Values => {
+                self.ensure_values_cache();
+                let n = self.cached_key_values().len();
+                self.values_index = if n == 0 { 0 } else { self.values_index.min(n - 1) };
+            }
         }
     }
 
@@ -2524,6 +2578,11 @@ impl App {
 
     fn apply_exact_filter_toggle(&mut self, path: &str, token: &str) {
         let exact = format!("{}={}", path, token);
+        let anchor = if self.mode == UiMode::Live {
+            self.live_anchor_at(self.live_event_index)
+        } else {
+            None
+        };
         if self.event_filters.exact_filter == exact {
             self.event_filters.exact_filter.clear();
             self.status = format!("Removed exact filter: {}", exact);
@@ -2531,7 +2590,7 @@ impl App {
             self.event_filters.exact_filter = exact.clone();
             self.status = format!("Applied exact filter: {}", exact);
         }
-        self.commit_filter_change(FilterOrigin::KeyShortcut { anchor: None });
+        self.commit_filter_change(FilterOrigin::KeyShortcut { anchor });
     }
 
     fn commit_filter_change(&mut self, origin: FilterOrigin) {
@@ -2541,7 +2600,7 @@ impl App {
                 self.mark_live_cache_dirty();
                 self.after_filter_change(anchor);
             }
-            FilterOrigin::TypedInput | FilterOrigin::Clear | FilterOrigin::TypeView => {
+            FilterOrigin::TypedInput | FilterOrigin::TypeView => {
                 self.mark_live_cache_dirty();
                 self.data_index = 0;
                 self.live_event_index = 0;
@@ -2579,6 +2638,11 @@ impl App {
     }
 
     fn jump_to_type_id(&mut self, type_id: String, set_return_to_live_esc: bool) {
+        // If the type is filtered out by types_filter, clear the filter so it becomes visible.
+        if !self.visible_types().contains(&type_id) && self.model.types.contains_key(&type_id) {
+            self.types_filter.clear();
+            self.type_index = 0;
+        }
         if let Some(idx) = self.visible_types().iter().position(|candidate| candidate == &type_id) {
             let type_name = self.model.type_display_name(&type_id);
             self.mode = UiMode::Types;
@@ -2592,6 +2656,8 @@ impl App {
             self.data_value_focus = false;
             self.return_to_live_object_on_types_esc = set_return_to_live_esc;
             self.status = format!("Jumped to type {}", type_name);
+        } else {
+            self.status = format!("Type not found: {}", self.model.type_display_name(&type_id));
         }
     }
 

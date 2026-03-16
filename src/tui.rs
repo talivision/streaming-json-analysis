@@ -28,6 +28,7 @@ pub enum InputMode {
     EventFilter(FilterField),
     TypesFilter,
     RenameType,
+    RenamePeriod,
     InsertPeriodRange,
     EditPeriodRange,
     ExportSessionPath,
@@ -47,7 +48,8 @@ pub fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     // Compute once per frame; passed to every row renderer to avoid O(types) per row.
     let max_type_count = app.model.types.values().map(|t| t.count).max().unwrap_or(1) as f64;
 
-    draw_tabs(frame, root[0], app.mode, app.baseline_tab_enabled());
+    let tab_mode = if app.mode == UiMode::Values { app.values_return_mode } else { app.mode };
+    draw_tabs(frame, root[0], tab_mode, app.baseline_tab_enabled());
     match app.mode {
         UiMode::Live => draw_live(frame, root[1], app, max_type_count),
         UiMode::Periods => draw_periods(frame, root[1], app, max_type_count),
@@ -79,7 +81,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, mode: UiMode, baseline_enabled: 
         titles.push(tab_title("4", "Baseline"));
     }
     let selected = match mode {
-        UiMode::Live | UiMode::Values => 0,
+        UiMode::Live | UiMode::Values => 0, // Values resolved to return_mode at call site
         UiMode::Periods => 1,
         UiMode::Types => 2,
         UiMode::Data => {
@@ -447,6 +449,8 @@ fn action_periods_title(pane_width: u16) -> Line<'static> {
             Span::raw("/"),
             styled_hotkey("e"),
             Span::raw("/"),
+            styled_hotkey("n"),
+            Span::raw("/"),
             styled_hotkey("d"),
             Span::raw(")"),
         ]);
@@ -458,18 +462,22 @@ fn action_periods_title(pane_width: u16) -> Line<'static> {
             Span::raw(" add, "),
             styled_hotkey("e"),
             Span::raw(" edit, "),
+            styled_hotkey("n"),
+            Span::raw(" rename, "),
             styled_hotkey("d"),
-            Span::raw(" del?)"),
+            Span::raw(" del)"),
         ]);
     }
     Line::from(vec![
         Span::raw("Action Periods ("),
         styled_hotkey("i"),
-        Span::raw(" insert start-end, "),
+        Span::raw(" insert, "),
         styled_hotkey("e"),
-        Span::raw(" edit selected, "),
+        Span::raw(" edit, "),
+        styled_hotkey("n"),
+        Span::raw(" rename, "),
         styled_hotkey("d"),
-        Span::raw(" delete selected)"),
+        Span::raw(" delete)"),
     ])
 }
 
@@ -813,10 +821,15 @@ fn draw_values(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let title = format!(
-        "Values for: {}  ({} unique)  ↑↓ navigate  enter/e apply exact filter  esc back",
-        app.values_key, total,
-    );
+    let title = Line::from(vec![
+        Span::raw(format!("Values for: {}  ({} unique)  ", app.values_key, total)),
+        styled_hotkey("e"),
+        Span::raw("/"),
+        styled_hotkey("↵"),
+        Span::raw(" filter  "),
+        styled_hotkey("Esc"),
+        Span::raw(" back"),
+    ]);
     let list = List::new(items).block(
         Block::default()
             .title(title)
@@ -944,6 +957,7 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
             },
             InputMode::TypesFilter => "type list filter",
             InputMode::RenameType => "rename type",
+            InputMode::RenamePeriod => "rename period",
             InputMode::InsertPeriodRange => {
                 "insert period in format <row_start>-<row_end> (e.g. 234-268)"
             }
