@@ -1339,7 +1339,7 @@ fn draw_type_preview_modal(frame: &mut Frame<'_>, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
-        let rendered = render_json_keypicker(&sample, None, false, false, "", "", &[], None);
+        let rendered = render_json_keypicker(&sample, None, false, false, "", "", &[], None, app.escape_strings);
         lines.extend(rendered.lines);
     } else {
         lines.push(Line::from("No type selected"));
@@ -1365,6 +1365,7 @@ fn render_json_keypicker(
     substring_filter: &str,
     whitelist_terms: &[String],
     considered_paths: Option<&IndexMap<String, bool>>,
+    escape_strings: bool,
 ) -> JsonRender {
     let mut lines = Vec::new();
     let mut selected_line = None;
@@ -1381,6 +1382,7 @@ fn render_json_keypicker(
         considered_paths,
         &mut lines,
         &mut selected_line,
+        escape_strings,
     );
     JsonRender {
         lines,
@@ -1471,6 +1473,7 @@ fn build_event_preview(
         &sub_lc,
         whitelist_terms,
         considered_paths,
+        app.escape_strings,
     );
     let scroll = selected_json_scroll(rendered.selected_line, pane_height);
     lines.extend(rendered.lines);
@@ -1490,6 +1493,7 @@ fn render_json_value_lines(
     considered_paths: Option<&IndexMap<String, bool>>,
     out: &mut Vec<Line<'static>>,
     selected_line: &mut Option<usize>,
+    escape_strings: bool,
 ) {
     match value {
         serde_json::Value::Object(map) => {
@@ -1516,6 +1520,7 @@ fn render_json_value_lines(
                     considered_paths,
                     out,
                     selected_line,
+                    escape_strings,
                 );
             }
             let tail = if is_last { "}" } else { "}," };
@@ -1544,13 +1549,18 @@ fn render_json_value_lines(
                     considered_paths,
                     out,
                     selected_line,
+                    escape_strings,
                 );
             }
             let tail = if is_last { "]" } else { "]," };
             out.push(Line::from(format!("{}{}", "  ".repeat(indent), tail)));
         }
         _ => {
-            let value_text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+            let value_text = if escape_strings {
+                terminal_safe_json_value(value)
+            } else {
+                serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+            };
             let tail = if is_last { "" } else { "," };
             let highlight = !substring_filter.is_empty()
                 && value_text.to_lowercase().contains(substring_filter);
@@ -1617,6 +1627,65 @@ fn push_close_bracket(
     ]));
 }
 
+/// Escape a JSON string for terminal display.
+///
+/// serde_json only escapes what JSON requires (ASCII controls + mandatory escapes).
+/// That leaves C1 controls (U+0080–U+009F), DEL (U+007F), Unicode line/paragraph
+/// separators, and invisible formatting characters as literal bytes, which terminals
+/// render badly or invisibly.  This helper escapes exactly those extra code points
+/// while leaving ordinary printable Unicode (accented Latin, CJK, emoji, …) alone.
+fn terminal_safe_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        let cp = c as u32;
+        match c {
+            // Standard JSON mandatory escapes
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // ASCII controls U+0000..U+001F (except the ones handled above)
+            c if cp < 0x20 => {
+                out.push_str(&format!("\\u{cp:04x}"));
+            }
+            // DEL U+007F
+            '\x7F' => out.push_str("\\u007f"),
+            // C1 controls U+0080..U+009F
+            c if (0x80..=0x9F).contains(&cp) => {
+                out.push_str(&format!("\\u{cp:04x}"));
+            }
+            // Unicode line/paragraph separators
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            // Invisible Unicode formatting / BOM
+            c if (0x200B..=0x200F).contains(&cp)
+                || (0x2060..=0x206F).contains(&cp)
+                || cp == 0xFEFF =>
+            {
+                out.push_str(&format!("\\u{cp:04x}"));
+            }
+            // Everything else (printable ASCII, accented Latin, CJK, emoji, …)
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// terminal_safe_json_value formats a JSON value for terminal display.
+/// Strings use terminal_safe_json_string; other scalar types use serde_json::to_string.
+/// Objects and arrays are not handled here – the recursive renderer handles those.
+fn terminal_safe_json_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => terminal_safe_json_string(s),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "null".to_string()),
+    }
+}
+
 fn render_json_keyed_value_line(
     key: Option<&str>,
     value: &serde_json::Value,
@@ -1631,6 +1700,7 @@ fn render_json_keyed_value_line(
     considered_paths: Option<&IndexMap<String, bool>>,
     out: &mut Vec<Line<'static>>,
     selected_line: &mut Option<usize>,
+    escape_strings: bool,
 ) {
     let selected = selected_path == Some(path);
     let filtered = !active_key_filter.is_empty() && active_key_filter == path;
@@ -1668,8 +1738,11 @@ fn render_json_keyed_value_line(
     let mut prefix = vec![Span::raw("  ".repeat(indent))];
     if let Some(k) = key {
         let key_base = apply_normalized_out_style(json_key_base_style(), normalized_out);
-        let escaped_k =
-            serde_json::to_string(k).unwrap_or_else(|_| format!("\"{k}\""));
+        let escaped_k = if escape_strings {
+            terminal_safe_json_string(k)
+        } else {
+            serde_json::to_string(k).unwrap_or_else(|_| format!("\"{k}\""))
+        };
         if selected || filtered {
             prefix.push(Span::styled(escaped_k, key_override));
         } else if key_highlight || key_whitelist_highlight {
@@ -1712,6 +1785,7 @@ fn render_json_keyed_value_line(
                     considered_paths,
                     out,
                     selected_line,
+                    escape_strings,
                 );
             }
             push_close_bracket(indent, '}', is_last, sel_or_filt, punctuation_override, out);
@@ -1737,6 +1811,7 @@ fn render_json_keyed_value_line(
                     considered_paths,
                     out,
                     selected_line,
+                    escape_strings,
                 );
             }
             push_close_bracket(indent, ']', is_last, sel_or_filt, punctuation_override, out);
@@ -1746,7 +1821,11 @@ fn render_json_keyed_value_line(
                 *selected_line = Some(out.len());
             }
             let mut line = prefix;
-            let value_text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+            let value_text = if escape_strings {
+                terminal_safe_json_value(value)
+            } else {
+                serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+            };
             let value_highlight = !substring_filter.is_empty()
                 && value_text.to_lowercase().contains(substring_filter);
             let value_whitelist_highlight =

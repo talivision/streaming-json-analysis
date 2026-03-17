@@ -54,6 +54,10 @@ struct Args {
     #[argh(switch)]
     reset: bool,
 
+    /// switch, escape C1 controls, DEL, and invisible Unicode in string values
+    #[argh(switch)]
+    escape_strings: bool,
+
     /// bind address for optional control HTTP API (e.g. 127.0.0.1:8080)
     #[argh(option)]
     control_http: Option<String>,
@@ -72,7 +76,7 @@ fn main() -> Result<()> {
         let session = import_session(import_path)?;
         let stream_path = PathBuf::from(&session.stream_path);
         // Session import is self-contained; do not load persisted local state.
-        let mut app = App::new(stream_path, None, true, args.debug_status, true);
+        let mut app = App::new(stream_path, None, true, args.debug_status, true, args.escape_strings);
         if let Some(whitelist_path) = args.whitelist.as_ref() {
             let terms = read_whitelist_terms(whitelist_path)?;
             app.add_whitelist_terms(terms);
@@ -111,6 +115,7 @@ fn main() -> Result<()> {
         args.offline,
         args.debug_status,
         args.reset,
+        args.escape_strings,
     );
     if let Some(whitelist_path) = args.whitelist.as_ref() {
         let terms = read_whitelist_terms(whitelist_path)?;

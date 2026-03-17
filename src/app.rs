@@ -124,6 +124,7 @@ pub struct App {
     pub values_return_mode: UiMode,
     values_cache: Option<Vec<(String, String, usize)>>,
 
+    pub escape_strings: bool,
     pub offline: bool,
     pub status: String,
     stashed_event_filters: Option<DataFilters>,
@@ -173,6 +174,7 @@ impl App {
         offline: bool,
         show_status_debug: bool,
         reset_state: bool,
+        escape_strings: bool,
     ) -> Self {
         let baseline_enabled = baseline_path.is_some();
         let is_directory_input = stream_path.is_dir();
@@ -225,6 +227,7 @@ impl App {
             values_return_mode: UiMode::Live,
             values_cache: None,
 
+            escape_strings,
             offline,
             status: if offline {
                 format!(
@@ -4027,6 +4030,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         app.offline = false;
         let err = app
@@ -4052,6 +4056,7 @@ mod tests {
         App::new(
             std::path::PathBuf::from("/tmp/test_app.jsonl"),
             None,
+            false,
             false,
             false,
             false,
@@ -4610,6 +4615,7 @@ mod tests {
             true,
             false,
             true,
+            false,
         );
         let started = app.control_start_action(None);
         assert_eq!(started.status, 409);
