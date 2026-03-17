@@ -1257,6 +1257,9 @@ impl App {
             KeyCode::Esc if self.mode == UiMode::Data && self.data_key_focus => {
                 self.exit_data_key_focus();
             }
+            KeyCode::Esc if self.mode == UiMode::Types && self.types_path_focus => {
+                self.types_path_focus = false;
+            }
             KeyCode::Esc if self.mode == UiMode::Periods && self.periods_focus != PeriodsFocus::Periods => {
                 self.handle_navigation_intent(NavIntent::Left);
             }
@@ -1345,7 +1348,7 @@ impl App {
                     "Live follow: OFF".to_string()
                 };
             }
-            KeyCode::Char('n')
+            KeyCode::Char('r')
                 if self.mode == UiMode::Periods
                     && self.periods_focus == PeriodsFocus::Periods =>
             {
@@ -2507,13 +2510,15 @@ impl App {
         match self.mode {
             UiMode::Live => {
                 self.refresh_live_position();
-                if let Some(anchor) = selected_anchor.as_ref() {
-                    if let Some(idx) = self.find_live_index(anchor) {
-                        self.live_event_index = idx;
-                        self.ensure_live_selection_visible();
-                    } else {
-                        self.live_event_index = 0;
-                        self.live_view_start = 0;
+                if !self.live_follow {
+                    if let Some(anchor) = selected_anchor.as_ref() {
+                        if let Some(idx) = self.find_live_index(anchor) {
+                            self.live_event_index = idx;
+                            self.ensure_live_selection_visible();
+                        } else {
+                            self.live_event_index = 0;
+                            self.live_view_start = 0;
+                        }
                     }
                 }
                 self.clamp_live_key_selection();

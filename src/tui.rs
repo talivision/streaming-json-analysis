@@ -400,6 +400,8 @@ fn types_list_title(
         spans.extend([
             styled_hotkey("↵"),
             Span::raw("/"),
+            styled_hotkey("r"),
+            Span::raw("/"),
             styled_hotkey("t"),
             Span::raw("/"),
             styled_hotkey("u"),
@@ -414,6 +416,8 @@ fn types_list_title(
         spans.extend([
             styled_hotkey("↵"),
             Span::raw(" details, "),
+            styled_hotkey("r"),
+            Span::raw(" rename, "),
             styled_hotkey("t"),
             Span::raw(" filter, "),
             styled_hotkey("u"),
@@ -428,6 +432,8 @@ fn types_list_title(
     spans.extend([
         styled_hotkey("↵"),
         Span::raw(" details, "),
+        styled_hotkey("r"),
+        Span::raw(" rename, "),
         styled_hotkey("t"),
         Span::raw(" filter, "),
         styled_hotkey("u"),
@@ -449,7 +455,7 @@ fn action_periods_title(pane_width: u16) -> Line<'static> {
             Span::raw("/"),
             styled_hotkey("e"),
             Span::raw("/"),
-            styled_hotkey("n"),
+            styled_hotkey("r"),
             Span::raw("/"),
             styled_hotkey("d"),
             Span::raw(")"),
@@ -462,7 +468,7 @@ fn action_periods_title(pane_width: u16) -> Line<'static> {
             Span::raw(" add, "),
             styled_hotkey("e"),
             Span::raw(" edit, "),
-            styled_hotkey("n"),
+            styled_hotkey("r"),
             Span::raw(" rename, "),
             styled_hotkey("d"),
             Span::raw(" del)"),
@@ -474,7 +480,7 @@ fn action_periods_title(pane_width: u16) -> Line<'static> {
         Span::raw(" insert, "),
         styled_hotkey("e"),
         Span::raw(" edit, "),
-        styled_hotkey("n"),
+        styled_hotkey("r"),
         Span::raw(" rename, "),
         styled_hotkey("d"),
         Span::raw(" delete)"),
@@ -1662,19 +1668,19 @@ fn render_json_keyed_value_line(
     let mut prefix = vec![Span::raw("  ".repeat(indent))];
     if let Some(k) = key {
         let key_base = apply_normalized_out_style(json_key_base_style(), normalized_out);
+        let escaped_k =
+            serde_json::to_string(k).unwrap_or_else(|_| format!("\"{k}\""));
         if selected || filtered {
-            prefix.push(Span::styled(format!("\"{k}\""), key_override));
+            prefix.push(Span::styled(escaped_k, key_override));
         } else if key_highlight || key_whitelist_highlight {
-            prefix.push(Span::raw("\""));
             prefix.extend(highlight_text_spans(
-                k,
+                &escaped_k,
                 substring_filter,
                 whitelist_terms,
                 key_base,
             ));
-            prefix.push(Span::raw("\""));
         } else {
-            prefix.push(Span::styled(format!("\"{k}\""), key_base));
+            prefix.push(Span::styled(escaped_k, key_base));
         }
         prefix.push(Span::styled(
             ": ",
