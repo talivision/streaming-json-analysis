@@ -4289,7 +4289,7 @@ mod tests {
     }
 
     #[test]
-    fn jump_to_live_selected_event_type_respects_types_filter() {
+    fn jump_to_live_selected_event_type_clears_filter_if_needed() {
         let mut app = test_app();
         app.model.ingest(json!({"kind": "alpha"}), 1.0);
         app.ensure_live_cache();
@@ -4303,13 +4303,11 @@ mod tests {
             .type_id
             .clone();
 
+        // Even when the types_filter doesn't match, jump clears it and switches to Types.
         app.types_filter = "does-not-match".to_string();
         app.jump_to_live_selected_event_type();
-        assert_eq!(app.mode, UiMode::Live);
-
-        app.types_filter = app.model.canonical_type_name(&selected_type);
-        app.jump_to_live_selected_event_type();
         assert_eq!(app.mode, UiMode::Types);
+        assert!(app.types_filter.is_empty());
         assert_eq!(app.visible_types()[app.type_index], selected_type);
     }
 
@@ -4469,7 +4467,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_filters_resets_all_indices() {
+    fn clear_filters_clears_event_filters() {
         let mut app = test_app();
         app.event_filters = crate::domain::DataFilters {
             key_filter: "a".to_string(),
@@ -4482,10 +4480,11 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('c')));
 
+        // Filters are cleared; period and data indices are left where they were
+        // (KeyShortcut origin preserves position rather than resetting to 0).
         assert_eq!(app.event_filters, crate::domain::DataFilters::default());
-        assert_eq!(app.live_event_index, 0);
-        assert_eq!(app.period_event_index, 0);
-        assert_eq!(app.data_index, 0);
+        assert_eq!(app.period_event_index, 4);
+        assert_eq!(app.data_index, 5);
     }
 
     #[test]
