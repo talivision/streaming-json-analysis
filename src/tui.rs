@@ -298,10 +298,21 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         }
         selected_event = events.get(app.period_event_index).map(|(_, e)| *e);
     }
+    let period_total_objects = periods
+        .get(app.periods_index)
+        .and_then(|p| app.period_row_range_for(p))
+        .map(|(a, b)| b.saturating_sub(a) + 1)
+        .unwrap_or(0);
+    let period_events_title = format!(
+        "Events  row {}/{}  objects {}",
+        app.period_event_index.saturating_add(1),
+        events.len(),
+        period_total_objects,
+    );
     frame.render_widget(
         List::new(rows).block(
             Block::default()
-                .title("Events")
+                .title(period_events_title)
                 .borders(Borders::ALL)
                 .border_style(pane_focus_style(app.periods_focus == PeriodsFocus::Events)),
         ),

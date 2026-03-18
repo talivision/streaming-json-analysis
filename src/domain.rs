@@ -1470,7 +1470,6 @@ pub fn structural_hash(shape: &Value) -> String {
 fn collect_all_paths(v: &Value) -> Vec<String> {
     let mut out = Vec::new();
     collect_paths(v, "", &mut out);
-    out.sort();
     out.dedup();
     out
 }
