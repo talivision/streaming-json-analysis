@@ -1,5 +1,5 @@
 use crate::app::{App, ModalConfirmation, PeriodsFocus};
-use crate::domain::{EventRecord, FilterField, PathOverride, RateDebugInfo};
+use crate::domain::{normalize_path, EventRecord, FilterField, PathOverride, RateDebugInfo};
 use indexmap::IndexMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -1541,11 +1541,7 @@ fn render_json_value_lines(
             out.push(Line::from(format!("{}[", "  ".repeat(indent))));
             for (idx, child) in arr.iter().enumerate() {
                 let child_is_last = idx + 1 == arr.len();
-                let child_path = if path.is_empty() {
-                    "[]".to_string()
-                } else {
-                    format!("{}[]", path)
-                };
+                let child_path = indexed_json_path(path, idx);
                 render_json_keyed_value_line(
                     None,
                     child,
@@ -1713,9 +1709,10 @@ fn render_json_keyed_value_line(
     selected_line: &mut Option<usize>,
     escape_strings: bool,
 ) {
+    let logical_path = normalize_path(path);
     let selected = selected_path == Some(path);
-    let filtered = !active_key_filter.is_empty() && active_key_filter == path;
-    let normalized_out = is_path_normalized_out(considered_paths, path);
+    let filtered = !active_key_filter.is_empty() && active_key_filter == logical_path;
+    let normalized_out = is_path_normalized_out(considered_paths, &logical_path);
     let key_highlight = !substring_filter.is_empty()
         && key
             .map(|k| k.to_lowercase().contains(substring_filter))
@@ -1807,7 +1804,7 @@ fn render_json_keyed_value_line(
             }
             push_open_bracket(prefix, "[", sel_or_filt, punctuation_override, out);
             for (idx, child) in arr.iter().enumerate() {
-                let child_path = format!("{}[]", path);
+                let child_path = indexed_json_path(path, idx);
                 render_json_keyed_value_line(
                     None,
                     child,
@@ -1849,7 +1846,7 @@ fn render_json_keyed_value_line(
                 },
                 normalized_out,
             );
-            let value_override = if selected && value_focus {
+            let value_override = if selected && (value_focus || key.is_none()) {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -1958,6 +1955,14 @@ fn selected_json_scroll(selected_line: Option<usize>, pane_height: u16) -> u16 {
     };
     let half = view_rows / 2;
     line.saturating_sub(half).min(u16::MAX as usize) as u16
+}
+
+fn indexed_json_path(path: &str, idx: usize) -> String {
+    if path.is_empty() {
+        format!("[{idx}]")
+    } else {
+        format!("{path}[{idx}]")
+    }
 }
 
 fn is_path_normalized_out(considered_paths: Option<&IndexMap<String, bool>>, path: &str) -> bool {
@@ -2268,4 +2273,61 @@ fn stylize_modal_line(s: &str) -> Line<'static> {
         i = next_tick;
     }
     Line::from(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use ratatui::style::Modifier;
+
+    #[test]
+    fn render_json_keypicker_anchors_to_indexed_array_instance() {
+        let value = json!({
+            "items": [
+                {"shared": "first"},
+                {"shared": "second"}
+            ]
+        });
+        let rendered = render_json_keypicker(
+            &value,
+            Some(&"items[1].shared".to_string()),
+            false,
+            false,
+            "",
+            "",
+            &[],
+            None,
+            false,
+        );
+        assert_eq!(rendered.selected_line, Some(6));
+    }
+
+    #[test]
+    fn render_json_keypicker_emphasizes_selected_scalar_array_item() {
+        let value = json!({
+            "items": ["first", "second"]
+        });
+        let rendered = render_json_keypicker(
+            &value,
+            Some(&"items[1]".to_string()),
+            false,
+            false,
+            "",
+            "",
+            &[],
+            None,
+            false,
+        );
+        let line = &rendered.lines[3];
+        assert!(
+            line.spans.iter().any(|span| {
+                span.content.as_ref().contains("\"second\"")
+                    && span.style.add_modifier.contains(Modifier::UNDERLINED)
+                    && span.style.add_modifier.contains(Modifier::BOLD)
+            }),
+            "selected scalar array item should be strongly highlighted"
+        );
+    }
+
 }

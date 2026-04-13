@@ -2,7 +2,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const ACTION_BOUNDARY_EPS: f64 = 0.000_001;
 const MIN_ACTION_RATE_DURATION_SECS: f64 = 1.0;
@@ -916,9 +916,9 @@ impl AnalyzerModel {
         if !exact_expr.matches(|term| {
             parse_exact_filter(term)
                 .map(|(k, v)| {
-                    value_at_path(&e.obj, k)
-                        .map(|actual| exact_value_matches(actual, &v))
-                        .unwrap_or(false)
+                    values_at_path(&e.obj, k)
+                        .into_iter()
+                        .any(|actual| exact_value_matches(actual, &v))
                 })
                 .unwrap_or(false)
         }) {
@@ -1095,7 +1095,7 @@ fn collect_scalar_paths(v: &Value, path: &str, out: &mut Vec<(String, String)>) 
             }
         }
         Value::Array(arr) => {
-            for child in arr.iter().take(3) {
+            for child in arr {
                 let p = format!("{}[]", path);
                 collect_scalar_paths(child, &p, out);
             }
@@ -1394,19 +1394,101 @@ fn exact_value_matches(actual: &Value, expected: &str) -> bool {
 pub fn value_at_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = v;
     for part in path.split('.') {
-        if part.ends_with("[]") {
-            let key = &part[..part.len().saturating_sub(2)];
+        let (key, array_index) = split_path_segment(part)?;
+        if !key.is_empty() {
             cur = cur.get(key)?;
+        }
+        if let Some(array_index) = array_index {
             if let Value::Array(arr) = cur {
-                cur = arr.first()?;
+                cur = match array_index {
+                    Some(index) => arr.get(index)?,
+                    None => arr.first()?,
+                };
             } else {
                 return None;
             }
-        } else {
-            cur = cur.get(part)?;
         }
     }
     Some(cur)
+}
+
+pub fn values_at_path<'a>(v: &'a Value, path: &str) -> Vec<&'a Value> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut out = Vec::new();
+    collect_values_at_path(v, &parts, &mut out);
+    out
+}
+
+pub fn normalize_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let bytes = path.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 && j < bytes.len() && bytes[j] == b']' {
+                out.push_str("[]");
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn split_path_segment(part: &str) -> Option<(&str, Option<Option<usize>>)> {
+    if let Some(prefix) = part.strip_suffix("[]") {
+        return Some((prefix, Some(None)));
+    }
+    if let Some(open) = part.rfind('[') {
+        if part.ends_with(']') {
+            let key = &part[..open];
+            let raw = &part[open + 1..part.len() - 1];
+            if raw.chars().all(|ch| ch.is_ascii_digit()) {
+                return Some((key, Some(Some(raw.parse().ok()?))));
+            }
+        }
+    }
+    Some((part, None))
+}
+
+fn collect_values_at_path<'a>(cur: &'a Value, parts: &[&str], out: &mut Vec<&'a Value>) {
+    let Some((part, rest)) = parts.split_first() else {
+        out.push(cur);
+        return;
+    };
+    let Some((key, array_index)) = split_path_segment(part) else {
+        return;
+    };
+    let mut next = cur;
+    if !key.is_empty() {
+        let Some(child) = next.get(key) else {
+            return;
+        };
+        next = child;
+    }
+    match array_index {
+        Some(Some(index)) => {
+            if let Value::Array(arr) = next {
+                if let Some(child) = arr.get(index) {
+                    collect_values_at_path(child, rest, out);
+                }
+            }
+        }
+        Some(None) => {
+            if let Value::Array(arr) = next {
+                for child in arr {
+                    collect_values_at_path(child, rest, out);
+                }
+            }
+        }
+        None => collect_values_at_path(next, rest, out),
+    }
 }
 
 fn fuzzy_match(haystack: &str, needle: &str) -> bool {
@@ -1469,28 +1551,68 @@ pub fn structural_hash(shape: &Value) -> String {
 
 fn collect_all_paths(v: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    collect_paths(v, "", &mut out);
-    out.dedup();
+    let mut seen = HashSet::new();
+    collect_paths(v, "", &mut out, &mut seen);
     out
 }
 
-fn collect_paths(v: &Value, path: &str, out: &mut Vec<String>) {
+pub fn collect_indexed_paths(v: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_paths_indexed(v, "", &mut out);
+    out
+}
+
+fn collect_paths(v: &Value, path: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    match v {
+        Value::Object(map) => {
+            for (k, child) in map {
+                let p = child_path(path, k);
+                if seen.insert(p.clone()) {
+                    out.push(p.clone());
+                }
+                collect_paths(child, &p, out, seen);
+            }
+        }
+        Value::Array(arr) => {
+            let p = format!("{}[]", path);
+            if seen.insert(p.clone()) {
+                out.push(p.clone());
+            }
+            for child in arr {
+                collect_paths(child, &p, out, seen);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_paths_indexed(v: &Value, path: &str, out: &mut Vec<String>) {
     match v {
         Value::Object(map) => {
             for (k, child) in map {
                 let p = child_path(path, k);
                 out.push(p.clone());
-                collect_paths(child, &p, out);
+                collect_paths_indexed(child, &p, out);
             }
         }
         Value::Array(arr) => {
-            let p = format!("{}[]", path);
-            out.push(p.clone());
-            for child in arr.iter().take(3) {
-                collect_paths(child, &p, out);
+            for (idx, child) in arr.iter().enumerate() {
+                let p = indexed_child_path(path, idx);
+                if !matches!(child, Value::Object(_) | Value::Array(_)) {
+                    out.push(p.clone());
+                }
+                collect_paths_indexed(child, &p, out);
             }
         }
         _ => {}
+    }
+}
+
+fn indexed_child_path(path: &str, idx: usize) -> String {
+    if path.is_empty() {
+        format!("[{idx}]")
+    } else {
+        format!("{path}[{idx}]")
     }
 }
 
@@ -1539,8 +1661,63 @@ mod tests {
             "meta": {"ok": true}
         });
         assert_eq!(value_at_path(&v, "items[].name"), Some(&json!("first")));
+        assert_eq!(value_at_path(&v, "items[1].name"), Some(&json!("second")));
+        let values = values_at_path(&v, "items[].name");
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], &json!("first"));
+        assert_eq!(values[1], &json!("second"));
         assert_eq!(value_at_path(&v, "meta.ok"), Some(&json!(true)));
         assert_eq!(value_at_path(&v, "items[].missing"), None);
+    }
+
+    #[test]
+    fn normalize_path_collapses_indexed_array_segments() {
+        assert_eq!(normalize_path("items[17].name"), "items[].name");
+        assert_eq!(normalize_path("payload.list[0].values[4]"), "payload.list[].values[]");
+    }
+
+    #[test]
+    fn collect_indexed_paths_preserves_array_instances() {
+        let v = json!({
+            "items": [
+                {"shared": 1, "only_first": true},
+                {"shared": 2, "only_second": true}
+            ]
+        });
+        assert_eq!(
+            collect_indexed_paths(&v),
+            vec![
+                "items",
+                "items[0].shared",
+                "items[0].only_first",
+                "items[1].shared",
+                "items[1].only_second",
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_indexed_paths_keeps_scalar_array_items_selectable() {
+        let v = json!({
+            "items": ["first", "second"]
+        });
+        assert_eq!(
+            collect_indexed_paths(&v),
+            vec!["items", "items[0]", "items[1]"]
+        );
+    }
+
+    #[test]
+    fn prepare_event_collects_keys_from_all_array_items() {
+        let prepared = prepare_event(json!({
+            "items": [
+                {"shared": 1},
+                {"shared": 2},
+                {"late_key": true}
+            ]
+        }));
+        assert!(prepared.keys.contains(&"items[].shared".to_string()));
+        assert!(prepared.keys.contains(&"items[].late_key".to_string()));
     }
 
     #[test]
@@ -1697,6 +1874,37 @@ mod tests {
             value_at_path(&events[0].obj, "msg"),
             Some(&json!("alpha beta gamma"))
         );
+    }
+
+    #[test]
+    fn exact_filter_matches_any_array_item_value() {
+        let mut model = AnalyzerModel::new();
+        model.ingest(
+            json!({"items":[{"name":"first"},{"name":"second"}]}),
+            1.0,
+        );
+
+        let filters = DataFilters {
+            exact_filter: "items[].name=s:second".to_string(),
+            ..DataFilters::default()
+        };
+        let events = model.filtered_events(&filters);
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn exact_filter_matches_any_scalar_array_item_type() {
+        let mut model = AnalyzerModel::new();
+        model.ingest(json!({"items":["alpha", true, null]}), 1.0);
+
+        for exact in ["items[]=s:alpha", "items[]=b:true", "items[]=null"] {
+            let filters = DataFilters {
+                exact_filter: exact.to_string(),
+                ..DataFilters::default()
+            };
+            let events = model.filtered_events(&filters);
+            assert_eq!(events.len(), 1, "filter {exact} should match");
+        }
     }
 
     #[test]

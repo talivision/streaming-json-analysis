@@ -1,9 +1,10 @@
 use crate::browser::{JsonFocusNav, JsonFocusState};
 use crate::control_http::{ControlCommand, ControlReply};
 use crate::domain::{
-    clear_positive_type_filters, prepare_event, rename_type_terms_in_filter,
+    clear_positive_type_filters, collect_indexed_paths, normalize_path, prepare_event,
+    rename_type_terms_in_filter,
     replace_positive_type_filters, toggle_negated_type_in_filter, type_is_negated_in_filter,
-    value_at_path, value_token, ActionPeriod, AnalyzerModel, DataFilters, EventRecord,
+    value_at_path, value_token, values_at_path, ActionPeriod, AnalyzerModel, DataFilters, EventRecord,
     FilterField, PreparedEvent,
 };
 use crate::io::StreamReader;
@@ -1493,14 +1494,14 @@ impl App {
                 self.apply_values_selection();
             }
             KeyCode::Enter if self.mode == UiMode::Live && self.live_key_focus => {
-                if self.live_value_focus {
+                if self.live_value_focus || self.live_selected_path_prefers_exact_filter() {
                     self.apply_live_selected_value_filter();
                 } else {
                     self.apply_live_selected_key_filter();
                 }
             }
             KeyCode::Enter if self.mode == UiMode::Data && self.data_key_focus => {
-                if self.data_value_focus {
+                if self.data_value_focus || self.data_selected_path_prefers_exact_filter() {
                     self.apply_data_selected_value_filter();
                 } else {
                     self.apply_data_selected_key_filter();
@@ -1509,7 +1510,7 @@ impl App {
             KeyCode::Enter
                 if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Json =>
             {
-                if self.period_value_focus {
+                if self.period_value_focus || self.period_selected_path_prefers_exact_filter() {
                     self.apply_period_selected_value_filter();
                 } else {
                     self.apply_period_selected_key_filter();
@@ -2210,8 +2211,7 @@ impl App {
         let Some(event) = self.live_selected_event() else {
             return Vec::new();
         };
-        // keys are already sorted and deduped by collect_all_paths
-        event.keys.clone()
+        collect_indexed_paths(&event.obj)
     }
 
     /// Collect unique values for `values_key` across all currently filtered events.
@@ -2225,7 +2225,7 @@ impl App {
                 self.ensure_baseline_cache();
                 let events: Vec<&EventRecord> = self.visible_baseline_events();
                 for e in events {
-                    if let Some(v) = value_at_path(&e.obj, &self.values_key) {
+                    for v in values_at_path(&e.obj, &self.values_key) {
                         let token = value_token(v);
                         let display = v.to_string();
                         let entry = counts.entry(token.clone()).or_insert((display, 0));
@@ -2234,7 +2234,7 @@ impl App {
                 }
             } else {
                 for e in self.model.filtered_events(&self.event_filters) {
-                    if let Some(v) = value_at_path(&e.obj, &self.values_key) {
+                    for v in values_at_path(&e.obj, &self.values_key) {
                         let token = value_token(v);
                         let display = v.to_string();
                         let entry = counts.entry(token.clone()).or_insert((display, 0));
@@ -2261,7 +2261,7 @@ impl App {
     }
 
     fn enter_values_mode_for_key(&mut self, key: String, return_mode: UiMode) {
-        self.values_key = key;
+        self.values_key = normalize_path(&key);
         self.values_index = 0;
         self.values_return_mode = return_mode;
         self.values_cache = None;
@@ -2447,14 +2447,30 @@ impl App {
     fn apply_live_selected_key_filter(&mut self) {
         let keys = self.live_selected_key_paths();
         if let Some(path) = keys.get(self.live_key_index) {
-            self.apply_key_filter_in_place(path);
+            if is_scalar_array_item_path(path) {
+                if let Some(token) = self.selected_live_value_token() {
+                    self.apply_exact_filter_toggle(path, &token);
+                } else {
+                    self.status = "Selected path has no value".to_string();
+                }
+            } else {
+                self.apply_key_filter_in_place(path);
+            }
         }
     }
 
     fn apply_period_selected_key_filter(&mut self) {
         let keys = self.period_selected_key_paths();
         if let Some(path) = keys.get(self.period_json_key_index) {
-            self.apply_key_filter_in_place(path);
+            if is_scalar_array_item_path(path) {
+                if let Some(token) = self.selected_period_value_token() {
+                    self.apply_exact_filter_toggle(path, &token);
+                } else {
+                    self.status = "Selected path has no value".to_string();
+                }
+            } else {
+                self.apply_key_filter_in_place(path);
+            }
         } else {
             self.status = "Selected event has no keys".to_string();
         }
@@ -2463,7 +2479,15 @@ impl App {
     fn apply_data_selected_key_filter(&mut self) {
         let keys = self.data_selected_key_paths();
         if let Some(path) = keys.get(self.data_key_index) {
-            self.apply_key_filter_in_place(path);
+            if is_scalar_array_item_path(path) {
+                if let Some(token) = self.selected_data_value_token() {
+                    self.apply_exact_filter_toggle(path, &token);
+                } else {
+                    self.status = "Selected path has no value".to_string();
+                }
+            } else {
+                self.apply_key_filter_in_place(path);
+            }
         } else {
             self.status = "Selected event has no keys".to_string();
         }
@@ -2558,17 +2582,18 @@ impl App {
     }
 
     fn apply_key_filter_in_place(&mut self, path: &str) {
+        let logical_path = normalize_path(path);
         let selected_anchor = if self.mode == UiMode::Live {
             self.live_anchor_at(self.live_event_index)
         } else {
             None
         };
-        if self.event_filters.key_filter == path {
+        if self.event_filters.key_filter == logical_path {
             self.event_filters.key_filter.clear();
-            self.status = format!("Removed key filter: {}", path);
+            self.status = format!("Removed key filter: {}", logical_path);
         } else {
-            self.event_filters.key_filter = path.to_string();
-            self.status = format!("Applied key filter: {}", path);
+            self.event_filters.key_filter = logical_path.clone();
+            self.status = format!("Applied key filter: {}", logical_path);
         }
         self.commit_filter_change(FilterOrigin::KeyShortcut {
             anchor: selected_anchor,
@@ -2587,8 +2612,29 @@ impl App {
         self.apply_exact_filter_toggle(path, &token);
     }
 
+    fn live_selected_path_prefers_exact_filter(&self) -> bool {
+        self.live_selected_key_paths()
+            .get(self.live_key_index)
+            .map(|path| is_scalar_array_item_path(path))
+            .unwrap_or(false)
+    }
+
+    fn period_selected_path_prefers_exact_filter(&self) -> bool {
+        self.period_selected_key_paths()
+            .get(self.period_json_key_index)
+            .map(|path| is_scalar_array_item_path(path))
+            .unwrap_or(false)
+    }
+
+    fn data_selected_path_prefers_exact_filter(&self) -> bool {
+        self.data_selected_key_paths()
+            .get(self.data_key_index)
+            .map(|path| is_scalar_array_item_path(path))
+            .unwrap_or(false)
+    }
+
     fn apply_exact_filter_toggle(&mut self, path: &str, token: &str) {
-        let exact = format!("{}={}", path, token);
+        let exact = format!("{}={}", normalize_path(path), token);
         let anchor = if self.mode == UiMode::Live {
             self.live_anchor_at(self.live_event_index)
         } else {
@@ -3304,7 +3350,7 @@ impl App {
         let Some(event) = self.selected_period_event() else {
             return Vec::new();
         };
-        event.keys.clone()
+        collect_indexed_paths(&event.obj)
     }
 
     pub fn selected_data_event(&self) -> Option<&EventRecord> {
@@ -3316,7 +3362,7 @@ impl App {
         let Some(event) = self.selected_data_event() else {
             return Vec::new();
         };
-        event.keys.clone()
+        collect_indexed_paths(&event.obj)
     }
 
     pub fn baseline_tab_enabled(&self) -> bool {
@@ -3952,6 +3998,10 @@ fn normalize_profile(mut profile: SourceProfile) -> SourceProfile {
     profile
 }
 
+fn is_scalar_array_item_path(path: &str) -> bool {
+    path.ends_with(']')
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4370,7 +4420,7 @@ mod tests {
         app.input_mode = crate::tui::InputMode::RenameType;
         app.input_buffer = "Renamed Type".to_string();
 
-        app.handle_input(KeyCode::Enter);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(app.model.canonical_type_name(&type_id), "Renamed Type");
         assert!(app.event_filters.type_filter.contains("Renamed Type"));
@@ -4433,6 +4483,66 @@ mod tests {
         app.values_cache = None;
         app.apply_values_selection();
         assert!(app.event_filters.exact_filter.is_empty());
+    }
+
+    #[test]
+    fn values_browser_collects_all_array_item_values_for_logical_path() {
+        let mut app = test_app();
+        app.model.ingest(
+            json!({"items":[{"name":"first"},{"name":"second"},{"name":"second"}]}),
+            1.0,
+        );
+        app.values_return_mode = UiMode::Live;
+        app.values_key = "items[].name".to_string();
+        app.values_cache = None;
+
+        let values = app.collect_key_values();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].0, "\"second\"");
+        assert_eq!(values[0].2, 2);
+        assert_eq!(values[1].0, "\"first\"");
+        assert_eq!(values[1].2, 1);
+    }
+
+    #[test]
+    fn enter_on_scalar_array_item_applies_exact_contains_filter() {
+        let mut app = test_app();
+        app.model.ingest(json!({"items":[1,2,3]}), 1.0);
+        app.ensure_live_cache();
+        app.mode = UiMode::Live;
+        app.live_event_index = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let keys = app.live_selected_key_paths();
+        let idx = keys
+            .iter()
+            .position(|path| path == "items[0]")
+            .expect("items[0] path should exist");
+        app.live_key_index = idx;
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.event_filters.exact_filter, "items[]=n:1");
+        assert!(app.event_filters.key_filter.is_empty());
+    }
+
+    #[test]
+    fn values_browser_collects_scalar_array_values_of_multiple_types() {
+        let mut app = test_app();
+        app.model.ingest(
+            json!({"items":["alpha", true, null, "alpha"]}),
+            1.0,
+        );
+        app.values_return_mode = UiMode::Live;
+        app.values_key = "items[]".to_string();
+        app.values_cache = None;
+
+        let values = app.collect_key_values();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].0, "\"alpha\"");
+        assert_eq!(values[0].2, 2);
+        assert_eq!(values[1].0, "null");
+        assert_eq!(values[1].2, 1);
+        assert_eq!(values[2].0, "true");
+        assert_eq!(values[2].2, 1);
     }
 
     #[test]
