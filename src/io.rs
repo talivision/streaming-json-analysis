@@ -10,6 +10,7 @@ const MAX_LINES_PER_POLL: usize = 20_000;
 const MAX_BYTES_PER_POLL: usize = 16 * 1024 * 1024;
 const MAX_FILES_PER_POLL: usize = 2_000;
 const MIN_PAR_PARSE_LINES: usize = 128;
+const TAIL_SCAN_CHUNK_BYTES: u64 = 8 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct StreamProgress {
@@ -72,7 +73,7 @@ impl StreamReader {
         };
         let mut reader = BufReader::new(file);
         let mut remaining = self.offset;
-        let mut buf = vec![0_u8; 8192];
+        let mut buf = vec![0_u8; TAIL_SCAN_CHUNK_BYTES as usize];
         let mut line = 1usize;
         while remaining > 0 {
             let to_read = remaining.min(buf.len() as u64) as usize;
@@ -102,13 +103,28 @@ impl StreamReader {
             return false;
         }
         let mut reader = BufReader::new(file);
-        let start = len.saturating_sub(8192);
-        if reader.seek(SeekFrom::Start(start)).is_err() {
-            return false;
-        }
+        let mut start = len;
         let mut tail = Vec::new();
-        if reader.read_to_end(&mut tail).is_err() {
-            return false;
+        loop {
+            let next_start = start.saturating_sub(TAIL_SCAN_CHUNK_BYTES);
+            if reader.seek(SeekFrom::Start(next_start)).is_err() {
+                return false;
+            }
+            let mut chunk = vec![0_u8; (start - next_start) as usize];
+            if reader.read_exact(&mut chunk).is_err() {
+                return false;
+            }
+            chunk.extend_from_slice(&tail);
+            tail = chunk;
+            let has_line_boundary_before_final_fragment = tail
+                .iter()
+                .rposition(|b| !matches!(*b, b' ' | b'\t' | b'\r' | b'\n'))
+                .map(|last_sig| tail[..=last_sig].contains(&b'\n'))
+                .unwrap_or(false);
+            if next_start == 0 || has_line_boundary_before_final_fragment {
+                break;
+            }
+            start = next_start;
         }
         let Some(last_significant_idx) = tail
             .iter()

@@ -193,6 +193,51 @@ fn stream_reader_reports_unterminated_final_json_object() {
 }
 
 #[test]
+fn stream_reader_handles_large_final_json_object_beyond_tail_scan_window() {
+    let path = temp_stream_path();
+    let payload = json!({
+        "event": "large",
+        "blob": "x".repeat(100 * 1024)
+    });
+    fs::write(&path, serde_json::to_string(&payload).expect("serialize payload"))
+        .expect("write large final object");
+
+    let mut reader = StreamReader::new(path.clone());
+    let rows = reader.poll().expect("poll succeeds");
+    assert_eq!(rows, vec![payload]);
+    assert!(
+        !reader.has_incomplete_final_line(),
+        "complete large EOF object should not be treated as incomplete"
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn stream_reader_does_not_flag_large_newline_terminated_final_line_as_incomplete() {
+    let path = temp_stream_path();
+    let payload = json!({
+        "event": "large-newline-terminated",
+        "blob": "x".repeat(100 * 1024)
+    });
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&payload).expect("serialize payload")),
+    )
+    .expect("write large newline-terminated object");
+
+    let mut reader = StreamReader::new(path.clone());
+    let rows = reader.poll().expect("poll succeeds");
+    assert_eq!(rows, vec![payload]);
+    assert!(
+        !reader.has_incomplete_final_line(),
+        "newline-terminated large final object should not be treated as incomplete"
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn stream_reader_reports_unparseable_trailing_fragment() {
     let path = temp_stream_path();
     fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\"").expect("write partial final object");
