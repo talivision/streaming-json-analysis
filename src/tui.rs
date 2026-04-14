@@ -115,7 +115,6 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
 
     let list_rows = cols[0].height.saturating_sub(2) as usize;
     app.set_live_window_rows(list_rows);
-    app.ensure_live_cache();
     let live = app.live_render_data_for_window(list_rows);
     let selected_visible = if live.rows.is_empty() {
         None
