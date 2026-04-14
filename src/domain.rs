@@ -2,7 +2,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 const ACTION_BOUNDARY_EPS: f64 = 0.000_001;
 const MIN_ACTION_RATE_DURATION_SECS: f64 = 1.0;
@@ -227,7 +227,7 @@ impl FilterField {
 #[derive(Debug, Clone)]
 pub struct AnalyzerModel {
     pub types: IndexMap<String, TypeProfile>,
-    pub events: VecDeque<EventRecord>,
+    pub events: Vec<EventRecord>,
     pub periods: Vec<ActionPeriod>,
     pub current_label: String,
 
@@ -246,7 +246,7 @@ impl AnalyzerModel {
     pub fn new() -> Self {
         Self {
             types: IndexMap::new(),
-            events: VecDeque::new(),
+            events: Vec::new(),
             periods: Vec::new(),
             current_label: "action".to_string(),
             baseline_elapsed_secs: 0.0,
@@ -352,7 +352,7 @@ impl AnalyzerModel {
         }
 
         let size_bytes = obj.to_string().len() as u32;
-        self.events.push_back(EventRecord {
+        self.events.push(EventRecord {
             ts,
             type_id: type_id.clone(),
             obj,
@@ -1755,7 +1755,7 @@ mod tests {
     fn rename_and_display_type_name_behaves_as_expected() {
         let mut model = AnalyzerModel::new();
         model.ingest(json!({"event":"login","user":"a"}), 1.0);
-        let type_id = model.events.front().expect("event exists").type_id.clone();
+        let type_id = model.events.first().expect("event exists").type_id.clone();
 
         let default_name = model.type_display_name(&type_id);
         assert!(default_name.starts_with("type-"));
@@ -1777,7 +1777,7 @@ mod tests {
         );
         model.ingest(json!({"event":"purchase","user":"bob","amount":42}), 20.0);
 
-        let login_type = model.events.back().expect("latest exists").type_id.clone();
+        let login_type = model.events.last().expect("latest exists").type_id.clone();
         model.rename_type(&login_type, "Purchase".to_string());
 
         let type_filter = DataFilters {
@@ -1834,7 +1834,7 @@ mod tests {
         model.ingest(json!({"event":"noise","k":1}), 1.0);
         model.ingest(json!({"event":"signal","k":2,"ctx":{"source":"web"}}), 2.0);
 
-        let signal_type = model.events.back().expect("event exists").type_id.clone();
+        let signal_type = model.events.last().expect("event exists").type_id.clone();
         model.toggle_known_unrelated_type(&signal_type);
 
         let filters = DataFilters::default();

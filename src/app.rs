@@ -770,7 +770,7 @@ impl App {
             events.into_par_iter().map(prepare_event).collect();
         for (idx, prepared) in prepared_events.into_iter().enumerate() {
             let ts = self.resolve_event_ts(&prepared.obj, batch_now, idx)?;
-            if let Some(last) = self.model.events.back() {
+            if let Some(last) = self.model.events.last() {
                 if ts < last.ts - 1e-9 {
                     bail!(
                         "Events must be sorted by timestamp. Found event at {ts} after event at {}. Sort your JSONL file with: jq -cs 'sort_by(._timestamp)[]' input.jsonl > sorted.jsonl",

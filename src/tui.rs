@@ -135,7 +135,7 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
         .max()
         .unwrap_or(16)
         .clamp(12, 36);
-    let first_live_ts = app.model.events.front().map(|e| e.ts).unwrap_or(0.0);
+    let first_live_ts = app.model.events.first().map(|e| e.ts).unwrap_or(0.0);
     for (idx, e) in live.rows.iter().enumerate() {
         let selected = Some(idx) == selected_visible;
         let row_index = live.row_indices.get(idx).copied();
