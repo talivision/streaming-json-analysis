@@ -84,6 +84,7 @@ Check `highlights` for entries with `underline: true` on the relevant row.
 ```
 
 ## Tips
+- **Never run `tmux kill-server`.** The user runs their own tmux sessions outside this skill. Clean up only the sessions you created, with `./stop.sh <session>` or `tmux kill-session -t <session>`.
 - Always `sleep 0.3` or more after sending keys that trigger data loading or animation before capturing — the TUI may not have re-rendered yet.
 - For multi-character input (e.g. filter strings), send each character as a separate arg: `./send_keys.sh tui-test / h e l l o Enter`
 - If the screen looks wrong, check `/tmp/tui-stderr.log` for Rust panics.

@@ -14,7 +14,8 @@ fi
 COLS="${TUI_COLS:-120}"
 ROWS="${TUI_ROWS:-40}"
 
-tmux new-session -d -s "$SESSION" -x "$COLS" -y "$ROWS" "cargo run 2>/tmp/tui-stderr.log"
+STREAM_ARG="${TUI_STREAM:+-- $TUI_STREAM}"
+tmux new-session -d -s "$SESSION" -x "$COLS" -y "$ROWS" "cargo run $STREAM_ARG 2>/tmp/tui-stderr.log"
 
 echo "Started session '$SESSION' (${COLS}x${ROWS})"
 echo "Stderr log: /tmp/tui-stderr.log"
