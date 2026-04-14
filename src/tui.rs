@@ -149,6 +149,7 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
             selected,
             stream_inner_width,
             max_type_count,
+            None,
         )));
     }
 
@@ -284,6 +285,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
             let idx = start_idx + vis_idx;
             let selected = idx == app.period_event_index;
             let diff_ms = Some((((e.ts - first_period_ts) * 1000.0).round() as i64).max(0));
+            let triaged = app.is_event_triaged(*event_idx);
             rows.push(ListItem::new(render_event_line(
                 app,
                 e,
@@ -294,6 +296,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
                 selected,
                 events_inner_width,
                 max_type_count,
+                Some(triaged),
             )));
         }
         selected_event = events.get(app.period_event_index).map(|(_, e)| *e);
@@ -303,12 +306,32 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         .and_then(|p| app.period_row_range_for(p))
         .map(|(a, b)| b.saturating_sub(a) + 1)
         .unwrap_or(0);
-    let period_events_title = format!(
-        "Events  row {}/{}  objects {}",
+    let event_total = events.len();
+    let triaged_count = events
+        .iter()
+        .filter(|(idx, _)| app.is_event_triaged(*idx))
+        .count();
+    let triage_count_str = if event_total == 0 || triaged_count == 0 {
+        format!("  {} untriaged", event_total)
+    } else if triaged_count == event_total {
+        "  all triaged \u{2713}".to_string()
+    } else {
+        format!("  {}/{} triaged", triaged_count, event_total)
+    };
+    let nav_str = format!(
+        "  row {}/{}  objects {}",
         app.period_event_index.saturating_add(1),
-        events.len(),
+        event_total,
         period_total_objects,
     );
+    let period_events_title = Line::from(vec![
+        Span::raw("Events"),
+        Span::raw(triage_count_str),
+        Span::raw("  \u{00b7} "),
+        Span::styled("space", Style::default().fg(Color::Yellow)),
+        Span::raw(" to triage"),
+        Span::raw(nav_str),
+    ]);
     frame.render_widget(
         List::new(rows).block(
             Block::default()
@@ -904,6 +927,7 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
             is_selected,
             list_inner_width,
             max_type_count,
+            None,
         )));
     }
     frame.render_widget(
@@ -2040,6 +2064,8 @@ fn render_event_line(
     selected: bool,
     row_width: usize,
     max_type_count: f64,
+    // None = no triage markers (live/baseline); Some(false) = untriaged; Some(true) = triaged
+    triage_state: Option<bool>,
 ) -> Line<'static> {
     let name = app.model.canonical_type_name(&e.type_id);
     let type_count = app
@@ -2048,7 +2074,14 @@ fn render_event_line(
         .get(&e.type_id)
         .map(|t| t.count)
         .unwrap_or(1) as f64;
-    let mut style = event_style(e, type_count, max_type_count);
+    let triaged = triage_state == Some(true);
+    let mut style = if triaged {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    } else {
+        event_style(e, type_count, max_type_count)
+    };
     if selected {
         style = style.add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
     }
@@ -2058,8 +2091,22 @@ fn render_event_line(
     } else {
         Span::raw("  ")
     };
+    let triage_marker = match triage_state {
+        None => Span::raw(" "),
+        Some(false) => Span::styled("?", Style::default().fg(Color::Rgb(220, 140, 0))),
+        Some(true) => Span::styled(
+            "·",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+    };
     let sel = if selected { "->" } else { "  " };
-    let name_style = if whitelist_hit {
+    let name_style = if triaged {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    } else if whitelist_hit {
         style
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -2122,7 +2169,7 @@ fn render_event_line(
 
     let mut spans = vec![
         action_marker,
-        Span::raw(" "),
+        triage_marker,
         Span::raw(format!("{} ", sel)),
         Span::styled(row_label, Style::default().fg(Color::Gray)),
         Span::raw(" "),
@@ -2133,8 +2180,15 @@ fn render_event_line(
         Span::styled(diff_label, Style::default().fg(Color::Gray)),
     ];
     if let Some((rate_str, value_str, _)) = metrics {
-        let rate_color = rate_anomaly_color(anomaly_norm(e.live_rate_score));
-        let value_color = value_anomaly_color(anomaly_norm(e.live_uniq_score));
+        let (rate_color, value_color) = if triaged {
+            let faded = Color::DarkGray;
+            (faded, faded)
+        } else {
+            (
+                rate_anomaly_color(anomaly_norm(e.live_rate_score)),
+                value_anomaly_color(anomaly_norm(e.live_uniq_score)),
+            )
+        };
         spans.extend([
             Span::raw(spacer),
             Span::raw("  "),

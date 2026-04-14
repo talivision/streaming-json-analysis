@@ -165,6 +165,7 @@ pub struct App {
     user_toggled_unrelated_types: HashSet<String>,
     user_toggled_paths: HashSet<String>,
     type_preview_open: bool,
+    pub triaged_event_indices: HashSet<usize>,
 }
 
 impl App {
@@ -278,6 +279,7 @@ impl App {
             user_toggled_unrelated_types: HashSet::new(),
             user_toggled_paths: HashSet::new(),
             type_preview_open: false,
+            triaged_event_indices: HashSet::new(),
         };
         if !reset_state {
             app.restore_persisted_state();
@@ -1532,6 +1534,12 @@ impl App {
             KeyCode::Enter if self.mode == UiMode::Data => self.toggle_data_key_focus(),
             KeyCode::Enter if self.mode == UiMode::Types => self.enter_types_path_focus(),
             KeyCode::Enter if self.mode == UiMode::Periods => self.advance_periods_focus(),
+            KeyCode::Char(' ')
+                if self.mode == UiMode::Periods
+                    && self.periods_focus == PeriodsFocus::Events =>
+            {
+                self.toggle_triage_period_event();
+            }
             KeyCode::Char(' ') => self.toggle_current_path(),
             KeyCode::Char('u') => self.toggle_known_unrelated(),
             _ => {}
@@ -3306,6 +3314,24 @@ impl App {
             .into_iter()
             .map(|(_, e)| e)
             .collect()
+    }
+
+    pub fn is_event_triaged(&self, idx: usize) -> bool {
+        self.triaged_event_indices.contains(&idx)
+    }
+
+    fn toggle_triage_period_event(&mut self) {
+        let event_idx = self
+            .visible_period_event_rows()
+            .get(self.period_event_index)
+            .map(|(idx, _)| *idx);
+        if let Some(idx) = event_idx {
+            if self.triaged_event_indices.contains(&idx) {
+                self.triaged_event_indices.remove(&idx);
+            } else {
+                self.triaged_event_indices.insert(idx);
+            }
+        }
     }
 
     pub fn visible_types(&self) -> Vec<String> {
