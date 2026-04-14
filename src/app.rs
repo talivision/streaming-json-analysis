@@ -2,10 +2,9 @@ use crate::browser::{JsonFocusNav, JsonFocusState};
 use crate::control_http::{ControlCommand, ControlReply};
 use crate::domain::{
     clear_positive_type_filters, collect_indexed_paths, normalize_path, prepare_event,
-    rename_type_terms_in_filter,
-    replace_positive_type_filters, toggle_negated_type_in_filter, type_is_negated_in_filter,
-    value_at_path, value_token, values_at_path, ActionPeriod, AnalyzerModel, DataFilters, EventRecord,
-    FilterField, PreparedEvent,
+    rename_type_terms_in_filter, replace_positive_type_filters, toggle_negated_type_in_filter,
+    type_is_negated_in_filter, value_at_path, value_token, values_at_path, ActionPeriod,
+    AnalyzerModel, DataFilters, EventRecord, FilterField, PreparedEvent,
 };
 use crate::io::StreamReader;
 use crate::persistence::{
@@ -46,6 +45,7 @@ const UI_FRAME_SLEEP: Duration = Duration::from_millis(16);
 const UI_BURST_SLEEP: Duration = Duration::from_millis(1);
 const MENU_PAGE_STEP: usize = 30;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
 const WARNING_PREFIX_ORANGE: &str = "\x1b[38;5;208mwarning:\x1b[0m";
 
 pub struct LiveRenderData<'a> {
@@ -148,8 +148,6 @@ pub struct App {
     baseline_cache_dirty: bool,
     initial_load_target_bytes: Option<u64>,
     initial_load_complete: bool,
-    initial_load_is_directory: bool,
-    initial_load_polled_once: bool,
     pending_live_recompute: bool,
     show_status_debug: bool,
     quit_pending_until: Option<Instant>,
@@ -169,6 +167,7 @@ pub struct App {
     user_toggled_paths: HashSet<String>,
     type_preview_open: bool,
     pub triaged_event_indices: HashSet<usize>,
+    state_dirty: bool,
 }
 
 impl App {
@@ -185,20 +184,11 @@ impl App {
         escape_strings: bool,
     ) -> Self {
         let baseline_enabled = baseline_path.is_some();
-        let is_directory_input = stream_path.is_dir();
-        let initial_load_target_bytes = if is_directory_input {
-            None
-        } else {
-            fs::metadata(&stream_path)
-                .ok()
-                .map(|m| m.len())
-                .filter(|len| *len > 0)
-        };
-        let initial_load_complete = if is_directory_input {
-            false
-        } else {
-            initial_load_target_bytes.is_none()
-        };
+        let initial_load_target_bytes = fs::metadata(&stream_path)
+            .ok()
+            .map(|m| m.len())
+            .filter(|len| *len > 0);
+        let initial_load_complete = initial_load_target_bytes.is_none();
         let mut app = Self {
             model: AnalyzerModel::new(),
             mode: UiMode::Live,
@@ -264,8 +254,6 @@ impl App {
             baseline_cache_dirty: true,
             initial_load_target_bytes,
             initial_load_complete,
-            initial_load_is_directory: is_directory_input,
-            initial_load_polled_once: false,
             pending_live_recompute: false,
             show_status_debug,
             quit_pending_until: None,
@@ -285,6 +273,7 @@ impl App {
             user_toggled_paths: HashSet::new(),
             type_preview_open: false,
             triaged_event_indices: HashSet::new(),
+            state_dirty: false,
         };
         if !reset_state {
             app.restore_persisted_state();
@@ -326,6 +315,7 @@ impl App {
         terminal.draw(|f| draw_ui(f, self))?;
 
         let mut last_poll = Instant::now() - LIVE_FALLBACK_POLL_INTERVAL;
+        let mut last_autosave = Instant::now();
 
         let loop_result = (|| -> Result<()> {
             loop {
@@ -386,6 +376,15 @@ impl App {
                     break;
                 }
 
+                if self.state_dirty && last_autosave.elapsed() >= AUTOSAVE_INTERVAL {
+                    if let Err(err) = self.persist_state() {
+                        eprintln!("{WARNING_PREFIX_ORANGE} failed to persist session state: {err}");
+                    } else {
+                        self.state_dirty = false;
+                    }
+                    last_autosave = Instant::now();
+                }
+
                 terminal.draw(|f| draw_ui(f, self))?;
                 self.rebuild_live_cache_if_needed();
                 // Re-pin after every cache rebuild: the cache may have been stale when
@@ -441,6 +440,8 @@ impl App {
         self.model.close_open_period(unix_ts());
         if let Err(err) = self.persist_state() {
             eprintln!("{WARNING_PREFIX_ORANGE} failed to persist session state: {err}");
+        } else {
+            self.state_dirty = false;
         }
         if let Err(err) = self.export_session_if_configured() {
             eprintln!("{WARNING_PREFIX_ORANGE} failed to export session: {err}");
@@ -529,6 +530,7 @@ impl App {
             let trimmed = next_label.trim();
             if !trimmed.is_empty() {
                 self.model.current_label = trimmed.to_string();
+                self.mark_state_dirty();
             }
         }
         if !self.do_toggle_period("HTTP") {
@@ -580,6 +582,7 @@ impl App {
             return false;
         }
         self.pending_live_recompute = true;
+        self.mark_state_dirty();
         self.status = if let Some(period) = self.model.active_period() {
             format!(
                 "Action started: {} #{} ({})",
@@ -776,7 +779,6 @@ impl App {
     }
 
     fn ingest_new_events(&mut self) -> Result<bool> {
-        self.initial_load_polled_once = true;
         self.rebuild_live_cache_if_needed();
         let use_snapshot_parallel = self.offline || self.loading_locked();
         let events = if use_snapshot_parallel {
@@ -1010,9 +1012,12 @@ impl App {
             ..saved
         };
         self.pending_restore = Some(transferable);
-        let msg = "Session restored (file changed: renames and filters restored, periods discarded)".to_string();
+        let msg =
+            "Session restored (file changed: renames and filters restored, periods discarded)"
+                .to_string();
         self.status = msg.clone();
         self.startup_hint = Some(msg);
+        self.mark_state_dirty();
     }
 
     fn apply_persisted_overrides_if_ready(&mut self) {
@@ -1143,12 +1148,7 @@ impl App {
         let triaged_events: Vec<(usize, String)> = self
             .triaged_event_indices
             .iter()
-            .filter_map(|&idx| {
-                self.model
-                    .events
-                    .get(idx)
-                    .map(|e| (idx, e.type_id.clone()))
-            })
+            .filter_map(|&idx| self.model.events.get(idx).map(|e| (idx, e.type_id.clone())))
             .collect();
         // Merge model renames (applied) with session renames (may be unmatched if the
         // file changed and some type IDs haven't appeared yet). Model renames win for
@@ -1398,7 +1398,9 @@ impl App {
             KeyCode::Esc if self.mode == UiMode::Types && self.types_path_focus => {
                 self.types_path_focus = false;
             }
-            KeyCode::Esc if self.mode == UiMode::Periods && self.periods_focus != PeriodsFocus::Periods => {
+            KeyCode::Esc
+                if self.mode == UiMode::Periods && self.periods_focus != PeriodsFocus::Periods =>
+            {
                 self.handle_navigation_intent(NavIntent::Left);
             }
             KeyCode::Char('h') | KeyCode::Char('?') => {
@@ -1489,8 +1491,7 @@ impl App {
                 };
             }
             KeyCode::Char('r')
-                if self.mode == UiMode::Periods
-                    && self.periods_focus == PeriodsFocus::Periods =>
+                if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Periods =>
             {
                 let label = self
                     .model
@@ -1657,8 +1658,7 @@ impl App {
             KeyCode::Enter if self.mode == UiMode::Types => self.enter_types_path_focus(),
             KeyCode::Enter if self.mode == UiMode::Periods => self.advance_periods_focus(),
             KeyCode::Char(' ')
-                if self.mode == UiMode::Periods
-                    && self.periods_focus == PeriodsFocus::Events =>
+                if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Events =>
             {
                 self.toggle_triage_period_event();
             }
@@ -1681,6 +1681,7 @@ impl App {
                     InputMode::Label => {
                         if !self.input_buffer.trim().is_empty() {
                             self.model.current_label = self.input_buffer.trim().to_string();
+                            self.mark_state_dirty();
                             self.status = format!("Current label: {}", self.model.current_label);
                         }
                     }
@@ -1713,6 +1714,7 @@ impl App {
                         self.type_index = 0;
                         self.path_index = 0;
                         self.types_path_focus = false;
+                        self.mark_state_dirty();
                     }
                     InputMode::RenameType => {
                         let visible = self.visible_types();
@@ -1841,8 +1843,7 @@ impl App {
                     .map(|(n, _)| *n == baseline_count)
                     .unwrap_or(false);
             if restored {
-                self.live_visible_indices =
-                    self.stashed_live_visible_indices.take().unwrap().1;
+                self.live_visible_indices = self.stashed_live_visible_indices.take().unwrap().1;
                 self.baseline_visible_indices =
                     self.stashed_baseline_visible_indices.take().unwrap().1;
                 self.live_cache_dirty = false;
@@ -2747,7 +2748,11 @@ impl App {
             UiMode::Values => {
                 self.ensure_values_cache();
                 let n = self.cached_key_values().len();
-                self.values_index = if n == 0 { 0 } else { self.values_index.min(n - 1) };
+                self.values_index = if n == 0 {
+                    0
+                } else {
+                    self.values_index.min(n - 1)
+                };
             }
         }
     }
@@ -2873,7 +2878,11 @@ impl App {
             self.types_filter.clear();
             self.type_index = 0;
         }
-        if let Some(idx) = self.visible_types().iter().position(|candidate| candidate == &type_id) {
+        if let Some(idx) = self
+            .visible_types()
+            .iter()
+            .position(|candidate| candidate == &type_id)
+        {
             let type_name = self.model.type_display_name(&type_id);
             self.mode = UiMode::Types;
             self.return_to_types_on_live_esc = false;
@@ -3151,6 +3160,11 @@ impl App {
         self.live_cache_dirty = true;
         self.baseline_cache_dirty = true;
         self.values_cache = None;
+        self.mark_state_dirty();
+    }
+
+    fn mark_state_dirty(&mut self) {
+        self.state_dirty = true;
     }
 
     fn rebuild_live_cache_if_needed(&mut self) {
@@ -3161,12 +3175,10 @@ impl App {
             return;
         }
         let base = self.model.filtered_event_indices(&self.event_filters, None);
-        self.live_visible_indices = self.apply_whitelist_to_indices(
-            self.model.events.len(),
-            base,
-            None,
-            |idx| self.model.events.get(idx),
-        );
+        self.live_visible_indices =
+            self.apply_whitelist_to_indices(self.model.events.len(), base, None, |idx| {
+                self.model.events.get(idx)
+            });
         self.live_cache_dirty = false;
     }
 
@@ -3200,12 +3212,10 @@ impl App {
         let base = self
             .model
             .filtered_event_indices_in_slice(&self.baseline_events, &self.event_filters);
-        self.baseline_visible_indices = self.apply_whitelist_to_indices(
-            self.baseline_events.len(),
-            base,
-            None,
-            |idx| self.baseline_events.get(idx),
-        );
+        self.baseline_visible_indices =
+            self.apply_whitelist_to_indices(self.baseline_events.len(), base, None, |idx| {
+                self.baseline_events.get(idx)
+            });
         self.baseline_cache_dirty = false;
     }
 
@@ -3453,6 +3463,7 @@ impl App {
             } else {
                 self.triaged_event_indices.insert(idx);
             }
+            self.mark_state_dirty();
         }
     }
 
@@ -3688,6 +3699,7 @@ impl App {
                     self.user_toggled_paths
                         .insert(path_override_key(&type_id, path));
                     self.pending_live_recompute = true;
+                    self.mark_state_dirty();
                 }
             }
         }
@@ -3848,9 +3860,6 @@ impl App {
             }
         });
         let Some(target) = target else {
-            if self.initial_load_is_directory && !self.initial_load_complete {
-                return true;
-            }
             return false;
         };
         self.reader.progress().loaded_bytes < target
@@ -3891,19 +3900,7 @@ impl App {
             }
         });
         let Some(target) = target else {
-            if self.initial_load_is_directory {
-                if self.initial_load_polled_once {
-                    self.initial_load_complete = true;
-                    self.status = format!(
-                        "Initial load complete: {} objects",
-                        self.model.total_objects()
-                    );
-                } else {
-                    self.status = "Initial load: scanning directory...".to_string();
-                }
-            } else {
-                self.initial_load_complete = true;
-            }
+            self.initial_load_complete = true;
             return;
         };
         if self.initial_load_target_bytes.is_none() {
@@ -4594,12 +4591,19 @@ mod tests {
         let first = visible[0].clone();
         let second = visible[1].clone();
 
-        app.event_filters.type_filter = format!("!{} && OldType", app.model.canonical_type_name(&second));
+        app.event_filters.type_filter =
+            format!("!{} && OldType", app.model.canonical_type_name(&second));
         app.type_index = 0;
         app.apply_selected_type_filter();
 
-        assert!(app.event_filters.type_filter.contains(&app.model.canonical_type_name(&first)));
-        assert!(app.event_filters.type_filter.contains(&format!("!{}", app.model.canonical_type_name(&second))));
+        assert!(app
+            .event_filters
+            .type_filter
+            .contains(&app.model.canonical_type_name(&first)));
+        assert!(app
+            .event_filters
+            .type_filter
+            .contains(&format!("!{}", app.model.canonical_type_name(&second))));
         assert!(!app.event_filters.type_filter.contains("OldType"));
 
         app.handle_key(key(KeyCode::Esc));
@@ -4729,10 +4733,8 @@ mod tests {
     #[test]
     fn values_browser_collects_scalar_array_values_of_multiple_types() {
         let mut app = test_app();
-        app.model.ingest(
-            json!({"items":["alpha", true, null, "alpha"]}),
-            1.0,
-        );
+        app.model
+            .ingest(json!({"items":["alpha", true, null, "alpha"]}), 1.0);
         app.values_return_mode = UiMode::Live;
         app.values_key = "items[]".to_string();
         app.values_cache = None;
