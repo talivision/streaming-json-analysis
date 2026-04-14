@@ -3169,7 +3169,6 @@ impl App {
     }
 
     fn clamp_live_indices(&mut self) {
-        self.rebuild_live_cache_if_needed();
         let total = self.live_visible_total();
         self.clamp_live_indices_n(total);
     }
@@ -3189,7 +3188,6 @@ impl App {
     }
 
     fn pin_live_to_latest(&mut self) {
-        self.rebuild_live_cache_if_needed();
         let total = self.live_visible_total();
         self.pin_live_to_latest_n(total);
     }
@@ -3226,7 +3224,6 @@ impl App {
     }
 
     fn ensure_live_selection_visible(&mut self) {
-        self.rebuild_live_cache_if_needed();
         let total = self.live_visible_total();
         self.ensure_live_selection_visible_n(total);
     }
@@ -3266,7 +3263,6 @@ impl App {
     }
 
     fn reposition_live_selection(&mut self) {
-        self.rebuild_live_cache_if_needed();
         let total = self.live_visible_total();
         self.reposition_live_selection_n(total);
     }
