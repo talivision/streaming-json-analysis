@@ -11,8 +11,9 @@ use crate::io::StreamReader;
 use crate::persistence::{
     export_session, invalidate_state, load_state, save_profile, save_state,
     NormalizedFieldOverride, RestoredState, SessionEvent, SessionExport, SourceProfile,
+    StateLoadResult,
 };
-use crate::tui::{draw_ui, InputMode, UiMode};
+use crate::tui::{draw_file_changed_prompt, draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -139,6 +140,7 @@ pub struct App {
     offline_loaded: bool,
     offline_fallback_ts: f64,
     pending_restore: Option<RestoredState>,
+    file_changed_state: Option<RestoredState>,
     startup_hint: Option<String>,
     live_visible_indices: Vec<usize>,
     baseline_visible_indices: Vec<usize>,
@@ -159,6 +161,7 @@ pub struct App {
     whitelist_terms: Vec<String>,
     whitelist_mode: WhitelistMode,
     profile_renames: Vec<(String, String)>,
+    session_renames: Vec<(String, String)>,
     profile_known_unrelated_types: Vec<String>,
     profile_normalized_field_overrides: Vec<NormalizedFieldOverride>,
     user_renamed_types: HashSet<String>,
@@ -253,6 +256,7 @@ impl App {
             offline_loaded: false,
             offline_fallback_ts: unix_ts(),
             pending_restore: None,
+            file_changed_state: None,
             startup_hint: None,
             live_visible_indices: Vec::new(),
             baseline_visible_indices: Vec::new(),
@@ -273,6 +277,7 @@ impl App {
             whitelist_terms: Vec::new(),
             whitelist_mode: WhitelistMode::Off,
             profile_renames: Vec::new(),
+            session_renames: Vec::new(),
             profile_known_unrelated_types: Vec::new(),
             profile_normalized_field_overrides: Vec::new(),
             user_renamed_types: HashSet::new(),
@@ -310,6 +315,14 @@ impl App {
 
         let backend = CrosstermBackend::new(out);
         let mut terminal = Terminal::new(backend)?;
+
+        if let Some(changed) = self.file_changed_state.take() {
+            let accepted = self.run_file_changed_prompt(&mut terminal, &changed)?;
+            if accepted {
+                self.apply_transferable_state(changed);
+            }
+        }
+
         terminal.draw(|f| draw_ui(f, self))?;
 
         let mut last_poll = Instant::now() - LIVE_FALLBACK_POLL_INTERVAL;
@@ -375,6 +388,13 @@ impl App {
 
                 terminal.draw(|f| draw_ui(f, self))?;
                 self.rebuild_live_cache_if_needed();
+                // Re-pin after every cache rebuild: the cache may have been stale when
+                // pin_live_to_latest() was called inside ingest_new_events(), which would
+                // leave the cursor at row 0 even with follow on (e.g. first frame after a
+                // file-changed restore).
+                if self.mode == UiMode::Live && self.live_follow {
+                    self.pin_live_to_latest();
+                }
                 self.clamp_live_indices();
                 self.apply_pending_live_anchor();
 
@@ -922,7 +942,7 @@ impl App {
 
     fn restore_persisted_state(&mut self) {
         match load_state(self.reader.path()) {
-            Ok(Some(saved)) => {
+            Ok(Some(StateLoadResult::Clean(saved))) => {
                 let msg = format!(
                     "Restored session: {} periods, {} renames, {} unrelated, {} normalized fields, filters {}/5{}{}",
                     saved.periods.len(),
@@ -957,12 +977,42 @@ impl App {
                 self.status = msg.clone();
                 self.startup_hint = Some(msg);
             }
+            Ok(Some(StateLoadResult::Changed(saved))) => {
+                // Don't apply anything yet — prompt the user first in run().
+                self.file_changed_state = Some(saved);
+            }
             Ok(None) => {}
             Err(err) => {
                 self.status = format!("State restore skipped: {err}");
                 self.startup_hint = Some(self.status.clone());
             }
         }
+    }
+
+    /// Applies the transferable portion of a file-changed state: everything
+    /// except periods, which reference timestamps in the old file content.
+    fn apply_transferable_state(&mut self, saved: RestoredState) {
+        if !saved.current_label.trim().is_empty() {
+            self.model.current_label = saved.current_label.clone();
+        }
+        self.event_filters = saved.event_filters.clone();
+        self.stashed_event_filters = saved.stashed_event_filters.clone();
+        self.types_filter = saved.types_filter.clone();
+        self.mark_live_cache_dirty();
+        self.refresh_live_position();
+        // Store renames in session_renames so they persist across ingest cycles and
+        // survive even if no matching type IDs appear in the new file.
+        self.session_renames = saved.renames.clone();
+        // Carry periods forward as empty so apply_persisted_overrides_if_ready
+        // still applies renames, unrelated flags, and field overrides.
+        let transferable = RestoredState {
+            periods: vec![],
+            ..saved
+        };
+        self.pending_restore = Some(transferable);
+        let msg = "Session restored (file changed: renames and filters restored, periods discarded)".to_string();
+        self.status = msg.clone();
+        self.startup_hint = Some(msg);
     }
 
     fn apply_persisted_overrides_if_ready(&mut self) {
@@ -987,6 +1037,16 @@ impl App {
                     .map(|r| (r.type_id.clone(), r.path.clone(), r.mode))
                     .collect::<Vec<_>>(),
             );
+        }
+        for (idx, type_id) in &saved.triaged_events {
+            if self
+                .model
+                .events
+                .get(*idx)
+                .is_some_and(|e| &e.type_id == type_id)
+            {
+                self.triaged_event_indices.insert(*idx);
+            }
         }
         self.apply_profile_overrides_to_types();
     }
@@ -1032,6 +1092,44 @@ impl App {
             }
             self.model.apply_normalized_field_overrides(&current);
         }
+        // Apply renames restored from a previous session (file-changed path) at lowest
+        // priority: skip if a profile or the user already set a name for this type.
+        for (type_id, name) in &self.session_renames {
+            if self.user_renamed_types.contains(type_id) {
+                continue;
+            }
+            if let Some(tp) = self.model.types.get(type_id) {
+                if tp.name.is_none() {
+                    self.model.rename_type(type_id, name.clone());
+                }
+            }
+        }
+    }
+
+    fn run_file_changed_prompt(
+        &self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        state: &RestoredState,
+    ) -> Result<bool> {
+        loop {
+            terminal.draw(|f| draw_file_changed_prompt(f, state))?;
+            if event::poll(Duration::from_millis(50))? {
+                if let Event::Key(key) = event::read()? {
+                    if !matches!(key.kind, KeyEventKind::Press) {
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                            return Ok(true);
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            return Ok(false);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     fn persist_state(&self) -> Result<()> {
@@ -1042,11 +1140,34 @@ impl App {
             // the state file instead so nothing is restored in the next session.
             return invalidate_state(self.reader.path());
         }
+        let triaged_events: Vec<(usize, String)> = self
+            .triaged_event_indices
+            .iter()
+            .filter_map(|&idx| {
+                self.model
+                    .events
+                    .get(idx)
+                    .map(|e| (idx, e.type_id.clone()))
+            })
+            .collect();
+        // Merge model renames (applied) with session renames (may be unmatched if the
+        // file changed and some type IDs haven't appeared yet). Model renames win for
+        // any type_id present in both, so the user's current name is always authoritative.
+        let mut all_renames = self.model.renamed_types();
+        {
+            let applied: std::collections::HashSet<String> =
+                all_renames.iter().map(|(id, _)| id.clone()).collect();
+            for (type_id, name) in &self.session_renames {
+                if !applied.contains(type_id) {
+                    all_renames.push((type_id.clone(), name.clone()));
+                }
+            }
+        }
         save_state(
             self.reader.path(),
             self.reader.offset(),
             &self.model.periods,
-            &self.model.renamed_types(),
+            &all_renames,
             &self
                 .model
                 .types
@@ -1058,6 +1179,7 @@ impl App {
             &self.event_filters,
             self.stashed_event_filters.as_ref(),
             &self.types_filter,
+            &triaged_events,
         )
     }
 

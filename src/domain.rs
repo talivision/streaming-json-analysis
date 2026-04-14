@@ -1408,18 +1408,14 @@ fn exact_value_matches(actual: &Value, expected: &str) -> bool {
 pub fn value_at_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = v;
     for part in path.split('.') {
-        let (key, array_index) = split_path_segment(part)?;
+        let (key, ops) = parse_segment(part)?;
         if !key.is_empty() {
             cur = cur.get(key)?;
         }
-        if let Some(array_index) = array_index {
-            if let Value::Array(arr) = cur {
-                cur = match array_index {
-                    Some(index) => arr.get(index)?,
-                    None => arr.first()?,
-                };
-            } else {
-                return None;
+        for op in ops {
+            match op {
+                Some(index) => cur = cur.as_array()?.get(index)?,
+                None => cur = cur.as_array()?.first()?,
             }
         }
     }
@@ -1455,20 +1451,28 @@ pub fn normalize_path(path: &str) -> String {
     out
 }
 
-fn split_path_segment(part: &str) -> Option<(&str, Option<Option<usize>>)> {
-    if let Some(prefix) = part.strip_suffix("[]") {
-        return Some((prefix, Some(None)));
-    }
-    if let Some(open) = part.rfind('[') {
-        if part.ends_with(']') {
-            let key = &part[..open];
-            let raw = &part[open + 1..part.len() - 1];
-            if raw.chars().all(|ch| ch.is_ascii_digit()) {
-                return Some((key, Some(Some(raw.parse().ok()?))));
-            }
+/// Parse a dot-split path segment into a key prefix and an ordered list of
+/// bracket operations. Each op is `None` for a wildcard `[]` or `Some(n)` for
+/// a concrete index `[n]`. Returns `None` on syntactically malformed input.
+fn parse_segment(part: &str) -> Option<(&str, Vec<Option<usize>>)> {
+    let bracket_start = part.find('[').unwrap_or(part.len());
+    let key = &part[..bracket_start];
+    let mut ops: Vec<Option<usize>> = Vec::new();
+    let mut rest = &part[bracket_start..];
+    while !rest.is_empty() {
+        let inner = rest.strip_prefix('[')?;
+        let close = inner.find(']')?;
+        let idx_str = &inner[..close];
+        if idx_str.is_empty() {
+            ops.push(None);
+        } else if idx_str.chars().all(|c| c.is_ascii_digit()) {
+            ops.push(Some(idx_str.parse().ok()?));
+        } else {
+            return None;
         }
+        rest = &inner[close + 1..];
     }
-    Some((part, None))
+    Some((key, ops))
 }
 
 fn collect_values_at_path<'a>(cur: &'a Value, parts: &[&str], out: &mut Vec<&'a Value>) {
@@ -1476,32 +1480,32 @@ fn collect_values_at_path<'a>(cur: &'a Value, parts: &[&str], out: &mut Vec<&'a 
         out.push(cur);
         return;
     };
-    let Some((key, array_index)) = split_path_segment(part) else {
+    let Some((key, ops)) = parse_segment(part) else {
         return;
     };
-    let mut next = cur;
+    let mut nodes: Vec<&Value> = vec![cur];
     if !key.is_empty() {
-        let Some(child) = next.get(key) else {
-            return;
-        };
-        next = child;
+        nodes = nodes.into_iter().filter_map(|n| n.get(key)).collect();
     }
-    match array_index {
-        Some(Some(index)) => {
-            if let Value::Array(arr) = next {
-                if let Some(child) = arr.get(index) {
-                    collect_values_at_path(child, rest, out);
-                }
+    for op in ops {
+        match op {
+            Some(index) => {
+                nodes = nodes
+                    .into_iter()
+                    .filter_map(|n| n.as_array()?.get(index))
+                    .collect();
+            }
+            None => {
+                nodes = nodes
+                    .into_iter()
+                    .filter_map(|n| n.as_array())
+                    .flatten()
+                    .collect();
             }
         }
-        Some(None) => {
-            if let Value::Array(arr) = next {
-                for child in arr {
-                    collect_values_at_path(child, rest, out);
-                }
-            }
-        }
-        None => collect_values_at_path(next, rest, out),
+    }
+    for node in nodes {
+        collect_values_at_path(node, rest, out);
     }
 }
 
@@ -1685,9 +1689,33 @@ mod tests {
     }
 
     #[test]
+    fn value_at_path_handles_nested_arrays() {
+        let v = json!({
+            "matrix": [[1, 2], [3, 4]],
+            "grid": [[{"x": 1, "y": 2}, {"x": 3}], [{"x": 4, "y": 5}]]
+        });
+        // Concrete indices into nested arrays
+        assert_eq!(value_at_path(&v, "matrix[0][0]"), Some(&json!(1)));
+        assert_eq!(value_at_path(&v, "matrix[0][1]"), Some(&json!(2)));
+        assert_eq!(value_at_path(&v, "matrix[1][0]"), Some(&json!(3)));
+        assert_eq!(value_at_path(&v, "matrix[1][1]"), Some(&json!(4)));
+        // Object field inside a nested array
+        assert_eq!(value_at_path(&v, "grid[0][0].x"), Some(&json!(1)));
+        assert_eq!(value_at_path(&v, "grid[0][1].x"), Some(&json!(3)));
+        assert_eq!(value_at_path(&v, "grid[1][0].x"), Some(&json!(4)));
+        // values_at_path with wildcard notation collects all matching scalars
+        let vals = values_at_path(&v, "matrix[][]");
+        assert_eq!(vals, vec![&json!(1), &json!(2), &json!(3), &json!(4)]);
+        let xs = values_at_path(&v, "grid[][].x");
+        assert_eq!(xs, vec![&json!(1), &json!(3), &json!(4)]);
+    }
+
+    #[test]
     fn normalize_path_collapses_indexed_array_segments() {
         assert_eq!(normalize_path("items[17].name"), "items[].name");
         assert_eq!(normalize_path("payload.list[0].values[4]"), "payload.list[].values[]");
+        assert_eq!(normalize_path("matrix[0][1]"), "matrix[][]");
+        assert_eq!(normalize_path("grid[0][0].x"), "grid[][].x");
     }
 
     #[test]

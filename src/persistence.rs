@@ -77,6 +77,7 @@ pub struct RestoredState {
     pub event_filters: DataFilters,
     pub stashed_event_filters: Option<DataFilters>,
     pub types_filter: String,
+    pub triaged_events: Vec<(usize, String)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -95,6 +96,8 @@ struct PersistedState {
     event_filters: DataFilters,
     stashed_event_filters: Option<DataFilters>,
     types_filter: String,
+    #[serde(default)]
+    triaged_events: Vec<(usize, String)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -103,7 +106,17 @@ struct TypeRename {
     name: String,
 }
 
-pub fn load_state(stream_path: &Path) -> Result<Option<RestoredState>> {
+/// Result of attempting to load persisted session state.
+pub enum StateLoadResult {
+    /// File identity confirmed — full state can be restored.
+    Clean(RestoredState),
+    /// File content has changed since the last session. Periods are present in
+    /// the inner state so the prompt can display their count, but callers should
+    /// not restore them: they reference timestamps from the old file.
+    Changed(RestoredState),
+}
+
+pub fn load_state(stream_path: &Path) -> Result<Option<StateLoadResult>> {
     let state_path = state_path_for_stream(stream_path)?;
     if !state_path.exists() {
         return Ok(None);
@@ -125,47 +138,52 @@ pub fn load_state(stream_path: &Path) -> Result<Option<RestoredState>> {
         return Ok(None);
     }
 
+    let renames = state
+        .renames
+        .into_iter()
+        .map(|r| (r.type_id, r.name))
+        .collect();
+
     if !stream_path.exists() {
-        return Ok((state.saved_len == 0).then_some(RestoredState {
+        return Ok((state.saved_len == 0).then_some(StateLoadResult::Clean(RestoredState {
             periods: state.periods,
-            renames: state
-                .renames
-                .into_iter()
-                .map(|r| (r.type_id, r.name))
-                .collect(),
+            renames,
             known_unrelated_types: state.known_unrelated_types,
             normalized_field_overrides: state.normalized_field_overrides,
             current_label: state.current_label,
             event_filters: state.event_filters,
             stashed_event_filters: state.stashed_event_filters,
             types_filter: state.types_filter,
-        }));
+            triaged_events: state.triaged_events,
+        })));
     }
 
     let len = std::fs::metadata(stream_path)?.len();
-    if len < state.saved_len {
-        return Ok(None);
-    }
 
-    let current_prefix_hash = hash_prefix(stream_path, state.saved_len)?;
-    if current_prefix_hash != state.prefix_hash_hex {
-        return Ok(None);
-    }
-
-    Ok(Some(RestoredState {
+    // Build the full RestoredState once; we reuse it for both outcomes below.
+    let restored = RestoredState {
         periods: state.periods,
-        renames: state
-            .renames
-            .into_iter()
-            .map(|r| (r.type_id, r.name))
-            .collect(),
+        renames,
         known_unrelated_types: state.known_unrelated_types,
         normalized_field_overrides: state.normalized_field_overrides,
         current_label: state.current_label,
         event_filters: state.event_filters,
         stashed_event_filters: state.stashed_event_filters,
         types_filter: state.types_filter,
-    }))
+        triaged_events: state.triaged_events,
+    };
+
+    if len < state.saved_len {
+        // File was truncated — content definitely changed.
+        return Ok(Some(StateLoadResult::Changed(restored)));
+    }
+
+    let current_prefix_hash = hash_prefix(stream_path, state.saved_len)?;
+    if current_prefix_hash != state.prefix_hash_hex {
+        return Ok(Some(StateLoadResult::Changed(restored)));
+    }
+
+    Ok(Some(StateLoadResult::Clean(restored)))
 }
 
 /// Writes a state file that `load_state` will always reject, ensuring no state
@@ -191,6 +209,7 @@ pub fn invalidate_state(stream_path: &Path) -> Result<()> {
         event_filters: DataFilters::default(),
         stashed_event_filters: None,
         types_filter: String::new(),
+        triaged_events: vec![],
     };
     let payload = serde_json::to_vec(&state).context("failed to serialize invalidated state")?;
     let mut file = File::create(&state_path)
@@ -210,6 +229,7 @@ pub fn save_state(
     event_filters: &DataFilters,
     stashed_event_filters: Option<&DataFilters>,
     types_filter: &str,
+    triaged_events: &[(usize, String)],
 ) -> Result<()> {
     let state_path = state_path_for_stream(stream_path)?;
     if let Some(parent) = state_path.parent() {
@@ -236,6 +256,7 @@ pub fn save_state(
         event_filters: event_filters.clone(),
         stashed_event_filters: stashed_event_filters.cloned(),
         types_filter: types_filter.to_string(),
+        triaged_events: triaged_events.to_vec(),
     };
     let payload = serde_json::to_vec(&state).context("failed to serialize persisted state")?;
 

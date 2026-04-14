@@ -1,5 +1,6 @@
 use crate::app::{App, ModalConfirmation, PeriodsFocus};
 use crate::domain::{normalize_path, EventRecord, FilterField, PathOverride, RateDebugInfo};
+use crate::persistence::RestoredState;
 use indexmap::IndexMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -33,6 +34,87 @@ pub enum InputMode {
     EditPeriodRange,
     ExportSessionPath,
     ExportProfilePath,
+}
+
+pub fn draw_file_changed_prompt(frame: &mut Frame<'_>, state: &RestoredState) {
+    let area = frame.area();
+
+    // Build the content lines.
+    let mut restore_items: Vec<Line> = Vec::new();
+    if !state.renames.is_empty() {
+        restore_items.push(Line::from(format!("  • {} type rename{}", state.renames.len(), if state.renames.len() == 1 { "" } else { "s" })));
+    }
+    if !state.known_unrelated_types.is_empty() {
+        restore_items.push(Line::from(format!("  • {} suppressed type{}", state.known_unrelated_types.len(), if state.known_unrelated_types.len() == 1 { "" } else { "s" })));
+    }
+    if !state.normalized_field_overrides.is_empty() {
+        restore_items.push(Line::from(format!("  • {} field normalization rule{}", state.normalized_field_overrides.len(), if state.normalized_field_overrides.len() == 1 { "" } else { "s" })));
+    }
+    let filter_count = state.event_filters.active_count();
+    if filter_count > 0 {
+        restore_items.push(Line::from(format!("  • {} active filter{}", filter_count, if filter_count == 1 { "" } else { "s" })));
+    }
+    if state.stashed_event_filters.is_some() {
+        restore_items.push(Line::from("  • suspended filter set"));
+    }
+    if !state.types_filter.is_empty() {
+        restore_items.push(Line::from(format!("  • type list filter: \"{}\"", state.types_filter)));
+    }
+    if !state.current_label.trim().is_empty() {
+        restore_items.push(Line::from(format!("  • session label: \"{}\"", state.current_label.trim())));
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  The stream file has changed since your last session.",
+        Style::default().fg(Color::Yellow),
+    )));
+    lines.push(Line::from(""));
+
+    if restore_items.is_empty() {
+        lines.push(Line::from("  Nothing to restore from the previous session."));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Will be restored:",
+            Style::default().fg(Color::Green),
+        )));
+        lines.extend(restore_items);
+    }
+
+    if !state.periods.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Cannot be restored (file content changed):",
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(format!(
+            "  • {} action period{}",
+            state.periods.len(),
+            if state.periods.len() == 1 { "" } else { "s" }
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  [Y] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::raw("Restore"),
+        Span::raw("    "),
+        Span::styled("[N] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::raw("Start fresh"),
+    ]));
+    lines.push(Line::from(""));
+
+    let content_height = lines.len() as u16 + 2; // +2 for block borders
+    let content_width = 62u16;
+    let popup = centered_rect_abs(content_width, content_height, area);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title(" Session from previous run ")),
+        popup,
+    );
 }
 
 pub fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
@@ -324,14 +406,64 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
         event_total,
         period_total_objects,
     );
-    let period_events_title = Line::from(vec![
-        Span::raw("Events"),
-        Span::raw(triage_count_str),
+    let nav_str_short = format!(
+        "  row {}/{}",
+        app.period_event_index.saturating_add(1),
+        event_total,
+    );
+    // Available width for the block title: panel width minus 2 border chars.
+    let title_budget = cols[1].width.saturating_sub(2) as usize;
+    // Priority (highest → lowest): hint > nav > objects count.
+    // Drop objects first, then nav entirely, then the hint, then triage info.
+    let hint_spans: &[Span] = &[
         Span::raw("  \u{00b7} "),
         Span::styled("space", Style::default().fg(Color::Yellow)),
         Span::raw(" to triage"),
-        Span::raw(nav_str),
-    ]);
+    ];
+    let hint_len: usize = hint_spans.iter().map(|s| s.content.chars().count()).sum();
+    let triage_len = triage_count_str.chars().count();
+    let full_len          = 6 + triage_len + hint_len + nav_str.chars().count();
+    let hint_short_nav    = 6 + triage_len + hint_len + nav_str_short.chars().count();
+    let hint_no_nav       = 6 + triage_len + hint_len;
+    let no_hint_short_nav = 6 + triage_len + nav_str_short.chars().count();
+    let triage_only_len   = 6 + triage_len;
+    let period_events_title = if full_len <= title_budget {
+        Line::from(vec![
+            Span::raw("Events"),
+            Span::raw(triage_count_str),
+            hint_spans[0].clone(),
+            hint_spans[1].clone(),
+            hint_spans[2].clone(),
+            Span::raw(nav_str),
+        ])
+    } else if hint_short_nav <= title_budget {
+        Line::from(vec![
+            Span::raw("Events"),
+            Span::raw(triage_count_str),
+            hint_spans[0].clone(),
+            hint_spans[1].clone(),
+            hint_spans[2].clone(),
+            Span::raw(nav_str_short),
+        ])
+    } else if hint_no_nav <= title_budget {
+        Line::from(vec![
+            Span::raw("Events"),
+            Span::raw(triage_count_str),
+            hint_spans[0].clone(),
+            hint_spans[1].clone(),
+            hint_spans[2].clone(),
+        ])
+    } else if no_hint_short_nav <= title_budget {
+        Line::from(vec![
+            Span::raw("Events"),
+            Span::raw(triage_count_str),
+            Span::raw(nav_str_short),
+        ])
+    } else if triage_only_len <= title_budget {
+        Line::from(vec![Span::raw("Events"), Span::raw(triage_count_str)])
+    } else {
+        Line::from("Events")
+    };
     frame.render_widget(
         List::new(rows).block(
             Block::default()
@@ -1157,19 +1289,41 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let filters_active = displayed_filters.active_count();
     let filters_dimmed = app.filters_suspended();
     let show_long_names = width >= 100;
-    let key = display_filter(&displayed_filters.key_filter);
+    let labels = if show_long_names {
+        ["k/key", "t/type", "//sub", "z/fuzzy", "e/exact"]
+    } else {
+        ["k", "t", "/", "z", "e"]
+    };
+    // Compute a per-filter character budget that expands to fill available width.
+    // fixed_overhead: 1 (leading space) + sum(label+"=") + 4×2 (separators) + 2+"state:"+10 (state suffix)
+    let label_total: usize = labels.iter().map(|l| l.len() + 1).sum();
+    let fixed_overhead = 1 + label_total + 8 + 18;
+    let raw_filter_values: [&str; 5] = [
+        &displayed_filters.key_filter,
+        &displayed_filters.type_filter,
+        &displayed_filters.substring_filter,
+        &displayed_filters.fuzzy_filter,
+        &displayed_filters.exact_filter,
+    ];
+    let inactive_count = raw_filter_values.iter().filter(|v| v.is_empty()).count();
+    let active_count_nonzero = (5 - inactive_count).max(1);
+    let per_filter_budget = {
+        let available = width.saturating_sub(fixed_overhead + inactive_count * 3);
+        (available / active_count_nonzero).max(4)
+    };
+    let key = display_filter_budget(&displayed_filters.key_filter, per_filter_budget);
     let typ = if displayed_filters.type_filter.is_empty() {
         "off".to_string()
     } else {
         truncate_text(
             &app.model
                 .display_type_filter_value(&displayed_filters.type_filter),
-            20,
+            per_filter_budget,
         )
     };
-    let substring = display_filter(&displayed_filters.substring_filter);
-    let fuzzy = display_filter(&displayed_filters.fuzzy_filter);
-    let exact = display_filter(&displayed_filters.exact_filter);
+    let substring = display_filter_budget(&displayed_filters.substring_filter, per_filter_budget);
+    let fuzzy = display_filter_budget(&displayed_filters.fuzzy_filter, per_filter_budget);
+    let exact = display_filter_budget(&displayed_filters.exact_filter, per_filter_budget);
     let mut row = vec![Span::raw(" ")];
     let mut push_value = |label: &str, value: String, active: bool, idx: usize| {
         if idx > 0 {
@@ -1195,11 +1349,6 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ));
     };
 
-    let labels = if show_long_names {
-        ["k/key", "t/type", "//sub", "z/fuzzy", "e/exact"]
-    } else {
-        ["k", "t", "/", "z", "e"]
-    };
     push_value(labels[0], key, !displayed_filters.key_filter.is_empty(), 0);
     push_value(labels[1], typ, !displayed_filters.type_filter.is_empty(), 1);
     push_value(
@@ -1254,10 +1403,14 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn display_filter(value: &str) -> String {
+    display_filter_budget(value, 20)
+}
+
+fn display_filter_budget(value: &str, budget: usize) -> String {
     if value.is_empty() {
         "off".to_string()
     } else {
-        truncate_text(value, 20)
+        truncate_text(value, budget)
     }
 }
 
