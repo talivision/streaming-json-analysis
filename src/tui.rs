@@ -187,6 +187,7 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
                 app.model.rate_debug_info_for_event_index(event_idx)
             }),
             cols[1].height,
+            cols[1].width,
         )
     } else {
         (Text::from("No event selected"), 0)
@@ -337,6 +338,7 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
             app.period_value_focus,
             rate_info,
             cols[2].height,
+            cols[2].width,
         )
     } else {
         (Text::from("No event selected"), 0)
@@ -936,6 +938,7 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
             app.data_value_focus,
             None,
             cols[1].height,
+            cols[1].width,
         )
     } else {
         (Text::from("No baseline event selected"), 0)
@@ -1432,6 +1435,7 @@ fn build_event_preview(
     value_focus: bool,
     rate_info: Option<RateDebugInfo>,
     pane_height: u16,
+    pane_width: u16,
 ) -> (Text<'static>, u16) {
     let mut lines = vec![Line::from(Span::styled(
         app.model.type_display_name(&event.type_id),
@@ -1486,8 +1490,10 @@ fn build_event_preview(
         considered_paths,
         app.escape_strings,
     );
-    let scroll = selected_json_scroll(rendered.selected_line, pane_height);
+    let preview_prefix_lines = lines.len();
     lines.extend(rendered.lines);
+    let selected_line = rendered.selected_line.map(|line| line + preview_prefix_lines);
+    let scroll = selected_json_scroll(&lines, selected_line, pane_height, pane_width);
     (Text::from(lines), scroll)
 }
 
@@ -1945,7 +1951,12 @@ fn highlight_text_spans(
     spans
 }
 
-fn selected_json_scroll(selected_line: Option<usize>, pane_height: u16) -> u16 {
+fn selected_json_scroll(
+    lines: &[Line<'_>],
+    selected_line: Option<usize>,
+    pane_height: u16,
+    pane_width: u16,
+) -> u16 {
     let view_rows = pane_height.saturating_sub(2) as usize;
     if view_rows == 0 {
         return 0;
@@ -1953,8 +1964,15 @@ fn selected_json_scroll(selected_line: Option<usize>, pane_height: u16) -> u16 {
     let Some(line) = selected_line else {
         return 0;
     };
+    let content_width = pane_width.saturating_sub(2) as usize;
+    let rows_before_selection: usize = lines[..line]
+        .iter()
+        .map(|line| rendered_line_rows(line, content_width))
+        .sum();
     let half = view_rows / 2;
-    line.saturating_sub(half).min(u16::MAX as usize) as u16
+    rows_before_selection
+        .saturating_sub(half)
+        .min(u16::MAX as usize) as u16
 }
 
 fn indexed_json_path(path: &str, idx: usize) -> String {
@@ -1963,6 +1981,14 @@ fn indexed_json_path(path: &str, idx: usize) -> String {
     } else {
         format!("{path}[{idx}]")
     }
+}
+
+fn rendered_line_rows(line: &Line<'_>, width: usize) -> usize {
+    use ratatui::widgets::{Paragraph, Wrap};
+
+    Paragraph::new(line.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(1) as u16)
 }
 
 fn is_path_normalized_out(considered_paths: Option<&IndexMap<String, bool>>, path: &str) -> bool {
@@ -2328,6 +2354,52 @@ mod tests {
             }),
             "selected scalar array item should be strongly highlighted"
         );
+    }
+
+    #[test]
+    fn wrapped_preview_scroll_uses_selected_line_start_row() {
+        let value = json!({
+            "payload": {
+                "head": "ok",
+                "items": [
+                    {
+                        "description": "x".repeat(120),
+                        "status": "ok"
+                    },
+                    {
+                        "description": "y".repeat(120),
+                        "target": 42
+                    }
+                ]
+            }
+        });
+        let rendered = render_json_keypicker(
+            &value,
+            Some(&"payload.items[1].target".to_string()),
+            false,
+            false,
+            "",
+            "",
+            &[],
+            None,
+            false,
+        );
+        let selected_line = rendered.selected_line.expect("selected line should exist");
+        let pane_height = 12u16;
+        let pane_width = 20u16;
+        let content_width = pane_width.saturating_sub(2) as usize;
+
+        let wrapped_scroll =
+            selected_json_scroll(&rendered.lines, Some(selected_line), pane_height, pane_width)
+                as usize;
+        let rows_before_selection: usize = rendered.lines[..selected_line]
+            .iter()
+            .map(|line| rendered_line_rows(line, content_width))
+            .sum();
+        let view_rows = pane_height.saturating_sub(2) as usize;
+        let expected_scroll = rows_before_selection.saturating_sub(view_rows / 2);
+
+        assert_eq!(wrapped_scroll, expected_scroll);
     }
 
 }
