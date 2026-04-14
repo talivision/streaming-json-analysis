@@ -1199,7 +1199,12 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
     row.push(Span::raw("  "));
     row.push(Span::styled("state:", Style::default().fg(Color::Gray)));
-    if app.filters_suspended() {
+    if app.filters_working() {
+        row.push(Span::styled(
+            "working...",
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if app.filters_suspended() {
         row.push(Span::styled(
             "suspended",
             Style::default().fg(Color::Yellow),

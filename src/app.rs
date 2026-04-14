@@ -369,8 +369,8 @@ impl App {
                     break;
                 }
 
-                self.rebuild_live_cache_if_needed();
                 terminal.draw(|f| draw_ui(f, self))?;
+                self.rebuild_live_cache_if_needed();
 
                 let target_sleep = if ingested_any {
                     UI_BURST_SLEEP
@@ -1674,6 +1674,10 @@ impl App {
 
     pub fn filters_suspended(&self) -> bool {
         self.stashed_event_filters.is_some()
+    }
+
+    pub fn filters_working(&self) -> bool {
+        self.live_cache_dirty && self.event_filters.has_active() && !self.loading_locked()
     }
 
     pub fn displayed_event_filters(&self) -> &DataFilters {
