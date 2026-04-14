@@ -373,6 +373,7 @@ impl App {
 
                 terminal.draw(|f| draw_ui(f, self))?;
                 self.rebuild_live_cache_if_needed();
+                self.clamp_live_indices();
                 self.apply_pending_live_anchor();
 
                 let target_sleep = if ingested_any {
