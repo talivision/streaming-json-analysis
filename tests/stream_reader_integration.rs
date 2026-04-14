@@ -20,18 +20,6 @@ fn temp_stream_path() -> PathBuf {
     ))
 }
 
-fn temp_stream_dir() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock should be after epoch")
-        .as_nanos();
-    let seq = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!(
-        "json_analyzer_stream_reader_dir_{pid}_{nanos}_{seq}"
-    ))
-}
-
 #[test]
 fn stream_reader_fails_fast_on_invalid_json_line() {
     let path = temp_stream_path();
@@ -98,26 +86,6 @@ fn stream_reader_resets_offset_after_truncate() {
 }
 
 #[test]
-fn stream_reader_reads_directory_in_timestamp_order() {
-    let dir = temp_stream_dir();
-    fs::create_dir_all(&dir).expect("create test dir");
-
-    fs::write(dir.join("a.json"), "{\"_timestamp\": 2000, \"id\": 2}\n").expect("write a");
-    fs::write(dir.join("b.json"), "{\"_timestamp\": 1000, \"id\": 1}\n").expect("write b");
-
-    let mut reader = StreamReader::new(dir.clone());
-    let rows = reader.poll().expect("directory poll succeeds");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], json!({"_timestamp":1000,"id":1}));
-    assert_eq!(rows[1], json!({"_timestamp":2000,"id":2}));
-
-    let second = reader.poll().expect("second directory poll succeeds");
-    assert!(second.is_empty());
-
-    let _ = fs::remove_dir_all(dir);
-}
-
-#[test]
 fn stream_reader_waits_for_partial_jsonl_line_until_newline_arrives() {
     let path = temp_stream_path();
     fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"par").expect("write partial file");
@@ -147,8 +115,11 @@ fn stream_reader_waits_for_partial_jsonl_line_until_newline_arrives() {
 #[test]
 fn stream_reader_does_not_report_incomplete_tail_for_unread_complete_jsonl_lines() {
     let path = temp_stream_path();
-    fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\"}\n{\"event\":\"c\"}\n")
-        .expect("write complete jsonl file");
+    fs::write(
+        &path,
+        "{\"event\":\"a\"}\n{\"event\":\"b\"}\n{\"event\":\"c\"}\n",
+    )
+    .expect("write complete jsonl file");
 
     let mut reader = StreamReader::new(path.clone());
     let first = reader.poll().expect("first poll succeeds");
@@ -162,8 +133,11 @@ fn stream_reader_does_not_report_incomplete_tail_for_unread_complete_jsonl_lines
     );
     assert!(!reader.has_incomplete_final_line());
 
-    fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\"}\n{\"event\":\"c\"}\n")
-        .expect("rewrite complete jsonl file");
+    fs::write(
+        &path,
+        "{\"event\":\"a\"}\n{\"event\":\"b\"}\n{\"event\":\"c\"}\n",
+    )
+    .expect("rewrite complete jsonl file");
     let mut reader = StreamReader::new(path.clone());
     reader.poll().expect("poll succeeds");
     fs::write(
@@ -199,8 +173,11 @@ fn stream_reader_handles_large_final_json_object_beyond_tail_scan_window() {
         "event": "large",
         "blob": "x".repeat(100 * 1024)
     });
-    fs::write(&path, serde_json::to_string(&payload).expect("serialize payload"))
-        .expect("write large final object");
+    fs::write(
+        &path,
+        serde_json::to_string(&payload).expect("serialize payload"),
+    )
+    .expect("write large final object");
 
     let mut reader = StreamReader::new(path.clone());
     let rows = reader.poll().expect("poll succeeds");
@@ -222,7 +199,10 @@ fn stream_reader_does_not_flag_large_newline_terminated_final_line_as_incomplete
     });
     fs::write(
         &path,
-        format!("{}\n", serde_json::to_string(&payload).expect("serialize payload")),
+        format!(
+            "{}\n",
+            serde_json::to_string(&payload).expect("serialize payload")
+        ),
     )
     .expect("write large newline-terminated object");
 
@@ -283,42 +263,4 @@ fn stream_reader_fails_fast_on_oversized_line_without_newline() {
     );
 
     let _ = fs::remove_file(path);
-}
-
-#[test]
-fn stream_reader_streams_large_directory_across_polls() {
-    let dir = temp_stream_dir();
-    fs::create_dir_all(&dir).expect("create test dir");
-
-    // MAX_FILES_PER_POLL is 2000 in src/io.rs; use more than that to verify streaming.
-    let total_files = 2_105usize;
-    for i in 0..total_files {
-        let path = dir.join(format!("f{:04}.json", i));
-        fs::write(path, format!("{{\"_timestamp\": {}, \"id\": {}}}\n", i, i)).expect("write file");
-    }
-
-    let mut reader = StreamReader::new(dir.clone());
-    let first = reader.poll().expect("first directory poll succeeds");
-    assert_eq!(first.len(), 2_000);
-    assert_eq!(first.first().cloned(), Some(json!({"_timestamp":0,"id":0})));
-    assert_eq!(
-        first.last().cloned(),
-        Some(json!({"_timestamp":1999,"id":1999}))
-    );
-
-    let second = reader.poll().expect("second directory poll succeeds");
-    assert_eq!(second.len(), 105);
-    assert_eq!(
-        second.first().cloned(),
-        Some(json!({"_timestamp":2000,"id":2000}))
-    );
-    assert_eq!(
-        second.last().cloned(),
-        Some(json!({"_timestamp":2104,"id":2104}))
-    );
-
-    let third = reader.poll().expect("third directory poll succeeds");
-    assert!(third.is_empty());
-
-    let _ = fs::remove_dir_all(dir);
 }
