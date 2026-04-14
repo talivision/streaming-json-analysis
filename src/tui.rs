@@ -1,5 +1,7 @@
 use crate::app::{App, ModalConfirmation, PeriodsFocus};
-use crate::domain::{normalize_path, EventRecord, FilterField, PathOverride, RateDebugInfo};
+use crate::domain::{
+    normalize_path, EventRecord, FilterField, PathOverride, RateDebugInfo, DEFAULT_ACTION_LABEL,
+};
 use crate::persistence::RestoredState;
 use indexmap::IndexMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -42,26 +44,57 @@ pub fn draw_file_changed_prompt(frame: &mut Frame<'_>, state: &RestoredState) {
     // Build the content lines.
     let mut restore_items: Vec<Line> = Vec::new();
     if !state.renames.is_empty() {
-        restore_items.push(Line::from(format!("  • {} type rename{}", state.renames.len(), if state.renames.len() == 1 { "" } else { "s" })));
+        restore_items.push(Line::from(format!(
+            "  • {} type rename{}",
+            state.renames.len(),
+            if state.renames.len() == 1 { "" } else { "s" }
+        )));
     }
     if !state.known_unrelated_types.is_empty() {
-        restore_items.push(Line::from(format!("  • {} suppressed type{}", state.known_unrelated_types.len(), if state.known_unrelated_types.len() == 1 { "" } else { "s" })));
+        restore_items.push(Line::from(format!(
+            "  • {} suppressed type{}",
+            state.known_unrelated_types.len(),
+            if state.known_unrelated_types.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        )));
     }
     if !state.normalized_field_overrides.is_empty() {
-        restore_items.push(Line::from(format!("  • {} field normalization rule{}", state.normalized_field_overrides.len(), if state.normalized_field_overrides.len() == 1 { "" } else { "s" })));
+        restore_items.push(Line::from(format!(
+            "  • {} field normalization rule{}",
+            state.normalized_field_overrides.len(),
+            if state.normalized_field_overrides.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        )));
     }
     let filter_count = state.event_filters.active_count();
     if filter_count > 0 {
-        restore_items.push(Line::from(format!("  • {} active filter{}", filter_count, if filter_count == 1 { "" } else { "s" })));
+        restore_items.push(Line::from(format!(
+            "  • {} active filter{}",
+            filter_count,
+            if filter_count == 1 { "" } else { "s" }
+        )));
     }
     if state.stashed_event_filters.is_some() {
         restore_items.push(Line::from("  • suspended filter set"));
     }
     if !state.types_filter.is_empty() {
-        restore_items.push(Line::from(format!("  • type list filter: \"{}\"", state.types_filter)));
+        restore_items.push(Line::from(format!(
+            "  • type list filter: \"{}\"",
+            state.types_filter
+        )));
     }
-    if !state.current_label.trim().is_empty() {
-        restore_items.push(Line::from(format!("  • session label: \"{}\"", state.current_label.trim())));
+    let trimmed_label = state.current_label.trim();
+    if !trimmed_label.is_empty() && trimmed_label != DEFAULT_ACTION_LABEL {
+        restore_items.push(Line::from(format!(
+            "  • session label: \"{}\"",
+            state.current_label.trim()
+        )));
     }
 
     let mut lines: Vec<Line> = Vec::new();
@@ -73,7 +106,9 @@ pub fn draw_file_changed_prompt(frame: &mut Frame<'_>, state: &RestoredState) {
     lines.push(Line::from(""));
 
     if restore_items.is_empty() {
-        lines.push(Line::from("  Nothing to restore from the previous session."));
+        lines.push(Line::from(
+            "  Nothing to restore from the previous session.",
+        ));
     } else {
         lines.push(Line::from(Span::styled(
             "  Will be restored:",
@@ -97,10 +132,18 @@ pub fn draw_file_changed_prompt(frame: &mut Frame<'_>, state: &RestoredState) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("  [Y] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "  [Y] ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("Restore"),
         Span::raw("    "),
-        Span::styled("[N] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[N] ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
         Span::raw("Start fresh"),
     ]));
     lines.push(Line::from(""));
@@ -111,8 +154,11 @@ pub fn draw_file_changed_prompt(frame: &mut Frame<'_>, state: &RestoredState) {
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::ALL).title(" Session from previous run ")),
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Session from previous run "),
+        ),
         popup,
     );
 }
@@ -130,7 +176,11 @@ pub fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     // Compute once per frame; passed to every row renderer to avoid O(types) per row.
     let max_type_count = app.model.types.values().map(|t| t.count).max().unwrap_or(1) as f64;
 
-    let tab_mode = if app.mode == UiMode::Values { app.values_return_mode } else { app.mode };
+    let tab_mode = if app.mode == UiMode::Values {
+        app.values_return_mode
+    } else {
+        app.mode
+    };
     draw_tabs(frame, root[0], tab_mode, app.baseline_tab_enabled());
     match app.mode {
         UiMode::Live => draw_live(frame, root[1], app, max_type_count),
@@ -265,9 +315,8 @@ fn draw_live(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
             selected_path,
             app.live_key_focus,
             app.live_value_focus,
-            selected_event_abs_index.and_then(|event_idx| {
-                app.model.rate_debug_info_for_event_index(event_idx)
-            }),
+            selected_event_abs_index
+                .and_then(|event_idx| app.model.rate_debug_info_for_event_index(event_idx)),
             cols[1].height,
             cols[1].width,
         )
@@ -422,11 +471,11 @@ fn draw_periods(frame: &mut Frame<'_>, area: Rect, app: &App, max_type_count: f6
     ];
     let hint_len: usize = hint_spans.iter().map(|s| s.content.chars().count()).sum();
     let triage_len = triage_count_str.chars().count();
-    let full_len          = 6 + triage_len + hint_len + nav_str.chars().count();
-    let hint_short_nav    = 6 + triage_len + hint_len + nav_str_short.chars().count();
-    let hint_no_nav       = 6 + triage_len + hint_len;
+    let full_len = 6 + triage_len + hint_len + nav_str.chars().count();
+    let hint_short_nav = 6 + triage_len + hint_len + nav_str_short.chars().count();
+    let hint_no_nav = 6 + triage_len + hint_len;
     let no_hint_short_nav = 6 + triage_len + nav_str_short.chars().count();
-    let triage_only_len   = 6 + triage_len;
+    let triage_only_len = 6 + triage_len;
     let period_events_title = if full_len <= title_budget {
         Line::from(vec![
             Span::raw("Events"),
@@ -995,7 +1044,10 @@ fn draw_values(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .collect();
 
     let title = Line::from(vec![
-        Span::raw(format!("Values for: {}  ({} unique)  ", app.values_key, total)),
+        Span::raw(format!(
+            "Values for: {}  ({} unique)  ",
+            app.values_key, total
+        )),
         styled_hotkey("e"),
         Span::raw("/"),
         styled_hotkey("↵"),
@@ -1402,10 +1454,6 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn display_filter(value: &str) -> String {
-    display_filter_budget(value, 20)
-}
-
 fn display_filter_budget(value: &str, budget: usize) -> String {
     if value.is_empty() {
         "off".to_string()
@@ -1426,7 +1474,9 @@ fn truncate_left(value: &str, max_chars: usize) -> String {
         return "…".to_string();
     }
     let tail_len = max_chars.saturating_sub(1);
-    let tail: String = chars[chars.len().saturating_sub(tail_len)..].iter().collect();
+    let tail: String = chars[chars.len().saturating_sub(tail_len)..]
+        .iter()
+        .collect();
     format!("…{}", tail)
 }
 
@@ -1534,7 +1584,17 @@ fn draw_type_preview_modal(frame: &mut Frame<'_>, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
-        let rendered = render_json_keypicker(&sample, None, false, false, "", "", &[], None, app.escape_strings);
+        let rendered = render_json_keypicker(
+            &sample,
+            None,
+            false,
+            false,
+            "",
+            "",
+            &[],
+            None,
+            app.escape_strings,
+        );
         lines.extend(rendered.lines);
     } else {
         lines.push(Line::from("No type selected"));
@@ -1673,7 +1733,9 @@ fn build_event_preview(
     );
     let preview_prefix_lines = lines.len();
     lines.extend(rendered.lines);
-    let selected_line = rendered.selected_line.map(|line| line + preview_prefix_lines);
+    let selected_line = rendered
+        .selected_line
+        .map(|line| line + preview_prefix_lines);
     let scroll = selected_json_scroll(&lines, selected_line, pane_height, pane_width);
     (Text::from(lines), scroll)
 }
@@ -2515,8 +2577,8 @@ fn stylize_modal_line(s: &str) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use ratatui::style::Modifier;
+    use serde_json::json;
 
     #[test]
     fn render_json_keypicker_anchors_to_indexed_array_instance() {
@@ -2600,9 +2662,12 @@ mod tests {
         let pane_width = 20u16;
         let content_width = pane_width.saturating_sub(2) as usize;
 
-        let wrapped_scroll =
-            selected_json_scroll(&rendered.lines, Some(selected_line), pane_height, pane_width)
-                as usize;
+        let wrapped_scroll = selected_json_scroll(
+            &rendered.lines,
+            Some(selected_line),
+            pane_height,
+            pane_width,
+        ) as usize;
         let rows_before_selection: usize = rendered.lines[..selected_line]
             .iter()
             .map(|line| rendered_line_rows(line, content_width))
@@ -2612,5 +2677,4 @@ mod tests {
 
         assert_eq!(wrapped_scroll, expected_scroll);
     }
-
 }

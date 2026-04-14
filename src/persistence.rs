@@ -145,17 +145,19 @@ pub fn load_state(stream_path: &Path) -> Result<Option<StateLoadResult>> {
         .collect();
 
     if !stream_path.exists() {
-        return Ok((state.saved_len == 0).then_some(StateLoadResult::Clean(RestoredState {
-            periods: state.periods,
-            renames,
-            known_unrelated_types: state.known_unrelated_types,
-            normalized_field_overrides: state.normalized_field_overrides,
-            current_label: state.current_label,
-            event_filters: state.event_filters,
-            stashed_event_filters: state.stashed_event_filters,
-            types_filter: state.types_filter,
-            triaged_events: state.triaged_events,
-        })));
+        return Ok(
+            (state.saved_len == 0).then_some(StateLoadResult::Clean(RestoredState {
+                periods: state.periods,
+                renames,
+                known_unrelated_types: state.known_unrelated_types,
+                normalized_field_overrides: state.normalized_field_overrides,
+                current_label: state.current_label,
+                event_filters: state.event_filters,
+                stashed_event_filters: state.stashed_event_filters,
+                types_filter: state.types_filter,
+                triaged_events: state.triaged_events,
+            })),
+        );
     }
 
     let len = std::fs::metadata(stream_path)?.len();

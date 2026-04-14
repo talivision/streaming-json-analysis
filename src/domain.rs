@@ -4,6 +4,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
+pub const DEFAULT_ACTION_LABEL: &str = "action";
 const ACTION_BOUNDARY_EPS: f64 = 0.000_001;
 const MIN_ACTION_RATE_DURATION_SECS: f64 = 1.0;
 const VALUE_ANOMALY_RARE_FREQ: f64 = 0.25;
@@ -248,7 +249,7 @@ impl AnalyzerModel {
             types: IndexMap::new(),
             events: Vec::new(),
             periods: Vec::new(),
-            current_label: "action".to_string(),
+            current_label: DEFAULT_ACTION_LABEL.to_string(),
             baseline_elapsed_secs: 0.0,
             baseline_counts: HashMap::new(),
             baseline_last_ts: None,
@@ -535,8 +536,7 @@ impl AnalyzerModel {
 
         let anomaly_score = if self.baseline_counts.get(type_id).copied().unwrap_or(0) == 0 {
             1.0
-        } else if observed_rate.is_none()
-        {
+        } else if observed_rate.is_none() {
             0.0
         } else {
             normalized_rate_anomaly(actual_rate, expected_rate)
@@ -1157,7 +1157,8 @@ pub fn type_is_negated_in_filter(filter: &str, canonical_name: &str) -> bool {
     let canonical = canonical_name.to_lowercase();
     !expr.groups.is_empty()
         && expr.groups.iter().all(|group| {
-            group.iter()
+            group
+                .iter()
                 .any(|term| term.negated && term.value.to_lowercase() == canonical)
         })
 }
@@ -1171,7 +1172,8 @@ pub fn toggle_negated_type_in_filter(filter: &str, canonical_name: &str) -> Stri
     let needle = canonical.to_lowercase();
     let present = !expr.groups.is_empty()
         && expr.groups.iter().all(|group| {
-            group.iter()
+            group
+                .iter()
                 .any(|term| term.negated && term.value.to_lowercase() == needle)
         });
     if present {
@@ -1205,14 +1207,22 @@ pub fn replace_positive_type_filters(filter: &str, canonical_name: &str) -> Stri
         });
     }
     format_filter_expr(&FilterExpr {
-        groups: if terms.is_empty() { Vec::new() } else { vec![terms] },
+        groups: if terms.is_empty() {
+            Vec::new()
+        } else {
+            vec![terms]
+        },
     })
 }
 
 pub fn clear_positive_type_filters(filter: &str) -> String {
     let terms = common_negated_type_terms(filter);
     format_filter_expr(&FilterExpr {
-        groups: if terms.is_empty() { Vec::new() } else { vec![terms] },
+        groups: if terms.is_empty() {
+            Vec::new()
+        } else {
+            vec![terms]
+        },
     })
 }
 
@@ -1335,7 +1345,8 @@ fn format_filter_expr(expr: &FilterExpr) -> String {
     expr.groups
         .iter()
         .map(|group| {
-            group.iter()
+            group
+                .iter()
                 .map(format_filter_term)
                 .collect::<Vec<_>>()
                 .join(" && ")
@@ -1355,8 +1366,7 @@ fn common_negated_type_terms(filter: &str) -> Vec<FilterTerm> {
         .filter(|term| {
             expr.groups.iter().all(|group| {
                 group.iter().any(|candidate| {
-                    candidate.negated
-                        && candidate.value.eq_ignore_ascii_case(term.value.as_str())
+                    candidate.negated && candidate.value.eq_ignore_ascii_case(term.value.as_str())
                 })
             })
         })
@@ -1713,7 +1723,10 @@ mod tests {
     #[test]
     fn normalize_path_collapses_indexed_array_segments() {
         assert_eq!(normalize_path("items[17].name"), "items[].name");
-        assert_eq!(normalize_path("payload.list[0].values[4]"), "payload.list[].values[]");
+        assert_eq!(
+            normalize_path("payload.list[0].values[4]"),
+            "payload.list[].values[]"
+        );
         assert_eq!(normalize_path("matrix[0][1]"), "matrix[][]");
         assert_eq!(normalize_path("grid[0][0].x"), "grid[][].x");
     }
@@ -1921,10 +1934,7 @@ mod tests {
     #[test]
     fn exact_filter_matches_any_array_item_value() {
         let mut model = AnalyzerModel::new();
-        model.ingest(
-            json!({"items":[{"name":"first"},{"name":"second"}]}),
-            1.0,
-        );
+        model.ingest(json!({"items":[{"name":"first"},{"name":"second"}]}), 1.0);
 
         let filters = DataFilters {
             exact_filter: "items[].name=s:second".to_string(),
