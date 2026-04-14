@@ -131,6 +131,7 @@ pub struct App {
     stashed_event_filters: Option<DataFilters>,
     stashed_live_visible_indices: Option<(usize, Vec<usize>)>,
     stashed_baseline_visible_indices: Option<(usize, Vec<usize>)>,
+    pending_live_anchor: Option<LiveAnchor>,
     reader: StreamReader,
     baseline_reader: Option<StreamReader>,
     baseline_events: Vec<EventRecord>,
@@ -243,6 +244,7 @@ impl App {
             stashed_event_filters: None,
             stashed_live_visible_indices: None,
             stashed_baseline_visible_indices: None,
+            pending_live_anchor: None,
             reader: StreamReader::new(stream_path),
             baseline_reader: baseline_path.map(StreamReader::new),
             baseline_events: Vec::new(),
@@ -371,6 +373,7 @@ impl App {
 
                 terminal.draw(|f| draw_ui(f, self))?;
                 self.rebuild_live_cache_if_needed();
+                self.apply_pending_live_anchor();
 
                 let target_sleep = if ingested_any {
                     UI_BURST_SLEEP
@@ -2583,15 +2586,7 @@ impl App {
             UiMode::Live => {
                 self.refresh_live_position();
                 if !self.live_follow {
-                    if let Some(anchor) = selected_anchor.as_ref() {
-                        if let Some(idx) = self.find_live_index(anchor) {
-                            self.live_event_index = idx;
-                            self.ensure_live_selection_visible();
-                        } else {
-                            self.live_event_index = 0;
-                            self.live_view_start = 0;
-                        }
-                    }
+                    self.pending_live_anchor = selected_anchor;
                 }
                 self.clamp_live_key_selection();
             }
@@ -3046,6 +3041,21 @@ impl App {
 
     pub fn ensure_live_cache(&mut self) {
         self.rebuild_live_cache_if_needed();
+    }
+
+    fn apply_pending_live_anchor(&mut self) {
+        let Some(anchor) = self.pending_live_anchor.take() else {
+            return;
+        };
+        if let Some(idx) = self.find_live_index(&anchor) {
+            self.live_event_index = idx;
+            let total = self.live_visible_total();
+            self.ensure_live_selection_visible_n(total);
+        } else {
+            self.live_event_index = 0;
+            self.live_view_start = 0;
+        }
+        self.clamp_live_key_selection();
     }
 
     pub fn ensure_baseline_cache(&mut self) {
