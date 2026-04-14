@@ -772,6 +772,17 @@ impl AnalyzerModel {
         filters: &DataFilters,
         range: Option<(f64, f64)>,
     ) -> Vec<usize> {
+        if !filters.has_active() {
+            return match range {
+                None => (0..self.events.len()).collect(),
+                Some((start, end)) => self
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| (e.ts >= start && e.ts <= end).then_some(i))
+                    .collect(),
+            };
+        }
         let mut out = Vec::new();
         let type_expr = FilterExpr::parse(&filters.type_filter);
         let key_expr = FilterExpr::parse(&filters.key_filter);
@@ -813,6 +824,9 @@ impl AnalyzerModel {
         events: &[EventRecord],
         filters: &DataFilters,
     ) -> Vec<usize> {
+        if !filters.has_active() {
+            return (0..events.len()).rev().collect();
+        }
         let mut out = Vec::new();
         let type_expr = FilterExpr::parse(&filters.type_filter);
         let key_expr = FilterExpr::parse(&filters.key_filter);
