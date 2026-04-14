@@ -129,6 +129,8 @@ pub struct App {
     pub offline: bool,
     pub status: String,
     stashed_event_filters: Option<DataFilters>,
+    stashed_live_visible_indices: Option<(usize, Vec<usize>)>,
+    stashed_baseline_visible_indices: Option<(usize, Vec<usize>)>,
     reader: StreamReader,
     baseline_reader: Option<StreamReader>,
     baseline_events: Vec<EventRecord>,
@@ -239,6 +241,8 @@ impl App {
                 format!("Watching {}", stream_path.display())
             },
             stashed_event_filters: None,
+            stashed_live_visible_indices: None,
+            stashed_baseline_visible_indices: None,
             reader: StreamReader::new(stream_path),
             baseline_reader: baseline_path.map(StreamReader::new),
             baseline_events: Vec::new(),
@@ -621,6 +625,8 @@ impl App {
 
         self.add_whitelist_terms(whitelist_terms);
         self.stashed_event_filters = None;
+        self.stashed_live_visible_indices = None;
+        self.stashed_baseline_visible_indices = None;
         self.event_filters = negative_filters;
         self.mark_live_cache_dirty();
         self.refresh_live_position();
@@ -1298,6 +1304,8 @@ impl App {
                 self.event_filters.type_filter =
                     clear_positive_type_filters(&self.event_filters.type_filter);
                 self.stashed_event_filters = None;
+                self.stashed_live_visible_indices = None;
+                self.stashed_baseline_visible_indices = None;
                 self.mark_live_cache_dirty();
                 self.refresh_live_position();
                 self.live_key_focus = false;
@@ -1682,7 +1690,30 @@ impl App {
         };
         if let Some(saved) = self.stashed_event_filters.take() {
             self.event_filters = saved;
-            self.mark_live_cache_dirty();
+            let live_count = self.model.events.len();
+            let baseline_count = self.baseline_events.len();
+            let restored = self
+                .stashed_live_visible_indices
+                .as_ref()
+                .map(|(n, _)| *n == live_count)
+                .unwrap_or(false)
+                && self
+                    .stashed_baseline_visible_indices
+                    .as_ref()
+                    .map(|(n, _)| *n == baseline_count)
+                    .unwrap_or(false);
+            if restored {
+                self.live_visible_indices =
+                    self.stashed_live_visible_indices.take().unwrap().1;
+                self.baseline_visible_indices =
+                    self.stashed_baseline_visible_indices.take().unwrap().1;
+                self.live_cache_dirty = false;
+                self.baseline_cache_dirty = false;
+            } else {
+                self.stashed_live_visible_indices = None;
+                self.stashed_baseline_visible_indices = None;
+                self.mark_live_cache_dirty();
+            }
             self.after_filter_change(anchor);
             self.status = "Event filters restored".to_string();
             return;
@@ -1693,6 +1724,14 @@ impl App {
             return;
         }
 
+        self.stashed_live_visible_indices = Some((
+            self.model.events.len(),
+            std::mem::take(&mut self.live_visible_indices),
+        ));
+        self.stashed_baseline_visible_indices = Some((
+            self.baseline_events.len(),
+            std::mem::take(&mut self.baseline_visible_indices),
+        ));
         self.stashed_event_filters = Some(self.event_filters.clone());
         self.event_filters = DataFilters::default();
         self.mark_live_cache_dirty();
@@ -1703,6 +1742,8 @@ impl App {
     fn apply_profile_filters(&mut self, filters: DataFilters) {
         if filters.has_active() {
             self.stashed_event_filters = None;
+            self.stashed_live_visible_indices = None;
+            self.stashed_baseline_visible_indices = None;
             self.event_filters = filters;
             self.mark_live_cache_dirty();
             self.refresh_live_position();
@@ -2652,6 +2693,8 @@ impl App {
 
     fn commit_filter_change(&mut self, origin: FilterOrigin) {
         self.stashed_event_filters = None;
+        self.stashed_live_visible_indices = None;
+        self.stashed_baseline_visible_indices = None;
         match origin {
             FilterOrigin::KeyShortcut { anchor } => {
                 self.mark_live_cache_dirty();
