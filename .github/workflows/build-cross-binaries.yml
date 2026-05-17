@@ -6,6 +6,19 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Rust tests
+        run: cargo test
+
   linux-musl:
     name: Linux MUSL (static)
     runs-on: ubuntu-latest
@@ -83,7 +96,7 @@ jobs:
   release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux-musl, linux-gnu, windows-exe]
+    needs: [test, linux-musl, linux-gnu, windows-exe]
     runs-on: ubuntu-latest
     permissions:
       contents: write
