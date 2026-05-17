@@ -4059,14 +4059,12 @@ impl App {
             if self.model.merge_groups.contains_key(&type_id) {
                 self.pending_unmerge_group_id = Some(type_id.clone());
                 let label = self.model.canonical_type_name(&type_id);
-                self.status =
-                    format!("Unmerge '{label}'? `y` to confirm, `n`/`Esc` to disregard");
+                self.status = format!("Unmerge '{label}'? `y` to confirm, `n`/`Esc` to disregard");
                 return;
             }
         }
-        self.status =
-            "Select >=2 types with 's' to merge, or highlight a merged group to unmerge"
-                .to_string();
+        self.status = "Select >=2 types with 's' to merge, or highlight a merged group to unmerge"
+            .to_string();
     }
 
     fn confirm_unmerge_pending(&mut self) {
@@ -4100,17 +4098,11 @@ impl App {
                     .unwrap_or_else(|| default_type_label_pub(member_id))
             })
             .collect();
-        self.event_filters.type_filter = expand_merged_label_in_filter(
-            &self.event_filters.type_filter,
-            &label,
-            &member_names,
-        );
+        self.event_filters.type_filter =
+            expand_merged_label_in_filter(&self.event_filters.type_filter, &label, &member_names);
         if let Some(stashed) = self.stashed_event_filters.as_mut() {
-            stashed.type_filter = expand_merged_label_in_filter(
-                &stashed.type_filter,
-                &label,
-                &member_names,
-            );
+            stashed.type_filter =
+                expand_merged_label_in_filter(&stashed.type_filter, &label, &member_names);
         }
         self.commit_filter_change(FilterOrigin::TypeView);
         self.pending_live_recompute = true;
@@ -4138,27 +4130,18 @@ impl App {
             .map(|m| self.model.canonical_type_name(m))
             .collect();
         let cleaned_label = label.trim().to_string();
-        let Some(_group_id) = self
-            .model
-            .merge_types(&members, cleaned_label.clone())
-        else {
+        let Some(group_id) = self.model.merge_types(&members, cleaned_label.clone()) else {
             self.status = "Merge failed (insufficient valid members)".to_string();
             return;
         };
         // Rewrite the type filter: replace each member's prior name with the
         // merged label, then dedupe.
         for prior in &prior_names {
-            self.event_filters.type_filter = rename_type_terms_in_filter(
-                &self.event_filters.type_filter,
-                prior,
-                &cleaned_label,
-            );
+            self.event_filters.type_filter =
+                rename_type_terms_in_filter(&self.event_filters.type_filter, prior, &cleaned_label);
             if let Some(stashed) = self.stashed_event_filters.as_mut() {
-                stashed.type_filter = rename_type_terms_in_filter(
-                    &stashed.type_filter,
-                    prior,
-                    &cleaned_label,
-                );
+                stashed.type_filter =
+                    rename_type_terms_in_filter(&stashed.type_filter, prior, &cleaned_label);
             }
         }
         self.event_filters.type_filter = dedupe_filter_terms(&self.event_filters.type_filter);
@@ -4170,7 +4153,7 @@ impl App {
         let member_set: HashSet<String> = members.iter().cloned().collect();
         for ev in self.baseline_events.iter_mut() {
             if member_set.contains(&ev.type_id) {
-                let prev = std::mem::replace(&mut ev.type_id, _group_id.clone());
+                let prev = std::mem::replace(&mut ev.type_id, group_id.clone());
                 if ev.original_type_id.is_none() {
                     ev.original_type_id = Some(prev);
                 }
@@ -4180,6 +4163,15 @@ impl App {
         self.selected_type_ids.clear();
         self.pending_live_recompute = true;
         self.mark_state_dirty();
+        // Point the cursor at the newly created merged group so the user sees
+        // the row they just acted on. Path-focus was over a now-gone member,
+        // so reset it to the list pane.
+        let visible_after = self.visible_types();
+        if let Some(idx) = visible_after.iter().position(|id| id == &group_id) {
+            self.type_index = idx;
+            self.types_path_focus = false;
+            self.path_index = 0;
+        }
         self.status = format!(
             "Merged {} types into '{}'",
             members.len(),
@@ -4544,7 +4536,9 @@ fn normalize_profile(mut profile: SourceProfile) -> SourceProfile {
     wl.sort();
     wl.dedup();
     profile.whitelist_terms = wl;
-    profile.merge_groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
+    profile
+        .merge_groups
+        .sort_by(|a, b| a.group_id.cmp(&b.group_id));
     profile
 }
 
@@ -5329,6 +5323,42 @@ mod tests {
         assert!(has_group, "expected a merged group in visible types");
         // Selection cleared.
         assert!(app.selected_type_ids.is_empty());
+    }
+
+    #[test]
+    fn merge_repositions_cursor_onto_merged_group() {
+        // After a successful merge, the cursor should point at the newly
+        // created group row rather than staying at the previous numeric index.
+        let mut app = test_app();
+        // Ingest three distinct shapes so we have stable rows around the
+        // merged group.
+        app.model.ingest(json!({"event": "login", "x": 1}), 1.0);
+        app.model.ingest(json!({"event": "logout", "y": 2}), 2.0);
+        app.model.ingest(json!({"event": "ping", "z": 3}), 3.0);
+        app.mode = UiMode::Types;
+        let visible_before = app.visible_types();
+        assert!(visible_before.len() >= 2);
+        // Select first two and merge under a recognisable label.
+        app.type_index = 0;
+        app.handle_key(key(KeyCode::Char('s')));
+        app.type_index = 1;
+        app.handle_key(key(KeyCode::Char('s')));
+        // Pretend the user was in path-focus before pressing g.
+        app.types_path_focus = true;
+        app.handle_key(key(KeyCode::Char('g')));
+        for ch in "Auth".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        // Cursor should be on the merged group row.
+        let visible_after = app.visible_types();
+        let cursor_id = &visible_after[app.type_index];
+        assert!(
+            app.model.merge_groups.contains_key(cursor_id),
+            "expected cursor to land on the merged group, got id {cursor_id}"
+        );
+        // Path-focus is reset so the user is back on the list pane.
+        assert!(!app.types_path_focus);
     }
 
     /// Helper: ingest two distinct shapes into a fresh app and return their
