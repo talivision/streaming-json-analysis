@@ -278,6 +278,21 @@ fn state_path_for_stream(stream_path: &Path) -> Result<PathBuf> {
 }
 
 fn base_state_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(dir) = env::var_os("LOCALAPPDATA") {
+            return Ok(PathBuf::from(dir).join("json-analyzer"));
+        }
+        if let Some(dir) = env::var_os("APPDATA") {
+            return Ok(PathBuf::from(dir).join("json-analyzer"));
+        }
+        if let Some(dir) = env::var_os("TEMP") {
+            return Ok(PathBuf::from(dir).join("json-analyzer"));
+        }
+        if let Some(dir) = env::var_os("TMP") {
+            return Ok(PathBuf::from(dir).join("json-analyzer"));
+        }
+    }
     if let Some(dir) = env::var_os("XDG_STATE_HOME") {
         return Ok(PathBuf::from(dir).join("json-analyzer"));
     }
