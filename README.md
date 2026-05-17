@@ -185,6 +185,8 @@ Switch to the **Periods view (`2`)** to see closed periods. Select one to browse
 
 The Types view lets you push down noise from types that aren't relevant to your investigation. Press **`u`** on a type to add it to a negative type filter — it stays visible in the Types view but disappears from event lists. Press **`u`** again to remove it.
 
+If two structurally distinct types describe the same logical event — for example, the same producer with an optional field present or absent — select them with **`s`** and press **`g`** to merge them under a chosen label. Merged types are treated as one across rate scoring, uniqueness scoring, and all event lists. Press **`g`** on a merged row to unmerge.
+
 Within a type, press `enter` to see the field paths the engine considers for uniqueness scoring. High-cardinality paths (IDs, free text) are auto-excluded by the engine; use `space` to force paths on or off if the heuristic gets it wrong.
 
 Use the filter keys (`k`, `t`, `/`, `z`, `e`) to narrow event lists to what you care about. Filters support `&&`, `||`, and `!` negation, and quoted terms:
@@ -213,7 +215,7 @@ Matches are highlighted in orange in the JSON preview.
 
 ### 6. Save your work
 
-Press **`p`** to export a profile — your configuration (type renames, excluded types, path overrides, whitelist terms) without the events. Reload it next time you open the same stream, or apply it to a different stream of the same kind:
+Press **`p`** to export a profile — your configuration (type renames, merge groups, excluded types, path overrides, whitelist terms) without the events. Reload it next time you open the same stream, or apply it to a different stream of the same kind:
 
 ```bash
 ./target/release/json-analyzer stream.jsonl --profile stream.profile.json
