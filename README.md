@@ -126,7 +126,7 @@ In `--offline` mode, `_timestamp` is optional. If it is missing, the analyzer as
 
 ### Enrichment fields
 
-Any `_`-prefixed field beyond `_timestamp` is treated as enrichment or deployment context and behaves like any other field. In JSONL, each complete object must end with `\n`, including the last one in the file.
+Most `_`-prefixed fields are treated as enrichment or deployment context and behave like any other field. In JSONL, each complete object must end with `\n`, including the last one in the file.
 
 ```jsonl
 {"_timestamp":1739952000123,"_env":"prod","_service":"auth","_region":"us-east-1","event":"login","user_id":42}
@@ -136,6 +136,11 @@ Any `_`-prefixed field beyond `_timestamp` is treated as enrichment or deploymen
 - Field values are tracked for uniqueness scoring. If `_env` is almost always `"prod"` in the baseline and a period produces `_env: "staging"`, the anomaly score rises.
 
 Tagging events with `_service`, `_region`, or `_datacenter` gives the anomaly engine more signal without polluting your application fields.
+
+Two `_`-prefixed fields are special-cased and control behaviour rather than acting as plain enrichment:
+
+- **`_timestamp`** — event time, as documented above.
+- **`_type`** *(optional)* — overrides the structural type fingerprint for the event. When present, the event is grouped, filtered, and scored under the given `_type` value instead of the hash derived from its shape. Must be a non-empty string when present; numbers, booleans, null, arrays, objects, and empty/whitespace strings are rejected at ingest. Mixing events that supply `_type` with events that don't is fine — each event is classified independently. When two events share the same `_type` but have different shapes, they merge into one type profile, and the Types view's path list is the union of paths observed across all those shapes. Type renames (`r`) work the same for `_type`-overridden types as for structural ones.
 
 ---
 
@@ -151,7 +156,7 @@ Rename unfamiliar types with `r` to give them human-readable labels — these pe
 
 When something of interest happens — a deployment, a user action, an incident — press **`m`** to open an action period. Press **`m`** again to close it. Label it with **`n`** before closing if you want a name on the period.
 
-This is only available in live mode. Offline analysis, including `--directory`, does not support opening or closing action periods.
+This is only available in live mode. Offline analysis does not support opening or closing action periods.
 
 Events inside the period are scored against the baseline:
 - **Rate anomaly** — is this event type arriving faster or slower than normal?
@@ -259,13 +264,12 @@ In the source terminal, press `l` (login), `p` (purchase), `s` (search), `c`/`t`
 ## CLI reference
 
 ```
-json_analyzer [<path>] [--jsonl <path>] [--directory <path>] [--baseline <path>]
+json_analyzer [<path>] [--jsonl <path>] [--baseline <path>]
               [--import <path>] [--profile <path>] [--whitelist <path>]
               [--offline] [--reset] [--debug-status] [--control-http <addr>]
 
   <path> / --jsonl    path to input JSONL file (live, tailed)
-  --directory         path to a directory of JSON/JSONL files (offline only)
-  --baseline          pre-load known-good events from a file or directory
+  --baseline          pre-load known-good events from a file
   --import            open a previously exported session snapshot
   --profile           apply a source profile on startup
   --whitelist         load whitelist terms from a file (one per line)
@@ -275,7 +279,7 @@ json_analyzer [<path>] [--jsonl <path>] [--directory <path>] [--baseline <path>]
   --control-http      optional control API bind address (e.g. 127.0.0.1:8080)
 ```
 
-If your events are spread across many files, use `--directory`. Files are read in parallel and sorted by `_timestamp` before ingestion. Directory mode is offline-only — it reads the files once and does not tail for new additions. It is slower and less reliable than a single JSONL file, as ordering depends entirely on `_timestamp` being present and correct. Where you have control over the source, prefer writing to a single append-only JSONL file with monotonically increasing `_timestamp` values.
+All input paths (`<path>`, `--jsonl`, `--baseline`, `--import`, `--profile`, `--whitelist`) are checked for existence at startup; a missing file aborts with a message naming the flag.
 
 ---
 

@@ -1,10 +1,11 @@
 use crate::browser::{JsonFocusNav, JsonFocusState};
 use crate::control_http::{ControlCommand, ControlReply};
 use crate::domain::{
-    clear_positive_type_filters, collect_indexed_paths, normalize_path, prepare_event,
-    rename_type_terms_in_filter, replace_positive_type_filters, toggle_negated_type_in_filter,
-    type_is_negated_in_filter, value_at_path, value_token, values_at_path, ActionPeriod,
-    AnalyzerModel, DataFilters, EventRecord, FilterField, PreparedEvent,
+    clear_positive_type_filters, collect_indexed_paths, default_type_label, normalize_path,
+    prepare_event, rename_type_terms_in_filter, replace_positive_type_filters,
+    toggle_negated_type_in_filter, type_is_negated_in_filter, value_at_path, value_token,
+    values_at_path, ActionPeriod, AnalyzerModel, DataFilters, EventRecord, FilterField,
+    PreparedEvent,
 };
 use crate::io::StreamReader;
 use crate::persistence::{
@@ -28,7 +29,7 @@ use ratatui::Terminal;
 use rayon::prelude::*;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, HashSet as StdHashSet};
+use std::collections::{HashMap, HashSet, HashSet as StdHashSet};
 use std::env;
 use std::fs;
 use std::io::stdout;
@@ -168,6 +169,7 @@ pub struct App {
     type_preview_open: bool,
     pub triaged_event_indices: HashSet<usize>,
     state_dirty: bool,
+    collapsed_paths: HashMap<String, HashSet<String>>,
 }
 
 impl App {
@@ -274,6 +276,7 @@ impl App {
             type_preview_open: false,
             triaged_event_indices: HashSet::new(),
             state_dirty: false,
+            collapsed_paths: HashMap::new(),
         };
         if !reset_state {
             app.restore_persisted_state();
@@ -713,6 +716,7 @@ impl App {
         self.model = AnalyzerModel::new();
         self.baseline_events.clear();
         for ev in &baseline_events {
+            validate_type_field(&ev.obj)?;
             let prepared = prepare_event(ev.obj.clone());
             let obj_size = prepared.obj.to_string().len() as u32;
             self.model.ingest_baseline_prepared(&prepared, ev.ts);
@@ -729,6 +733,7 @@ impl App {
             });
         }
         for ev in &events {
+            validate_type_field(&ev.obj)?;
             self.model.ingest(ev.obj.clone(), ev.ts);
         }
 
@@ -803,6 +808,7 @@ impl App {
         let prepared_events: Vec<PreparedEvent> =
             events.into_par_iter().map(prepare_event).collect();
         for (idx, prepared) in prepared_events.into_iter().enumerate() {
+            validate_type_field(&prepared.obj)?;
             let ts = self.resolve_event_ts(&prepared.obj, batch_now, idx)?;
             if let Some(last) = self.model.events.last() {
                 if ts < last.ts - 1e-9 {
@@ -883,6 +889,7 @@ impl App {
         let prepared_events: Vec<PreparedEvent> =
             events.into_par_iter().map(prepare_event).collect();
         for (idx, prepared) in prepared_events.into_iter().enumerate() {
+            validate_type_field(&prepared.obj)?;
             let ts = match parse_event_timestamp_millis(&prepared.obj)? {
                 Some(ts) => ts,
                 None => seed_ts + (idx as f64 * 0.001),
@@ -2391,7 +2398,8 @@ impl App {
         let Some(event) = self.live_selected_event() else {
             return Vec::new();
         };
-        collect_indexed_paths(&event.obj)
+        let paths = collect_indexed_paths(&event.obj);
+        filter_paths_by_collapsed(paths, self.collapsed_paths.get(&event.type_id))
     }
 
     /// Collect unique values for `values_key` across all currently filtered events.
@@ -3478,7 +3486,7 @@ impl App {
                     return true;
                 }
                 let name = tp.name.clone().unwrap_or_default().to_lowercase();
-                let default = format!("type-{}", &type_id[..8]).to_lowercase();
+                let default = default_type_label(type_id).to_lowercase();
                 type_id.to_lowercase().contains(&query)
                     || name.contains(&query)
                     || default.contains(&query)
@@ -3563,7 +3571,8 @@ impl App {
         let Some(event) = self.selected_period_event() else {
             return Vec::new();
         };
-        collect_indexed_paths(&event.obj)
+        let paths = collect_indexed_paths(&event.obj);
+        filter_paths_by_collapsed(paths, self.collapsed_paths.get(&event.type_id))
     }
 
     pub fn selected_data_event(&self) -> Option<&EventRecord> {
@@ -3575,11 +3584,107 @@ impl App {
         let Some(event) = self.selected_data_event() else {
             return Vec::new();
         };
-        collect_indexed_paths(&event.obj)
+        let paths = collect_indexed_paths(&event.obj);
+        filter_paths_by_collapsed(paths, self.collapsed_paths.get(&event.type_id))
     }
 
     pub fn baseline_tab_enabled(&self) -> bool {
         self.baseline_tab_enabled
+    }
+
+    pub fn collapsed_paths_for_type(&self, type_id: &str) -> Option<&HashSet<String>> {
+        self.collapsed_paths.get(type_id)
+    }
+
+    fn toggle_collapse(&mut self, type_id: &str, path: &str, container: bool) {
+        if path.is_empty() || !container {
+            return;
+        }
+        let set = self
+            .collapsed_paths
+            .entry(type_id.to_string())
+            .or_default();
+        if !set.insert(path.to_string()) {
+            set.remove(path);
+            if set.is_empty() {
+                self.collapsed_paths.remove(type_id);
+            }
+        }
+    }
+
+    fn toggle_collapse_live(&mut self) {
+        let Some(event) = self.live_selected_event() else {
+            return;
+        };
+        let type_id = event.type_id.clone();
+        let paths = collect_indexed_paths(&event.obj);
+        let visible =
+            filter_paths_by_collapsed(paths.clone(), self.collapsed_paths.get(&type_id));
+        let Some(path) = visible.get(self.live_key_index).cloned() else {
+            return;
+        };
+        let container = path_value_is_container(&event.obj, &path);
+        self.toggle_collapse(&type_id, &path, container);
+        if container {
+            self.reanchor_live_key_index(&path);
+        }
+    }
+
+    fn toggle_collapse_period(&mut self) {
+        let Some(event) = self.selected_period_event() else {
+            return;
+        };
+        let type_id = event.type_id.clone();
+        let paths = collect_indexed_paths(&event.obj);
+        let visible =
+            filter_paths_by_collapsed(paths.clone(), self.collapsed_paths.get(&type_id));
+        let Some(path) = visible.get(self.period_json_key_index).cloned() else {
+            return;
+        };
+        let container = path_value_is_container(&event.obj, &path);
+        self.toggle_collapse(&type_id, &path, container);
+        if container {
+            self.reanchor_period_key_index(&path);
+        }
+    }
+
+    fn toggle_collapse_data(&mut self) {
+        let Some(event) = self.selected_data_event() else {
+            return;
+        };
+        let type_id = event.type_id.clone();
+        let paths = collect_indexed_paths(&event.obj);
+        let visible =
+            filter_paths_by_collapsed(paths.clone(), self.collapsed_paths.get(&type_id));
+        let Some(path) = visible.get(self.data_key_index).cloned() else {
+            return;
+        };
+        let container = path_value_is_container(&event.obj, &path);
+        self.toggle_collapse(&type_id, &path, container);
+        if container {
+            self.reanchor_data_key_index(&path);
+        }
+    }
+
+    fn reanchor_live_key_index(&mut self, path: &str) {
+        let paths = self.live_selected_key_paths();
+        if let Some(idx) = paths.iter().position(|p| p == path) {
+            self.live_key_index = idx;
+        }
+    }
+
+    fn reanchor_period_key_index(&mut self, path: &str) {
+        let paths = self.period_selected_key_paths();
+        if let Some(idx) = paths.iter().position(|p| p == path) {
+            self.period_json_key_index = idx;
+        }
+    }
+
+    fn reanchor_data_key_index(&mut self, path: &str) {
+        let paths = self.data_selected_key_paths();
+        if let Some(idx) = paths.iter().position(|p| p == path) {
+            self.data_key_index = idx;
+        }
     }
 
     pub fn type_excluded_by_type_filter(&self, type_id: &str) -> bool {
@@ -4096,6 +4201,19 @@ fn supports_unicode_blocks() -> bool {
     false
 }
 
+fn validate_type_field(obj: &Value) -> Result<()> {
+    let Some(raw) = obj.get("_type") else {
+        return Ok(());
+    };
+    match raw {
+        Value::String(s) if !s.trim().is_empty() => Ok(()),
+        Value::String(_) => {
+            bail!("Unsupported input: `_type` must be a non-empty string when present.")
+        }
+        _ => bail!("Unsupported input: `_type` must be a string when present."),
+    }
+}
+
 fn parse_event_timestamp_millis(obj: &Value) -> Result<Option<f64>> {
     let Some(raw) = obj.get("_timestamp") else {
         return Ok(None);
@@ -4201,11 +4319,50 @@ fn is_scalar_array_item_path(path: &str) -> bool {
     path.ends_with(']')
 }
 
+fn filter_paths_by_collapsed(
+    paths: Vec<String>,
+    collapsed: Option<&HashSet<String>>,
+) -> Vec<String> {
+    let Some(collapsed) = collapsed else {
+        return paths;
+    };
+    if collapsed.is_empty() {
+        return paths;
+    }
+    paths
+        .into_iter()
+        .filter(|p| !has_collapsed_ancestor(p, collapsed))
+        .collect()
+}
+
+fn has_collapsed_ancestor(path: &str, collapsed: &HashSet<String>) -> bool {
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'.' || c == b'[' {
+            if collapsed.contains(&path[..i]) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn path_value_is_container(root: &Value, path: &str) -> bool {
+    use crate::domain::value_at_path;
+    match value_at_path(root, path) {
+        Some(Value::Object(_)) | Some(Value::Array(_)) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_navigation_code, parse_event_timestamp_millis, App, NavIntent, PeriodsFocus,
-        UiMode, MENU_PAGE_STEP,
+        normalize_navigation_code, parse_event_timestamp_millis, validate_type_field, App,
+        NavIntent, PeriodsFocus, UiMode, MENU_PAGE_STEP,
     };
     use crate::domain::prepare_event;
     use crate::persistence::{SessionEvent, SessionExport, SourceProfile};
@@ -4269,6 +4426,30 @@ mod tests {
         assert!(parse_event_timestamp_millis(&json!({"_timestamp": 999_999_999_999i64})).is_err());
         assert!(parse_event_timestamp_millis(&json!({"_timestamp": 1.5f64})).is_err());
         assert!(parse_event_timestamp_millis(&json!({"_timestamp": "1739952000123"})).is_err());
+    }
+
+    #[test]
+    fn validate_type_field_accepts_missing_and_string() {
+        assert!(validate_type_field(&json!({"x": 1})).is_ok());
+        assert!(validate_type_field(&json!({"_type": "login", "x": 1})).is_ok());
+    }
+
+    #[test]
+    fn validate_type_field_rejects_non_string_and_empty() {
+        for bad in [
+            json!({"_type": 42}),
+            json!({"_type": true}),
+            json!({"_type": null}),
+            json!({"_type": ["a"]}),
+            json!({"_type": {}}),
+            json!({"_type": ""}),
+            json!({"_type": "   "}),
+        ] {
+            assert!(
+                validate_type_field(&bad).is_err(),
+                "expected error for {bad}"
+            );
+        }
     }
 
     #[test]

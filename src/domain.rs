@@ -947,7 +947,10 @@ impl AnalyzerModel {
     }
 }
 
-fn default_type_label(type_id: &str) -> String {
+pub fn default_type_label(type_id: &str) -> String {
+    if let Some(rest) = type_id.strip_prefix(TYPE_OVERRIDE_PREFIX) {
+        return rest.to_string();
+    }
     format!("type-{}", &type_id[..type_id.len().min(8)])
 }
 
@@ -1121,15 +1124,13 @@ fn collect_scalar_paths(v: &Value, path: &str, out: &mut Vec<(String, String)>) 
 }
 
 pub fn classify_event(obj: &Value) -> (String, Vec<String>) {
-    let shape = extract_shape(obj);
-    let type_id = structural_hash(&shape);
+    let type_id = type_id_for(obj);
     let keys = collect_all_paths(obj);
     (type_id, keys)
 }
 
 pub fn prepare_event(obj: Value) -> PreparedEvent {
-    let shape = extract_shape(&obj);
-    let type_id = structural_hash(&shape);
+    let type_id = type_id_for(&obj);
     let keys = collect_all_paths(&obj);
     let mut scalar_paths = Vec::new();
     collect_scalar_paths(&obj, "", &mut scalar_paths);
@@ -1139,6 +1140,25 @@ pub fn prepare_event(obj: Value) -> PreparedEvent {
         keys,
         scalar_paths,
     }
+}
+
+const TYPE_OVERRIDE_PREFIX: &str = "t:";
+
+fn type_id_for(obj: &Value) -> String {
+    if let Some(name) = type_field_value(obj) {
+        return format!("{}{}", TYPE_OVERRIDE_PREFIX, name);
+    }
+    let shape = extract_shape(obj);
+    structural_hash(&shape)
+}
+
+/// Returns the `_type` override value when it is a non-empty trimmed string.
+/// Non-string / empty values fall through to structural classification; the
+/// strict validation that rejects those lives in the ingest pipeline.
+pub fn type_field_value(obj: &Value) -> Option<String> {
+    let raw = obj.get("_type")?.as_str()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 pub fn value_token(v: &Value) -> String {
@@ -1181,17 +1201,23 @@ pub fn toggle_negated_type_in_filter(filter: &str, canonical_name: &str) -> Stri
             group.retain(|term| !(term.negated && term.value.to_lowercase() == needle));
         }
         expr.groups.retain(|group| !group.is_empty());
-    } else if expr.groups.is_empty() {
-        expr.groups.push(vec![FilterTerm {
-            negated: true,
-            value: canonical.to_string(),
-        }]);
     } else {
         for group in &mut expr.groups {
-            group.push(FilterTerm {
+            group.retain(|term| !(!term.negated && term.value.to_lowercase() == needle));
+        }
+        expr.groups.retain(|group| !group.is_empty());
+        if expr.groups.is_empty() {
+            expr.groups.push(vec![FilterTerm {
                 negated: true,
                 value: canonical.to_string(),
-            });
+            }]);
+        } else {
+            for group in &mut expr.groups {
+                group.push(FilterTerm {
+                    negated: true,
+                    value: canonical.to_string(),
+                });
+            }
         }
     }
     format_filter_expr(&expr)
@@ -1199,8 +1225,10 @@ pub fn toggle_negated_type_in_filter(filter: &str, canonical_name: &str) -> Stri
 
 pub fn replace_positive_type_filters(filter: &str, canonical_name: &str) -> String {
     let canonical = canonical_name.trim();
+    let needle = canonical.to_lowercase();
     let mut terms = common_negated_type_terms(filter);
     if !canonical.is_empty() {
+        terms.retain(|term| term.value.to_lowercase() != needle);
         terms.push(FilterTerm {
             negated: false,
             value: canonical.to_string(),
@@ -2007,5 +2035,82 @@ mod tests {
 
         let cleared = clear_positive_type_filters(&filter);
         assert_eq!(cleared, "!Noise");
+    }
+
+    #[test]
+    fn applying_t_strips_matching_negation_for_same_type() {
+        let filter = replace_positive_type_filters("!login", "login");
+        assert_eq!(filter, "login");
+        assert!(!type_is_negated_in_filter(&filter, "login"));
+    }
+
+    #[test]
+    fn applying_t_preserves_unrelated_negations_for_same_type() {
+        let filter = replace_positive_type_filters("!login && !other", "login");
+        assert_eq!(filter, "!other && login");
+        assert!(!type_is_negated_in_filter(&filter, "login"));
+    }
+
+    #[test]
+    fn applying_u_strips_matching_positive_for_same_type() {
+        let filter = toggle_negated_type_in_filter("login", "login");
+        assert_eq!(filter, "!login");
+        assert!(type_is_negated_in_filter(&filter, "login"));
+    }
+
+    #[test]
+    fn applying_u_strips_positive_alongside_unrelated_term() {
+        let filter = toggle_negated_type_in_filter("foo && login", "login");
+        assert_eq!(filter, "foo && !login");
+        assert!(type_is_negated_in_filter(&filter, "login"));
+    }
+
+    #[test]
+    fn applying_u_strips_positive_across_or_groups() {
+        let filter = toggle_negated_type_in_filter("foo || login", "login");
+        assert_eq!(filter, "foo && !login");
+        assert!(type_is_negated_in_filter(&filter, "login"));
+    }
+
+    #[test]
+    fn type_field_overrides_structural_hash() {
+        let a = prepare_event(json!({"_type": "login", "user": "alice"}));
+        let b = prepare_event(json!({"_type": "login", "user": "bob", "extra": 1}));
+        let c = prepare_event(json!({"_type": "logout", "user": "alice"}));
+        assert_eq!(a.type_id, "t:login");
+        assert_eq!(b.type_id, "t:login");
+        assert_eq!(c.type_id, "t:logout");
+        assert_ne!(a.type_id, c.type_id);
+    }
+
+    #[test]
+    fn type_field_label_renders_without_type_prefix() {
+        assert_eq!(default_type_label("t:login"), "login");
+        assert_eq!(default_type_label("abcdef012345"), "type-abcdef01");
+    }
+
+    #[test]
+    fn type_field_overridden_event_can_be_renamed() {
+        let mut model = AnalyzerModel::new();
+        model.ingest(json!({"_type": "login", "user": "a"}), 1.0);
+        model.rename_type("t:login", "User Login".to_string());
+        assert_eq!(model.canonical_type_name("t:login"), "User Login");
+        assert_eq!(model.type_display_name("t:login"), "User Login (login)");
+    }
+
+    #[test]
+    fn type_field_non_string_falls_back_to_shape_in_prepare() {
+        // prepare_event itself is silent on bad _type; strict validation lives
+        // in the ingest pipeline. Here, the override is simply ignored.
+        let p = prepare_event(json!({"_type": 42, "k": 1}));
+        assert!(!p.type_id.starts_with("t:"));
+    }
+
+    #[test]
+    fn type_field_empty_or_whitespace_falls_back_to_shape() {
+        let a = prepare_event(json!({"_type": "", "k": 1}));
+        let b = prepare_event(json!({"_type": "   ", "k": 1}));
+        assert!(!a.type_id.starts_with("t:"));
+        assert!(!b.type_id.starts_with("t:"));
     }
 }

@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use argh::FromArgs;
 use json_analyzer::app::App;
 
@@ -8,7 +8,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use json_analyzer::control_http::spawn_control_http_server;
 use json_analyzer::persistence::{import_session, load_profile};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 /// Analyze a JSONL stream in the terminal UI.
@@ -62,6 +62,24 @@ struct Args {
 fn main() -> Result<()> {
     let args: Args = argh::from_env();
     let control_http = args.control_http.clone();
+    if let Some(path) = args.path.as_ref() {
+        ensure_input_path("<path>", path)?;
+    }
+    if let Some(path) = args.jsonl.as_ref() {
+        ensure_input_path("--jsonl", path)?;
+    }
+    if let Some(path) = args.baseline.as_ref() {
+        ensure_input_path("--baseline", path)?;
+    }
+    if let Some(path) = args.import.as_ref() {
+        ensure_input_path("--import", path)?;
+    }
+    if let Some(path) = args.profile.as_ref() {
+        ensure_input_path("--profile", path)?;
+    }
+    if let Some(path) = args.whitelist.as_ref() {
+        ensure_input_path("--whitelist", path)?;
+    }
     if let Some(import_path) = args.import.as_ref() {
         if args.path.is_some() || args.jsonl.is_some() {
             bail!("--import cannot be combined with <path> or --jsonl");
@@ -137,8 +155,16 @@ fn main() -> Result<()> {
     app.run()
 }
 
+fn ensure_input_path(flag: &str, path: &Path) -> Result<()> {
+    if !path.exists() {
+        bail!("{} path does not exist: {}", flag, path.display());
+    }
+    Ok(())
+}
+
 fn read_whitelist_terms(path: &PathBuf) -> Result<Vec<String>> {
-    let body = fs::read_to_string(path)?;
+    let body = fs::read_to_string(path)
+        .with_context(|| format!("failed to read --whitelist {}", path.display()))?;
     Ok(body
         .lines()
         .map(|line| line.trim().to_string())
