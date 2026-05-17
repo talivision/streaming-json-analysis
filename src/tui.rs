@@ -5,6 +5,7 @@ use crate::domain::{
 use crate::persistence::RestoredState;
 use indexmap::IndexMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use std::collections::HashSet;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
@@ -780,6 +781,8 @@ fn selected_json_title(is_key_focus: bool, value_focus: bool, pane_width: u16) -
             Span::raw(" value, "),
             styled_hotkey("v"),
             Span::raw(" browse, "),
+            styled_hotkey("f"),
+            Span::raw(" fold, "),
             styled_hotkey("t"),
             Span::raw(" type)"),
         ]);
@@ -792,6 +795,8 @@ fn selected_json_title(is_key_focus: bool, value_focus: bool, pane_width: u16) -
         Span::raw(" value, "),
         styled_hotkey("v"),
         Span::raw(" browse values, "),
+        styled_hotkey("f"),
+        Span::raw(" fold, "),
         styled_hotkey("t"),
         Span::raw(" jump type)"),
     ])
@@ -1570,7 +1575,7 @@ fn draw_full_help(frame: &mut Frame<'_>, app: &App) {
         Line::from("  left returns from key selection to event list"),
         Line::from("  Home/End jump to top/bottom"),
         Line::from("  PageUp/PageDown move viewport and cursor (Ctrl+U / Ctrl+D also)"),
-        Line::from("  with key focus: up/down select key, k apply key filter, t jump to type"),
+        Line::from("  with key focus: up/down select key, k apply key filter, t jump to type, f fold/unfold object or array"),
         Line::from("  k/t///z/e/y/w filters | c clear | filter syntax: && || ! | e.g. type 'login && !debug'"),
         Line::from(""),
         Line::from("Periods"),
@@ -1578,6 +1583,7 @@ fn draw_full_help(frame: &mut Frame<'_>, app: &App) {
         Line::from("  enter/right move focus right, left move focus left"),
         Line::from("  up/down choose row in active pane"),
         Line::from("  with periods focus: i insert start-end, e edit selected, d delete selected (asks confirm)"),
+        Line::from("  with json focus: f fold/unfold selected object or array"),
         Line::from(""),
         Line::from("Types"),
         Line::from("  / filter types by id or name"),
@@ -1592,7 +1598,7 @@ fn draw_full_help(frame: &mut Frame<'_>, app: &App) {
         Line::from("Baseline"),
         Line::from("  up/down scroll events"),
         Line::from("  right or enter focus key selection in selected-object pane"),
-        Line::from("  with key focus: up/down select key, k apply key filter, t jump to type"),
+        Line::from("  with key focus: up/down select key, k apply key filter, t jump to type, f fold/unfold object or array"),
         Line::from("  with value focus: e apply exact path=value filter"),
     ];
     frame.render_widget(
@@ -1627,6 +1633,7 @@ fn draw_type_preview_modal(frame: &mut Frame<'_>, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
+        let collapsed_paths = app.collapsed_paths_for_type(type_id);
         let rendered = render_json_keypicker(
             &sample,
             None,
@@ -1636,6 +1643,7 @@ fn draw_type_preview_modal(frame: &mut Frame<'_>, app: &App) {
             "",
             &[],
             None,
+            collapsed_paths,
             app.escape_strings,
         );
         lines.extend(rendered.lines);
@@ -1663,6 +1671,7 @@ fn render_json_keypicker(
     substring_filter: &str,
     whitelist_terms: &[String],
     considered_paths: Option<&IndexMap<String, bool>>,
+    collapsed_paths: Option<&HashSet<String>>,
     escape_strings: bool,
 ) -> JsonRender {
     let mut lines = Vec::new();
@@ -1678,6 +1687,7 @@ fn render_json_keypicker(
         substring_filter,
         whitelist_terms,
         considered_paths,
+        collapsed_paths,
         &mut lines,
         &mut selected_line,
         escape_strings,
@@ -1763,6 +1773,7 @@ fn build_event_preview(
     } else {
         &[]
     };
+    let collapsed_paths = app.collapsed_paths_for_type(&event.type_id);
     let rendered = render_json_keypicker(
         &event.obj,
         selected_path,
@@ -1772,6 +1783,7 @@ fn build_event_preview(
         &sub_lc,
         whitelist_terms,
         considered_paths,
+        collapsed_paths,
         app.escape_strings,
     );
     let preview_prefix_lines = lines.len();
@@ -1794,6 +1806,7 @@ fn render_json_value_lines(
     substring_filter: &str,
     whitelist_terms: &[String],
     considered_paths: Option<&IndexMap<String, bool>>,
+    collapsed_paths: Option<&HashSet<String>>,
     out: &mut Vec<Line<'static>>,
     selected_line: &mut Option<usize>,
     escape_strings: bool,
@@ -1821,6 +1834,7 @@ fn render_json_value_lines(
                     substring_filter,
                     whitelist_terms,
                     considered_paths,
+                    collapsed_paths,
                     out,
                     selected_line,
                     escape_strings,
@@ -1846,6 +1860,7 @@ fn render_json_value_lines(
                     substring_filter,
                     whitelist_terms,
                     considered_paths,
+                    collapsed_paths,
                     out,
                     selected_line,
                     escape_strings,
@@ -1897,6 +1912,33 @@ fn push_open_bracket(
             json_punctuation_style()
         },
     ));
+    out.push(Line::from(prefix));
+}
+
+fn push_collapsed_placeholder(
+    mut prefix: Vec<Span<'static>>,
+    placeholder: &str,
+    is_last: bool,
+    sel_or_filt: bool,
+    punctuation_override: Style,
+    normalized_out: bool,
+    out: &mut Vec<Line<'static>>,
+) {
+    let style = if sel_or_filt {
+        punctuation_override
+    } else {
+        apply_normalized_out_style(
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            normalized_out,
+        )
+    };
+    prefix.push(Span::styled(placeholder.to_string(), style));
+    if !is_last {
+        prefix.push(Span::styled(
+            ",",
+            apply_normalized_out_style(json_punctuation_style(), normalized_out),
+        ));
+    }
     out.push(Line::from(prefix));
 }
 
@@ -1997,6 +2039,7 @@ fn render_json_keyed_value_line(
     substring_filter: &str,
     whitelist_terms: &[String],
     considered_paths: Option<&IndexMap<String, bool>>,
+    collapsed_paths: Option<&HashSet<String>>,
     out: &mut Vec<Line<'static>>,
     selected_line: &mut Option<usize>,
     escape_strings: bool,
@@ -2062,7 +2105,39 @@ fn render_json_keyed_value_line(
     }
 
     let sel_or_filt = selected || filtered;
+    let is_collapsed = !path.is_empty()
+        && collapsed_paths
+            .map(|set| set.contains(path))
+            .unwrap_or(false);
     match value {
+        serde_json::Value::Object(map) if is_collapsed => {
+            if selected && selected_line.is_none() {
+                *selected_line = Some(out.len());
+            }
+            push_collapsed_placeholder(
+                prefix,
+                &format!("{{\u{2026}{}}}", map.len()),
+                is_last,
+                sel_or_filt,
+                punctuation_override,
+                normalized_out,
+                out,
+            );
+        }
+        serde_json::Value::Array(arr) if is_collapsed => {
+            if selected && selected_line.is_none() {
+                *selected_line = Some(out.len());
+            }
+            push_collapsed_placeholder(
+                prefix,
+                &format!("[\u{2026}{}]", arr.len()),
+                is_last,
+                sel_or_filt,
+                punctuation_override,
+                normalized_out,
+                out,
+            );
+        }
         serde_json::Value::Object(map) => {
             if selected && selected_line.is_none() {
                 *selected_line = Some(out.len());
@@ -2083,6 +2158,7 @@ fn render_json_keyed_value_line(
                     substring_filter,
                     whitelist_terms,
                     considered_paths,
+                    collapsed_paths,
                     out,
                     selected_line,
                     escape_strings,
@@ -2109,6 +2185,7 @@ fn render_json_keyed_value_line(
                     substring_filter,
                     whitelist_terms,
                     considered_paths,
+                    collapsed_paths,
                     out,
                     selected_line,
                     escape_strings,
@@ -2640,6 +2717,7 @@ mod tests {
             "",
             &[],
             None,
+            None,
             false,
         );
         assert_eq!(rendered.selected_line, Some(6));
@@ -2658,6 +2736,7 @@ mod tests {
             "",
             "",
             &[],
+            None,
             None,
             false,
         );
@@ -2697,6 +2776,7 @@ mod tests {
             "",
             "",
             &[],
+            None,
             None,
             false,
         );

@@ -1606,6 +1606,17 @@ impl App {
                 }
             }
 
+            KeyCode::Char('f') if self.mode == UiMode::Live && self.live_key_focus => {
+                self.toggle_collapse_live();
+            }
+            KeyCode::Char('f')
+                if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Json =>
+            {
+                self.toggle_collapse_period();
+            }
+            KeyCode::Char('f') if self.mode == UiMode::Data && self.data_key_focus => {
+                self.toggle_collapse_data();
+            }
             KeyCode::Char('f') if self.mode == UiMode::Live => {
                 if self.live_key_focus {
                     self.status =
@@ -4692,10 +4703,10 @@ fn has_collapsed_ancestor(path: &str, collapsed: &HashSet<String>) -> bool {
 
 fn path_value_is_container(root: &Value, path: &str) -> bool {
     use crate::domain::value_at_path;
-    match value_at_path(root, path) {
-        Some(Value::Object(_)) | Some(Value::Array(_)) => true,
-        _ => false,
-    }
+    matches!(
+        value_at_path(root, path),
+        Some(Value::Object(_)) | Some(Value::Array(_))
+    )
 }
 
 #[cfg(test)]
