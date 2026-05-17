@@ -5,7 +5,7 @@ use crate::domain::{
     default_type_label_pub, expand_merged_label_in_filter, normalize_path, prepare_event,
     rename_type_terms_in_filter, replace_positive_type_filters, toggle_negated_type_in_filter,
     type_is_negated_in_filter, value_at_path, value_token, values_at_path, ActionPeriod,
-    AnalyzerModel, DataFilters, EventRecord, FilterField, PreparedEvent,
+    AnalyzerModel, DataFilters, EventRecord, FilterField, MergeGroup, PreparedEvent,
 };
 use crate::io::StreamReader;
 use crate::persistence::{
@@ -629,7 +629,12 @@ impl App {
         self.profile_normalized_field_overrides = profile.normalized_field_overrides.clone();
         self.apply_profile_overrides_to_types();
         self.add_whitelist_terms(profile.whitelist_terms);
+        // Apply filters BEFORE merge groups so the filter-rewrite step has the
+        // profile's filter terms to operate on.
         self.apply_profile_filters(profile.negative_filters);
+        if self.apply_profile_merge_groups(&profile.merge_groups) {
+            self.pending_live_recompute = true;
+        }
     }
 
     fn apply_profile_forced(&mut self, profile: SourceProfile) {
@@ -639,7 +644,7 @@ impl App {
             normalized_field_overrides,
             negative_filters,
             whitelist_terms,
-            merge_groups: _,
+            merge_groups,
         } = profile;
         self.profile_renames = renames.clone();
         self.profile_known_unrelated_types = known_unrelated_types.clone();
@@ -667,8 +672,73 @@ impl App {
         self.stashed_live_visible_indices = None;
         self.stashed_baseline_visible_indices = None;
         self.event_filters = negative_filters;
+        let applied_merges = self.apply_profile_merge_groups(&merge_groups);
         self.mark_live_cache_dirty();
         self.refresh_live_position();
+        if applied_merges {
+            self.pending_live_recompute = true;
+        }
+    }
+
+    /// Apply merge groups carried by an imported profile to the current model.
+    /// Unlike the restore path (which uses `apply_merge_groups` before any
+    /// ingest so the alias hook redirects incoming events), profile-import
+    /// happens after the live/baseline events have already populated stats, so
+    /// we use `merge_types` which correctly folds each member's existing
+    /// TypeProfile into the merged group.
+    ///
+    /// Returns true if at least one group was successfully applied. Caller is
+    /// responsible for triggering `pending_live_recompute`.
+    fn apply_profile_merge_groups(&mut self, groups: &[MergeGroup]) -> bool {
+        if groups.is_empty() {
+            return false;
+        }
+        let mut any_applied = false;
+        for group in groups {
+            // Snapshot member display names BEFORE the merge mutates types — we
+            // need them to rewrite the type filter the same way an interactive
+            // merge does. `merge_types` already filters to present, non-grouped
+            // members internally and returns None if fewer than 2 remain, so we
+            // pre-collect names only for the members that are about to land.
+            let prior_names: Vec<String> = group
+                .members
+                .iter()
+                .filter(|m| self.model.types.contains_key(m.as_str()))
+                .map(|m| self.model.canonical_type_name(m))
+                .collect();
+            let cleaned_label = group.label.trim().to_string();
+            if self
+                .model
+                .merge_types(&group.members, cleaned_label.clone())
+                .is_none()
+            {
+                // Either fewer than 2 members present in the current model, or
+                // members already belong to a group locally. Skip without
+                // mutating anything — this is the documented "safely a no-op"
+                // path for re-applying the same profile.
+                continue;
+            }
+            any_applied = true;
+            for prior in &prior_names {
+                self.event_filters.type_filter = rename_type_terms_in_filter(
+                    &self.event_filters.type_filter,
+                    prior,
+                    &cleaned_label,
+                );
+                if let Some(stashed) = self.stashed_event_filters.as_mut() {
+                    stashed.type_filter =
+                        rename_type_terms_in_filter(&stashed.type_filter, prior, &cleaned_label);
+                }
+            }
+        }
+        if any_applied {
+            self.event_filters.type_filter = dedupe_filter_terms(&self.event_filters.type_filter);
+            if let Some(stashed) = self.stashed_event_filters.as_mut() {
+                stashed.type_filter = dedupe_filter_terms(&stashed.type_filter);
+            }
+            self.mark_live_cache_dirty();
+        }
+        any_applied
     }
 
     pub fn set_whitelist_terms(&mut self, terms: Vec<String>) {
@@ -5259,5 +5329,138 @@ mod tests {
         assert!(has_group, "expected a merged group in visible types");
         // Selection cleared.
         assert!(app.selected_type_ids.is_empty());
+    }
+
+    /// Helper: ingest two distinct shapes into a fresh app and return their
+    /// (login, logout) structural type ids.
+    fn seed_two_types(app: &mut App) -> (String, String) {
+        for _ in 0..3 {
+            app.model
+                .ingest(json!({"event": "login", "user": "a"}), 1.0);
+        }
+        for _ in 0..2 {
+            app.model
+                .ingest(json!({"event": "logout", "session": "z"}), 2.0);
+        }
+        let login_id = app
+            .model
+            .events
+            .iter()
+            .find(|e| e.obj.get("user").is_some())
+            .map(|e| e.type_id.clone())
+            .expect("login event");
+        let logout_id = app
+            .model
+            .events
+            .iter()
+            .find(|e| e.obj.get("session").is_some())
+            .map(|e| e.type_id.clone())
+            .expect("logout event");
+        (login_id, logout_id)
+    }
+
+    #[test]
+    fn profile_import_applies_saved_merge_groups() {
+        // Build a model with two ingested types and assemble a profile whose
+        // merge_groups list joins them. Importing that profile should produce
+        // the merged group in `model.merge_groups` and a corresponding entry
+        // in `model.types`.
+        let mut app = test_app();
+        let (login_id, logout_id) = seed_two_types(&mut app);
+        let members = vec![login_id.clone(), logout_id.clone()];
+        let mut sorted_members = members.clone();
+        sorted_members.sort();
+        let group_id = crate::domain::AnalyzerModel::compute_group_id(&sorted_members);
+        let group = crate::domain::MergeGroup {
+            group_id: group_id.clone(),
+            label: "Auth".to_string(),
+            members: sorted_members,
+            members_prior_name: vec![None, None],
+        };
+        let profile = SourceProfile {
+            renames: vec![],
+            known_unrelated_types: vec![],
+            normalized_field_overrides: vec![],
+            negative_filters: crate::domain::DataFilters::default(),
+            whitelist_terms: vec![],
+            merge_groups: vec![group],
+        };
+        app.apply_profile(profile, false);
+        assert!(app.model.merge_groups.contains_key(&group_id));
+        assert!(app.model.types.contains_key(&group_id));
+        assert!(!app.model.types.contains_key(&login_id));
+        assert!(!app.model.types.contains_key(&logout_id));
+        // Merged count == sum of member counts (3 + 2).
+        assert_eq!(app.model.types.get(&group_id).unwrap().count, 5);
+    }
+
+    #[test]
+    fn profile_import_skips_merge_with_missing_members() {
+        // Members referenced by the profile don't exist in this model's
+        // ingested types. apply_profile_merge_groups should bail without
+        // panicking and without inserting a spurious group.
+        let mut app = test_app();
+        let (login_id, _logout_id) = seed_two_types(&mut app);
+        let ghost_a = "ghost-a-doesnotexist".to_string();
+        let ghost_b = "ghost-b-doesnotexist".to_string();
+        let mut sorted_members = vec![ghost_a.clone(), ghost_b.clone()];
+        sorted_members.sort();
+        let group_id = crate::domain::AnalyzerModel::compute_group_id(&sorted_members);
+        let group = crate::domain::MergeGroup {
+            group_id: group_id.clone(),
+            label: "Phantom".to_string(),
+            members: sorted_members,
+            members_prior_name: vec![None, None],
+        };
+        let profile = SourceProfile {
+            renames: vec![],
+            known_unrelated_types: vec![],
+            normalized_field_overrides: vec![],
+            negative_filters: crate::domain::DataFilters::default(),
+            whitelist_terms: vec![],
+            merge_groups: vec![group],
+        };
+        app.apply_profile(profile, false);
+        assert!(!app.model.merge_groups.contains_key(&group_id));
+        assert!(!app.model.types.contains_key(&group_id));
+        // Original types untouched.
+        assert!(app.model.types.contains_key(&login_id));
+    }
+
+    #[test]
+    fn profile_import_rewrites_filter_to_group_label() {
+        // event_filters.type_filter references "login" (the prior canonical
+        // name of one of the merged members). After import, the filter should
+        // be rewritten to the merged label "Auth".
+        let mut app = test_app();
+        let (login_id, logout_id) = seed_two_types(&mut app);
+        // Rename one of the members so the filter rewrite has something
+        // user-recognisable to match.
+        app.model.rename_type(&login_id, "LoginEvt".to_string());
+        let prior_login_name = app.model.canonical_type_name(&login_id);
+        assert_eq!(prior_login_name, "LoginEvt");
+        let mut sorted_members = vec![login_id.clone(), logout_id.clone()];
+        sorted_members.sort();
+        let group_id = crate::domain::AnalyzerModel::compute_group_id(&sorted_members);
+        let group = crate::domain::MergeGroup {
+            group_id: group_id.clone(),
+            label: "Merged".to_string(),
+            members: sorted_members,
+            members_prior_name: vec![None, None],
+        };
+        let profile = SourceProfile {
+            renames: vec![],
+            known_unrelated_types: vec![],
+            normalized_field_overrides: vec![],
+            negative_filters: crate::domain::DataFilters {
+                type_filter: "LoginEvt".to_string(),
+                ..crate::domain::DataFilters::default()
+            },
+            whitelist_terms: vec![],
+            merge_groups: vec![group],
+        };
+        app.apply_profile(profile, false);
+        assert_eq!(app.event_filters.type_filter, "Merged");
+        assert!(app.model.merge_groups.contains_key(&group_id));
     }
 }
