@@ -36,6 +36,7 @@ pub enum InputMode {
     EditPeriodRange,
     ExportSessionPath,
     ExportProfilePath,
+    MergeTypes,
 }
 
 pub fn draw_file_changed_prompt(frame: &mut Frame<'_>, state: &RestoredState) {
@@ -856,6 +857,8 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     {
         let idx = type_start + vis_idx;
         let excluded = app.type_excluded_by_type_filter(type_id);
+        let selected_for_merge = app.is_type_selected_for_merge(type_id);
+        let is_group = app.model.merge_groups.contains_key(*type_id);
         let mut style = Style::default();
         if idx == app.type_index {
             style = if app.types_path_focus {
@@ -867,13 +870,22 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 style.fg(Color::Yellow).add_modifier(Modifier::BOLD)
             };
+        } else if selected_for_merge {
+            style = style.fg(Color::Magenta).add_modifier(Modifier::BOLD);
         } else if excluded {
             style = style.fg(Color::Gray).add_modifier(Modifier::DIM);
         }
         let name = app.model.canonical_type_name(type_id);
-        let marker = if excluded { "[-] " } else { "    " };
+        let marker = if selected_for_merge {
+            "[*] "
+        } else if excluded {
+            "[-] "
+        } else {
+            "    "
+        };
+        let group_suffix = if is_group { " [merged]" } else { "" };
         type_items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!("{}{}  count={}", marker, name, tp.count),
+            format!("{}{}{}  count={}", marker, name, group_suffix, tp.count),
             style,
         )])));
     }
@@ -1193,6 +1205,7 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
             InputMode::ExportSessionPath => "export session path (Enter to write)",
             InputMode::ExportProfilePath => "export profile path (Enter to write)",
+            InputMode::MergeTypes => "label for merged type",
         };
         let prefix = format!("{}: ", title);
         let available = inner_width.saturating_sub(prefix.chars().count());
@@ -1543,6 +1556,7 @@ fn draw_full_help(frame: &mut Frame<'_>, app: &App) {
         Line::from("  enter/right focus paths, left return to type list"),
         Line::from("  with path focus: up/down choose path, space toggle include/exclude"),
         Line::from("  u toggle selected type in negative type filter (!\"type name\")"),
+        Line::from("  s toggle selection for merge | g merge >=2 selected (or unmerge highlighted group)"),
         Line::from(""),
         Line::from("Baseline"),
         Line::from("  up/down scroll events"),

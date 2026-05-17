@@ -1,4 +1,4 @@
-use crate::domain::{ActionPeriod, DataFilters, PathOverride};
+use crate::domain::{ActionPeriod, DataFilters, MergeGroup, PathOverride};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,6 +30,8 @@ pub struct SessionExport {
     pub profile: Option<SourceProfile>,
     pub events: Vec<SessionEvent>,
     pub baseline_events: Vec<SessionEvent>,
+    #[serde(default)]
+    pub merge_groups: Vec<MergeGroup>,
 }
 
 impl SessionExport {
@@ -47,6 +49,7 @@ impl SessionExport {
             profile: None,
             events: Vec::new(),
             baseline_events: Vec::new(),
+            merge_groups: Vec::new(),
         }
     }
 }
@@ -58,6 +61,8 @@ pub struct SourceProfile {
     pub normalized_field_overrides: Vec<NormalizedFieldOverride>,
     pub negative_filters: DataFilters,
     pub whitelist_terms: Vec<String>,
+    #[serde(default)]
+    pub merge_groups: Vec<MergeGroup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +83,7 @@ pub struct RestoredState {
     pub stashed_event_filters: Option<DataFilters>,
     pub types_filter: String,
     pub triaged_events: Vec<(usize, String)>,
+    pub merge_groups: Vec<MergeGroup>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,6 +104,8 @@ struct PersistedState {
     types_filter: String,
     #[serde(default)]
     triaged_events: Vec<(usize, String)>,
+    #[serde(default)]
+    merge_groups: Vec<MergeGroup>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -156,6 +164,7 @@ pub fn load_state(stream_path: &Path) -> Result<Option<StateLoadResult>> {
                 stashed_event_filters: state.stashed_event_filters,
                 types_filter: state.types_filter,
                 triaged_events: state.triaged_events,
+                merge_groups: state.merge_groups,
             })),
         );
     }
@@ -173,6 +182,7 @@ pub fn load_state(stream_path: &Path) -> Result<Option<StateLoadResult>> {
         stashed_event_filters: state.stashed_event_filters,
         types_filter: state.types_filter,
         triaged_events: state.triaged_events,
+        merge_groups: state.merge_groups,
     };
 
     if len < state.saved_len {
@@ -212,6 +222,7 @@ pub fn invalidate_state(stream_path: &Path) -> Result<()> {
         stashed_event_filters: None,
         types_filter: String::new(),
         triaged_events: vec![],
+        merge_groups: vec![],
     };
     let payload = serde_json::to_vec(&state).context("failed to serialize invalidated state")?;
     let mut file = File::create(&state_path)
@@ -232,6 +243,7 @@ pub fn save_state(
     stashed_event_filters: Option<&DataFilters>,
     types_filter: &str,
     triaged_events: &[(usize, String)],
+    merge_groups: &[MergeGroup],
 ) -> Result<()> {
     let state_path = state_path_for_stream(stream_path)?;
     if let Some(parent) = state_path.parent() {
@@ -259,6 +271,7 @@ pub fn save_state(
         stashed_event_filters: stashed_event_filters.cloned(),
         types_filter: types_filter.to_string(),
         triaged_events: triaged_events.to_vec(),
+        merge_groups: merge_groups.to_vec(),
     };
     let payload = serde_json::to_vec(&state).context("failed to serialize persisted state")?;
 
@@ -358,4 +371,57 @@ pub fn save_profile(path: &Path, profile: &SourceProfile) -> Result<()> {
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     file.write_all(&payload)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::MergeGroup;
+    use std::env::temp_dir;
+    use std::fs;
+
+    #[test]
+    fn save_and_load_state_round_trips_merge_groups() {
+        // Use a unique stream path so XDG_STATE_HOME isolation isn't required.
+        let mut stream_path = temp_dir();
+        stream_path.push(format!("merge_persist_{}.jsonl", std::process::id()));
+        // Create an empty stream file so save_state can hash a length of 0.
+        fs::write(&stream_path, b"").expect("write stream file");
+
+        let group = MergeGroup {
+            group_id: "g:abcdef0123".to_string(),
+            label: "Auth".to_string(),
+            members: vec!["aaaaaaaaaaaa".to_string(), "bbbbbbbbbbbb".to_string()],
+            members_prior_name: vec![None, Some("LoginV1".to_string())],
+        };
+        save_state(
+            &stream_path,
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            &DataFilters::default(),
+            None,
+            "",
+            &[],
+            &[group.clone()],
+        )
+        .expect("save_state");
+
+        let loaded = load_state(&stream_path).expect("load_state").expect("some");
+        match loaded {
+            StateLoadResult::Clean(state) => {
+                assert_eq!(state.merge_groups.len(), 1);
+                assert_eq!(state.merge_groups[0].group_id, group.group_id);
+                assert_eq!(state.merge_groups[0].label, "Auth");
+                assert_eq!(state.merge_groups[0].members, group.members);
+                assert_eq!(state.merge_groups[0].members_prior_name, group.members_prior_name);
+            }
+            StateLoadResult::Changed(_) => panic!("expected clean restore"),
+        }
+
+        let _ = fs::remove_file(&stream_path);
+    }
 }
