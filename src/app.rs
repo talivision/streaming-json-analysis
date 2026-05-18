@@ -1197,7 +1197,9 @@ impl App {
             merged_renames.sort_by(|a, b| a.0.cmp(&b.0));
 
             // --- normalized field overrides ---
-            let local_key = |o: &NormalizedFieldOverride| format!("{}::{}", o.type_id, o.path);
+            // Key format must match `path_override_key` exactly, otherwise
+            // user_toggled lookups silently miss and the override is dropped.
+            let local_key = |o: &NormalizedFieldOverride| path_override_key(&o.type_id, &o.path);
             let local_by_key: std::collections::HashMap<String, NormalizedFieldOverride> = next
                 .normalized_field_overrides
                 .iter()
