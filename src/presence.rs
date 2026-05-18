@@ -38,6 +38,9 @@ struct PresenceFile {
 /// also time out heartbeats older than `PEER_STALE_AFTER_SECS`).
 pub struct PresenceHandle {
     dir: PathBuf,
+    /// SHA-256 hex of the stream path — presence files from OTHER streams
+    /// share the same `dir` and must be filtered out.
+    stream_id: String,
     self_file: PathBuf,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
@@ -55,10 +58,11 @@ impl PresenceHandle {
         };
         let now = now_secs();
         let mut by_user: HashMap<String, usize> = HashMap::new();
+        let prefix = format!("{}.presence.", self.stream_id);
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if !is_presence_filename(name) {
+            if !name.starts_with(&prefix) || !name.ends_with(".json") {
                 continue;
             }
             let Ok(bytes) = std::fs::read(entry.path()) else {
@@ -142,6 +146,7 @@ pub fn start_heartbeat(stream_path: &Path) -> Result<PresenceHandle> {
 
     Ok(PresenceHandle {
         dir: paths.dir,
+        stream_id: paths.id,
         self_file,
         stop,
         join: Some(join),
@@ -188,6 +193,7 @@ fn current_hostname() -> String {
 
 /// Matches `<id>.presence.<anything>.json`. Anything else (shared, lock,
 /// legacy local) is ignored.
+#[cfg(test)]
 fn is_presence_filename(name: &str) -> bool {
     let Some(rest) = name.strip_suffix(".json") else {
         return false;
