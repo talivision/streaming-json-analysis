@@ -12,6 +12,7 @@ use crate::persistence::{
     save_profile, state_paths_for_stream, update_shared_state, NormalizedFieldOverride,
     RestoredState, SessionEvent, SessionExport, SharedState, SourceProfile,
 };
+use crate::presence::{start_heartbeat, PresenceHandle};
 use crate::state_watcher::{spawn_shared_state_watcher, WatchMessage, WatcherHandle};
 use crate::tui::{draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
@@ -183,6 +184,7 @@ pub struct App {
     shared_dirty: bool,
     state_reload_rx: Option<Receiver<WatchMessage>>,
     _state_watcher: Option<WatcherHandle>,
+    presence: Option<PresenceHandle>,
 }
 
 impl App {
@@ -292,6 +294,7 @@ impl App {
             shared_dirty: false,
             state_reload_rx: None,
             _state_watcher: None,
+            presence: None,
         };
         // Best-effort: remove any legacy per-process state files left behind
         // by older builds. View state is no longer persisted at all.
@@ -332,6 +335,18 @@ impl App {
                 eprintln!(
                     "{WARNING_PREFIX_ORANGE} state-sync watcher disabled: {err}"
                 );
+            }
+        }
+
+        // Announce ourselves so peers know we're connected. Dropped at the
+        // end of run() via the App's own drop semantics (or earlier if
+        // start_heartbeat returns Err).
+        if self.presence.is_none() {
+            match start_heartbeat(self.reader.path()) {
+                Ok(handle) => self.presence = Some(handle),
+                Err(err) => eprintln!(
+                    "{WARNING_PREFIX_ORANGE} presence heartbeat disabled: {err}"
+                ),
             }
         }
 
@@ -3726,6 +3741,16 @@ impl App {
 
     pub fn startup_hint(&self) -> Option<&str> {
         self.startup_hint.as_deref()
+    }
+
+    /// Sorted, deduplicated usernames of operators currently connected to the
+    /// same stream (includes self). Returns an empty Vec until the presence
+    /// heartbeat is initialised in `run()`.
+    pub fn connected_operators(&self) -> Vec<String> {
+        self.presence
+            .as_ref()
+            .map(|p| p.current_peers())
+            .unwrap_or_default()
     }
 
     pub fn should_show_status_line(&self) -> bool {

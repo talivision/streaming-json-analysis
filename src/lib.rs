@@ -4,5 +4,6 @@ pub mod control_http;
 pub mod domain;
 pub mod io;
 pub mod persistence;
+pub mod presence;
 pub mod state_watcher;
 pub mod tui;

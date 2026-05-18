@@ -1046,6 +1046,14 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
 fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut text = Vec::new();
     let inner_width = area.width.saturating_sub(2) as usize;
+    // "Connected: a, b, c" — only rendered if the active status line has
+    // enough room left over after its own content + a separator.
+    let peers = app.connected_operators();
+    let connected_str = if peers.is_empty() {
+        String::new()
+    } else {
+        format!("Connected: {}", peers.join(", "))
+    };
     if app.input_mode != InputMode::None {
         let title = match app.input_mode {
             InputMode::None => "",
@@ -1071,29 +1079,46 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
         };
         let prefix = format!("{}: ", title);
         let available = inner_width.saturating_sub(prefix.chars().count());
-        text.push(Line::from(vec![
-            Span::styled(prefix, Style::default().fg(Color::Yellow)),
+        let left_spans = vec![
+            Span::styled(prefix.clone(), Style::default().fg(Color::Yellow)),
             Span::raw(truncate_left(&app.input_buffer, available)),
-        ]));
+        ];
+        let left_width = prefix.chars().count() + truncate_left(&app.input_buffer, available).chars().count();
+        text.push(Line::from(append_connected_right(
+            left_spans,
+            left_width,
+            inner_width,
+            &connected_str,
+        )));
     } else if app.should_show_status_line() && !app.status.is_empty() {
         let max_status = inner_width.saturating_sub(10).max(16);
-        text.push(Line::from(vec![
+        let value = truncate_text(&app.status, max_status);
+        let left_width = "status: ".chars().count() + value.chars().count();
+        let left_spans = vec![
             Span::styled("status: ", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                truncate_text(&app.status, max_status),
-                Style::default().fg(Color::LightGreen),
-            ),
-        ]));
+            Span::styled(value, Style::default().fg(Color::LightGreen)),
+        ];
+        text.push(Line::from(append_connected_right(
+            left_spans,
+            left_width,
+            inner_width,
+            &connected_str,
+        )));
         text.push(Line::from(""));
     } else if let Some(hint) = app.startup_hint() {
         let max_hint = inner_width.saturating_sub(8).max(16);
-        text.push(Line::from(vec![
+        let value = truncate_text(hint, max_hint);
+        let left_width = "hint: ".chars().count() + value.chars().count();
+        let left_spans = vec![
             Span::styled("hint: ", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                truncate_text(hint, max_hint),
-                Style::default().fg(Color::LightGreen),
-            ),
-        ]));
+            Span::styled(value, Style::default().fg(Color::LightGreen)),
+        ];
+        text.push(Line::from(append_connected_right(
+            left_spans,
+            left_width,
+            inner_width,
+            &connected_str,
+        )));
         text.push(Line::from(""));
     } else {
         let mut row = Vec::new();
@@ -1209,7 +1234,13 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
         row.push(Span::raw(":"));
         row.push(Span::styled(export_state, Style::default().fg(Color::Gray)));
 
-        text.push(Line::from(row));
+        let row_width: usize = row.iter().map(|s| s.content.chars().count()).sum();
+        text.push(Line::from(append_connected_right(
+            row,
+            row_width,
+            inner_width,
+            &connected_str,
+        )));
     }
     let width = area.width.saturating_sub(2) as usize;
     let displayed_filters = app.displayed_event_filters();
@@ -1335,6 +1366,36 @@ fn display_filter_budget(value: &str, budget: usize) -> String {
     } else {
         truncate_text(value, budget)
     }
+}
+
+/// Right-aligns `connected_str` (dim/grey) onto an already-built status line
+/// if there is room for it after `left_width` chars plus a 2-char separator.
+/// If the connected text would overflow, drops it entirely (no truncation
+/// — per spec, "drop, don't truncate"). Returns the spans for the full line.
+fn append_connected_right(
+    mut left_spans: Vec<Span<'static>>,
+    left_width: usize,
+    inner_width: usize,
+    connected_str: &str,
+) -> Vec<Span<'static>> {
+    if connected_str.is_empty() {
+        return left_spans;
+    }
+    let connected_width = connected_str.chars().count();
+    // 2-char gap so the right-aligned label never butts up against status.
+    let needed = left_width + 2 + connected_width;
+    if needed > inner_width {
+        return left_spans;
+    }
+    let pad = inner_width - left_width - connected_width;
+    left_spans.push(Span::raw(" ".repeat(pad)));
+    left_spans.push(Span::styled(
+        connected_str.to_string(),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    ));
+    left_spans
 }
 
 fn truncate_left(value: &str, max_chars: usize) -> String {
