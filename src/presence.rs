@@ -10,7 +10,7 @@
 use crate::persistence::{atomic_write, state_paths_for_stream};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -46,14 +46,15 @@ pub struct PresenceHandle {
 impl PresenceHandle {
     /// Scan the state directory for `<sha>.presence.*.json` files, parse each,
     /// drop entries whose `last_heartbeat_secs` is older than the staleness
-    /// window, and return the sorted, deduplicated list of usernames (including
-    /// this process's own).
-    pub fn current_peers(&self) -> Vec<String> {
+    /// window, group by username, and return `(username, count)` pairs sorted
+    /// by username. Count > 1 means the same Unix user has multiple TUI
+    /// processes connected to this stream.
+    pub fn current_peers(&self) -> Vec<(String, usize)> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };
         let now = now_secs();
-        let mut users: HashSet<String> = HashSet::new();
+        let mut by_user: HashMap<String, usize> = HashMap::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -69,10 +70,10 @@ impl PresenceHandle {
             if now.saturating_sub(file.last_heartbeat_secs) > PEER_STALE_AFTER_SECS {
                 continue;
             }
-            users.insert(file.username);
+            *by_user.entry(file.username).or_insert(0) += 1;
         }
-        let mut list: Vec<String> = users.into_iter().collect();
-        list.sort();
+        let mut list: Vec<(String, usize)> = by_user.into_iter().collect();
+        list.sort_by(|a, b| a.0.cmp(&b.0));
         list
     }
 }
@@ -259,7 +260,7 @@ mod tests {
 
         let peers = handle.current_peers();
         assert!(
-            !peers.iter().any(|u| u == "ghost"),
+            !peers.iter().any(|(u, _)| u == "ghost"),
             "stale peer should be filtered out, got {:?}",
             peers
         );

@@ -1046,13 +1046,26 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
 fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut text = Vec::new();
     let inner_width = area.width.saturating_sub(2) as usize;
-    // "Connected: a, b, c" — only rendered if the active status line has
-    // enough room left over after its own content + a separator.
+    // "Connected: tali (×3), alice" — only rendered when more than one
+    // process is connected (a single TUI shouldn't see its own name). Same
+    // username with multiple processes collapses to a single entry with a
+    // count suffix.
     let peers = app.connected_operators();
-    let connected_str = if peers.is_empty() {
+    let total: usize = peers.iter().map(|(_, n)| *n).sum();
+    let connected_str = if total <= 1 {
         String::new()
     } else {
-        format!("Connected: {}", peers.join(", "))
+        let entries: Vec<String> = peers
+            .iter()
+            .map(|(name, n)| {
+                if *n > 1 {
+                    format!("{} (×{})", name, n)
+                } else {
+                    name.clone()
+                }
+            })
+            .collect();
+        format!("Connected: {}", entries.join(", "))
     };
     if app.input_mode != InputMode::None {
         let title = match app.input_mode {

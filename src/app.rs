@@ -3746,7 +3746,7 @@ impl App {
     /// Sorted, deduplicated usernames of operators currently connected to the
     /// same stream (includes self). Returns an empty Vec until the presence
     /// heartbeat is initialised in `run()`.
-    pub fn connected_operators(&self) -> Vec<String> {
+    pub fn connected_operators(&self) -> Vec<(String, usize)> {
         self.presence
             .as_ref()
             .map(|p| p.current_peers())
