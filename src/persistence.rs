@@ -1,4 +1,4 @@
-use crate::domain::{ActionPeriod, DataFilters, PathOverride};
+use crate::domain::{ActionPeriod, DataFilters, MergeGroup, PathOverride};
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,8 @@ pub struct SessionExport {
     pub profile: Option<SourceProfile>,
     pub events: Vec<SessionEvent>,
     pub baseline_events: Vec<SessionEvent>,
+    #[serde(default)]
+    pub merge_groups: Vec<MergeGroup>,
 }
 
 impl SessionExport {
@@ -52,6 +54,7 @@ impl SessionExport {
             profile: None,
             events: Vec::new(),
             baseline_events: Vec::new(),
+            merge_groups: Vec::new(),
         }
     }
 }
@@ -63,6 +66,8 @@ pub struct SourceProfile {
     pub normalized_field_overrides: Vec<NormalizedFieldOverride>,
     pub negative_filters: DataFilters,
     pub whitelist_terms: Vec<String>,
+    #[serde(default)]
+    pub merge_groups: Vec<MergeGroup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +94,10 @@ pub struct SharedState {
     /// Triaged events identified by (ts, type_id) — stable across processes.
     /// Vec indices are *not* shared, so we serialize a value identity instead.
     pub triaged_events: Vec<(f64, String)>,
+    /// User-curated structural type groupings (same shape as `renames`/etc.).
+    /// `#[serde(default)]` so older shared files without this field still load.
+    #[serde(default)]
+    pub merge_groups: Vec<MergeGroup>,
 }
 
 impl SharedState {
@@ -100,6 +109,7 @@ impl SharedState {
             renames: Vec::new(),
             normalized_field_overrides: Vec::new(),
             triaged_events: Vec::new(),
+            merge_groups: Vec::new(),
         }
     }
 }
@@ -150,6 +160,8 @@ pub struct RestoredState {
     /// Materialized triage identifiers — converted back to Vec<usize> in App
     /// by matching (ts, type_id) against the loaded EventRecord stream.
     pub triaged_events: Vec<(f64, String)>,
+    /// Type-merge groupings restored from shared state.
+    pub merge_groups: Vec<MergeGroup>,
 }
 
 /// Outcome of attempting to load the per-stream state on startup.
@@ -194,6 +206,21 @@ pub fn state_paths_for_stream(stream_path: &Path) -> Result<StatePaths> {
 }
 
 fn base_state_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(dir) = env::var_os("LOCALAPPDATA") {
+            return Ok(PathBuf::from(dir).join("json-analyzer"));
+        }
+        if let Some(dir) = env::var_os("APPDATA") {
+            return Ok(PathBuf::from(dir).join("json-analyzer"));
+        }
+        if let Some(dir) = env::var_os("TEMP") {
+            return Ok(PathBuf::from(dir).join("json-analyzer"));
+        }
+        if let Some(dir) = env::var_os("TMP") {
+            return Ok(PathBuf::from(dir).join("json-analyzer"));
+        }
+    }
     if let Some(dir) = env::var_os("XDG_STATE_HOME") {
         return Ok(PathBuf::from(dir).join("json-analyzer"));
     }
@@ -460,6 +487,7 @@ pub fn load_full_state(stream_path: &Path) -> Result<Option<StateLoadResult>> {
         stashed_event_filters: local.stashed_event_filters.clone(),
         types_filter: local.types_filter.clone(),
         triaged_events: shared.triaged_events.clone(),
+        merge_groups: shared.merge_groups.clone(),
     };
 
     if !local_known {
@@ -667,6 +695,12 @@ mod tests {
         update_shared_state(&stream, |mut s| {
             s.renames.push(("abc".to_string(), "Login".to_string()));
             s.triaged_events.push((1700000000.0, "abc".to_string()));
+            s.merge_groups.push(crate::domain::MergeGroup {
+                group_id: "g:deadbeef00".to_string(),
+                label: "Auth".to_string(),
+                members: vec!["aaa".to_string(), "bbb".to_string()],
+                members_prior_name: vec![None, Some("LoginV1".to_string())],
+            });
             s
         })
         .unwrap();
@@ -676,6 +710,13 @@ mod tests {
         assert_eq!(
             loaded.triaged_events,
             vec![(1700000000.0, "abc".to_string())]
+        );
+        assert_eq!(loaded.merge_groups.len(), 1);
+        assert_eq!(loaded.merge_groups[0].group_id, "g:deadbeef00");
+        assert_eq!(loaded.merge_groups[0].label, "Auth");
+        assert_eq!(
+            loaded.merge_groups[0].members_prior_name,
+            vec![None, Some("LoginV1".to_string())]
         );
         let _ = std::fs::remove_file(&stream);
         let _ = std::fs::remove_file(&paths.shared);
@@ -737,3 +778,4 @@ mod tests {
         let _ = std::fs::remove_file(&paths.lock);
     }
 }
+

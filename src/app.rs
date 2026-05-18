@@ -2,9 +2,11 @@ use crate::browser::{JsonFocusNav, JsonFocusState};
 use crate::control_http::{ControlCommand, ControlReply};
 use crate::domain::{
     apply_rename_batch_to_filter, clear_positive_type_filters, collect_indexed_paths,
-    normalize_path, prepare_event, replace_positive_type_filters, toggle_negated_type_in_filter,
-    type_is_negated_in_filter, value_at_path, value_token, values_at_path, ActionPeriod,
-    AnalyzerModel, DataFilters, EventRecord, FilterField, PreparedEvent,
+    dedupe_filter_terms, default_type_label, expand_merged_label_in_filter, normalize_path,
+    prepare_event, rename_type_terms_in_filter, replace_positive_type_filters,
+    toggle_negated_type_in_filter, type_is_negated_in_filter, value_at_path, value_token,
+    values_at_path, ActionPeriod, AnalyzerModel, DataFilters, EventRecord, FilterField,
+    MergeGroup, PreparedEvent,
 };
 use crate::io::StreamReader;
 use crate::persistence::{
@@ -31,7 +33,7 @@ use ratatui::Terminal;
 use rayon::prelude::*;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, HashSet as StdHashSet};
+use std::collections::{HashMap, HashSet, HashSet as StdHashSet};
 use std::env;
 use std::fs;
 use std::io::stdout;
@@ -184,11 +186,20 @@ pub struct App {
     /// map to a Vec index (the events hadn't been ingested when the watcher
     /// fired). Drained by `apply_persisted_overrides_if_ready`.
     pending_triaged_identities: Vec<(f64, String)>,
+    /// Merge group ids this process explicitly created/removed locally.
+    /// Local state wins for these during the shared-state merge; rest from disk.
+    user_modified_merge_groups: HashSet<String>,
+    /// Merge group ids this process intentionally unmerged. Subtracted from the
+    /// on-disk union during merge so a stale concurrent writer can't re-add.
+    user_removed_merge_groups: HashSet<String>,
     shared_dirty: bool,
     local_dirty: bool,
     state_reload_rx: Option<Receiver<WatchMessage>>,
     _state_watcher: Option<WatcherHandle>,
     presence: Option<PresenceHandle>,
+    collapsed_paths: HashMap<String, HashSet<String>>,
+    pub selected_type_ids: HashSet<String>,
+    pub pending_unmerge_group_id: Option<String>,
 }
 
 impl App {
@@ -297,11 +308,16 @@ impl App {
             user_deleted_period_ids: HashSet::new(),
             user_toggled_triage_identities: HashSet::new(),
             pending_triaged_identities: Vec::new(),
+            user_modified_merge_groups: HashSet::new(),
+            user_removed_merge_groups: HashSet::new(),
             shared_dirty: false,
             local_dirty: false,
             state_reload_rx: None,
             _state_watcher: None,
             presence: None,
+            collapsed_paths: HashMap::new(),
+            selected_type_ids: HashSet::new(),
+            pending_unmerge_group_id: None,
         };
         if !reset_state {
             app.restore_persisted_state();
@@ -670,11 +686,16 @@ impl App {
         self.profile_normalized_field_overrides = profile.normalized_field_overrides.clone();
         self.apply_profile_overrides_to_types();
         self.add_whitelist_terms(profile.whitelist_terms);
+        // Apply filters BEFORE merge groups so the filter-rewrite step has the
+        // profile's filter terms to operate on.
         self.apply_profile_filters(profile.negative_filters);
+        if self.apply_profile_merge_groups(&profile.merge_groups) {
+            self.pending_live_recompute = true;
+        }
         // The profile import path mutates renames and overrides (shared) plus
         // the local known_unrelated_types list. apply_profile_filters already
         // marks local; bump shared too so other operators see the imported
-        // renames/overrides.
+        // renames/overrides and merge groups.
         self.mark_shared_dirty();
         self.mark_local_dirty();
     }
@@ -686,6 +707,7 @@ impl App {
             normalized_field_overrides,
             negative_filters,
             whitelist_terms,
+            merge_groups,
         } = profile;
         self.profile_renames = renames.clone();
         self.profile_known_unrelated_types = known_unrelated_types.clone();
@@ -713,10 +735,96 @@ impl App {
         self.stashed_live_visible_indices = None;
         self.stashed_baseline_visible_indices = None;
         self.event_filters = negative_filters;
+        let applied_merges = self.apply_profile_merge_groups(&merge_groups);
         self.mark_live_cache_dirty();
         self.mark_shared_dirty();
         self.mark_local_dirty();
         self.refresh_live_position();
+        if applied_merges {
+            self.pending_live_recompute = true;
+        }
+    }
+
+    /// Apply merge groups carried by an imported profile to the current model.
+    ///
+    /// Two cases are handled per group:
+    /// * Runtime import after events have streamed in: `merge_types` folds
+    ///   each member's existing TypeProfile into the merged group.
+    /// * Boot-time import (CLI `--profile` with `--reset`) when no events have
+    ///   been ingested yet: `merge_types` returns None because members aren't
+    ///   present, so we fall back to `model.apply_merge_groups` to register
+    ///   the alias hook before ingest — same path used by session restore.
+    ///
+    /// Returns true if at least one group was successfully applied. Caller is
+    /// responsible for triggering `pending_live_recompute`.
+    fn apply_profile_merge_groups(&mut self, groups: &[MergeGroup]) -> bool {
+        if groups.is_empty() {
+            return false;
+        }
+        let mut any_applied = false;
+        for group in groups {
+            let cleaned_label = group.label.trim().to_string();
+            // Snapshot prior display names BEFORE any mutation: prefer the
+            // live canonical name (catches user renames), fall back to the
+            // profile's saved prior name, then to the default `type-<hex>`
+            // label. Pre-ingest we won't have a live canonical, but the
+            // saved/default chain still gives us the names that any
+            // hand-edited filter term would reference.
+            let prior_names: Vec<String> = group
+                .members
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    if self.model.types.contains_key(m.as_str()) {
+                        self.model.canonical_type_name(m)
+                    } else {
+                        group
+                            .members_prior_name
+                            .get(i)
+                            .and_then(|o| o.clone())
+                            .unwrap_or_else(|| default_type_label(m))
+                    }
+                })
+                .collect();
+            let merged_via_stats = self
+                .model
+                .merge_types(&group.members, cleaned_label.clone())
+                .is_some();
+            if !merged_via_stats && !self.model.merge_groups.contains_key(&group.group_id) {
+                // Pre-ingest path: model has no member types yet, so register
+                // the alias hook so the upcoming event stream redirects into
+                // the group. Same approach as session restore.
+                self.model.apply_merge_groups(std::slice::from_ref(group));
+                if !self.model.merge_groups.contains_key(&group.group_id) {
+                    continue;
+                }
+            }
+            // Always rewrite filter terms when the group is present, even if
+            // it was already registered locally. A re-applied profile whose
+            // negative_filters reference member names needs the rename so the
+            // resulting filter targets the merged label instead of phantom
+            // member ids.
+            any_applied = true;
+            for prior in &prior_names {
+                self.event_filters.type_filter = rename_type_terms_in_filter(
+                    &self.event_filters.type_filter,
+                    prior,
+                    &cleaned_label,
+                );
+                if let Some(stashed) = self.stashed_event_filters.as_mut() {
+                    stashed.type_filter =
+                        rename_type_terms_in_filter(&stashed.type_filter, prior, &cleaned_label);
+                }
+            }
+        }
+        if any_applied {
+            self.event_filters.type_filter = dedupe_filter_terms(&self.event_filters.type_filter);
+            if let Some(stashed) = self.stashed_event_filters.as_mut() {
+                stashed.type_filter = dedupe_filter_terms(&stashed.type_filter);
+            }
+            self.mark_live_cache_dirty();
+        }
+        any_applied
     }
 
     pub fn set_whitelist_terms(&mut self, terms: Vec<String>) {
@@ -761,6 +869,7 @@ impl App {
             profile: session_profile,
             events,
             baseline_events,
+            merge_groups,
         } = session;
         self.offline = true;
         self.offline_loaded = true;
@@ -769,14 +878,34 @@ impl App {
         self.pending_restore = None;
 
         self.model = AnalyzerModel::new();
+        // Register merge groups BEFORE any ingestion so the alias hook redirects
+        // every replayed event into the appropriate group.
+        if !merge_groups.is_empty() {
+            self.model.apply_merge_groups(&merge_groups);
+        }
         self.baseline_events.clear();
         for ev in &baseline_events {
+            validate_type_field(&ev.obj)?;
             let prepared = prepare_event(ev.obj.clone());
             let obj_size = prepared.obj.to_string().len() as u32;
+            // Capture the original structural type id for baseline events too,
+            // so unmerge can rebuild them faithfully.
+            let raw_type_id = prepared.type_id.clone();
             self.model.ingest_baseline_prepared(&prepared, ev.ts);
+            let effective_type_id = self
+                .model
+                .type_aliases
+                .get(&raw_type_id)
+                .cloned()
+                .unwrap_or_else(|| raw_type_id.clone());
+            let original = if effective_type_id != raw_type_id {
+                Some(raw_type_id)
+            } else {
+                None
+            };
             self.baseline_events.push(EventRecord {
                 ts: ev.ts,
-                type_id: prepared.type_id,
+                type_id: effective_type_id,
                 obj: prepared.obj,
                 keys: prepared.keys,
                 size_bytes: obj_size,
@@ -784,9 +913,11 @@ impl App {
                 in_action_period: false,
                 live_rate_score: 0.0,
                 live_uniq_score: 0.0,
+                original_type_id: original,
             });
         }
         for ev in &events {
+            validate_type_field(&ev.obj)?;
             self.model.ingest(ev.obj.clone(), ev.ts);
         }
 
@@ -861,6 +992,7 @@ impl App {
         let prepared_events: Vec<PreparedEvent> =
             events.into_par_iter().map(prepare_event).collect();
         for (idx, prepared) in prepared_events.into_iter().enumerate() {
+            validate_type_field(&prepared.obj)?;
             let ts = self.resolve_event_ts(&prepared.obj, batch_now, idx)?;
             if let Some(last) = self.model.events.last() {
                 if ts < last.ts - 1e-9 {
@@ -941,6 +1073,7 @@ impl App {
         let prepared_events: Vec<PreparedEvent> =
             events.into_par_iter().map(prepare_event).collect();
         for (idx, prepared) in prepared_events.into_iter().enumerate() {
+            validate_type_field(&prepared.obj)?;
             let ts = match parse_event_timestamp_millis(&prepared.obj)? {
                 Some(ts) => ts,
                 None => seed_ts + (idx as f64 * 0.001),
@@ -963,6 +1096,7 @@ impl App {
                 in_action_period: false,
                 live_rate_score: 0.0,
                 live_uniq_score: 0.0,
+                original_type_id: None,
             });
         }
         self.baseline_tab_enabled = !self.baseline_events.is_empty();
@@ -1004,11 +1138,12 @@ impl App {
         match load_full_state(self.reader.path()) {
             Ok(Some(StateLoadResult::Clean(saved))) => {
                 let msg = format!(
-                    "Restored session: {} periods, {} renames, {} unrelated, {} normalized fields, filters {}/5{}{}",
+                    "Restored session: {} periods, {} renames, {} unrelated, {} normalized fields, {} merge groups, filters {}/5{}{}",
                     saved.periods.len(),
                     saved.renames.len(),
                     saved.known_unrelated_types.len(),
                     saved.normalized_field_overrides.len(),
+                    saved.merge_groups.len(),
                     saved.event_filters.active_count(),
                     if saved.stashed_event_filters.is_some() {
                         " (suspended set saved)"
@@ -1027,6 +1162,12 @@ impl App {
                 self.event_filters = saved.event_filters.clone();
                 self.stashed_event_filters = saved.stashed_event_filters.clone();
                 self.types_filter = saved.types_filter.clone();
+                // Merges must be registered BEFORE the live event stream is
+                // ingested: the alias hook then redirects each member-event into
+                // its group naturally.
+                if !saved.merge_groups.is_empty() {
+                    self.model.apply_merge_groups(&saved.merge_groups);
+                }
                 self.mark_live_cache_dirty();
                 self.refresh_live_position();
                 if !saved.periods.is_empty() {
@@ -1058,6 +1199,10 @@ impl App {
         self.event_filters = saved.event_filters.clone();
         self.stashed_event_filters = saved.stashed_event_filters.clone();
         self.types_filter = saved.types_filter.clone();
+        // Apply merge groups upfront so the alias hook is active during ingest.
+        if !saved.merge_groups.is_empty() {
+            self.model.apply_merge_groups(&saved.merge_groups);
+        }
         self.mark_live_cache_dirty();
         self.refresh_live_position();
         // Store renames in session_renames so they persist across ingest cycles and
@@ -1100,6 +1245,9 @@ impl App {
                     .map(|r| (r.type_id.clone(), r.path.clone(), r.mode))
                     .collect::<Vec<_>>(),
             );
+        }
+        if !saved.merge_groups.is_empty() {
+            self.model.apply_merge_groups(&saved.merge_groups);
         }
         self.apply_triaged_identities(&saved.triaged_events);
         self.apply_profile_overrides_to_types();
@@ -1275,6 +1423,8 @@ impl App {
             })
             .chain(self.pending_triaged_identities.iter().cloned())
             .collect();
+        let merge_groups: Vec<MergeGroup> =
+            self.model.merge_groups.values().cloned().collect();
         SharedState {
             version: 1,
             stream_path: self.reader.path().to_string_lossy().to_string(),
@@ -1282,6 +1432,7 @@ impl App {
             renames: all_renames,
             normalized_field_overrides: self.current_normalized_field_overrides(),
             triaged_events,
+            merge_groups,
         }
     }
 
@@ -1340,6 +1491,16 @@ impl App {
             self.user_deleted_period_ids.iter().copied().collect();
         let user_toggled_triage: std::collections::HashSet<(u64, String)> = self
             .user_toggled_triage_identities
+            .iter()
+            .cloned()
+            .collect();
+        let user_modified_groups: std::collections::HashSet<String> = self
+            .user_modified_merge_groups
+            .iter()
+            .cloned()
+            .collect();
+        let user_removed_groups: std::collections::HashSet<String> = self
+            .user_removed_merge_groups
             .iter()
             .cloned()
             .collect();
@@ -1435,6 +1596,32 @@ impl App {
             }
             merged_triage.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
 
+            // --- merge groups ---
+            // Same shape as renames: groups we explicitly modified locally win;
+            // groups we explicitly removed are subtracted from the disk union;
+            // everything else passes through from disk. Keyed by group_id.
+            let local_groups_by_id: std::collections::HashMap<String, MergeGroup> = next
+                .merge_groups
+                .iter()
+                .filter(|g| user_modified_groups.contains(&g.group_id))
+                .map(|g| (g.group_id.clone(), g.clone()))
+                .collect();
+            let mut merged_groups: Vec<MergeGroup> = disk
+                .merge_groups
+                .iter()
+                .filter(|g| {
+                    !user_removed_groups.contains(&g.group_id)
+                        && !local_groups_by_id.contains_key(&g.group_id)
+                })
+                .cloned()
+                .collect();
+            for (_, g) in local_groups_by_id {
+                if !user_removed_groups.contains(&g.group_id) {
+                    merged_groups.push(g);
+                }
+            }
+            merged_groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
+
             SharedState {
                 version: disk.version,
                 stream_path: next.stream_path.clone(),
@@ -1442,6 +1629,7 @@ impl App {
                 renames: merged_renames,
                 normalized_field_overrides: merged_overrides,
                 triaged_events: merged_triage,
+                merge_groups: merged_groups,
             }
         })
     }
@@ -1514,12 +1702,20 @@ impl App {
             stashed_event_filters: self.stashed_event_filters.clone(),
             types_filter: self.types_filter.clone(),
             triaged_events: shared.triaged_events.clone(),
+            merge_groups: shared.merge_groups.clone(),
         };
 
         // Replace periods immediately (they may have changed from another op).
         self.model.set_periods(staged.periods.clone());
         self.pending_live_recompute = true;
         self.mark_live_cache_dirty();
+
+        // Apply merge_groups from disk. If we hadn't seen them before, they get
+        // applied to model.merge_groups + model.types via the same path the
+        // profile-import flow uses.
+        if !staged.merge_groups.is_empty() {
+            self.model.apply_merge_groups(&staged.merge_groups);
+        }
 
         // Replace triage set wholesale — the on-disk identity list is the
         // authority. Stash any unresolved identities for retry as new events
@@ -1608,6 +1804,7 @@ impl App {
             normalized_field_overrides: self.current_normalized_field_overrides(),
             negative_filters: self.event_filters.clone(),
             whitelist_terms: self.whitelist_terms.clone(),
+            merge_groups: self.model.merge_groups.values().cloned().collect(),
         };
         match save_profile(&path, &profile) {
             Ok(_) => self.status = format!("Profile exported to {}", path.display()),
@@ -1616,6 +1813,7 @@ impl App {
     }
 
     fn build_session_export(&self) -> SessionExport {
+        let merge_groups: Vec<_> = self.model.merge_groups.values().cloned().collect();
         let mut snapshot = SessionExport::new(self.reader.path().display().to_string());
         snapshot.periods = self.model.periods.clone();
         snapshot.renames = self.model.renamed_types();
@@ -1630,6 +1828,7 @@ impl App {
         snapshot.event_filters = self.event_filters.clone();
         snapshot.stashed_event_filters = self.stashed_event_filters.clone();
         snapshot.types_filter = self.types_filter.clone();
+        snapshot.merge_groups = merge_groups.clone();
         snapshot.profile = Some(SourceProfile {
             renames: self.model.renamed_types(),
             known_unrelated_types: self
@@ -1641,6 +1840,7 @@ impl App {
             normalized_field_overrides: self.current_normalized_field_overrides(),
             negative_filters: self.event_filters.clone(),
             whitelist_terms: self.whitelist_terms.clone(),
+            merge_groups: merge_groups.clone(),
         });
         snapshot.events = self
             .model
@@ -1745,6 +1945,21 @@ impl App {
                 }
             }
         }
+        if self.pending_unmerge_group_id.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_unmerge_pending();
+                    return false;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cancel_pending_unmerge();
+                    return false;
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
         if self.loading_locked() {
             self.update_loading_status();
             return false;
@@ -1790,6 +2005,10 @@ impl App {
             }
             KeyCode::Esc if self.mode == UiMode::Types && self.types_path_focus => {
                 self.types_path_focus = false;
+            }
+            KeyCode::Esc if self.mode == UiMode::Types && !self.selected_type_ids.is_empty() => {
+                self.selected_type_ids.clear();
+                self.status = "Merge selection cleared".to_string();
             }
             KeyCode::Esc
                 if self.mode == UiMode::Periods && self.periods_focus != PeriodsFocus::Periods =>
@@ -1861,6 +2080,17 @@ impl App {
                 }
             }
 
+            KeyCode::Char('f') if self.mode == UiMode::Live && self.live_key_focus => {
+                self.toggle_collapse_live();
+            }
+            KeyCode::Char('f')
+                if self.mode == UiMode::Periods && self.periods_focus == PeriodsFocus::Json =>
+            {
+                self.toggle_collapse_period();
+            }
+            KeyCode::Char('f') if self.mode == UiMode::Data && self.data_key_focus => {
+                self.toggle_collapse_data();
+            }
             KeyCode::Char('f') if self.mode == UiMode::Live => {
                 if self.live_key_focus {
                     self.status =
@@ -1977,6 +2207,12 @@ impl App {
                 self.start_event_filter_input(FilterField::Type)
             }
             KeyCode::Char('t') if self.mode == UiMode::Types => self.apply_selected_type_filter(),
+            KeyCode::Char('s') if self.mode == UiMode::Types => {
+                self.toggle_type_merge_selection();
+            }
+            KeyCode::Char('g') if self.mode == UiMode::Types => {
+                self.begin_merge_or_unmerge();
+            }
             KeyCode::Char('/') if self.mode != UiMode::Types => {
                 self.start_event_filter_input(FilterField::Substring)
             }
@@ -2178,6 +2414,10 @@ impl App {
                         };
                         self.export_profile_to_path(path);
                     }
+                    InputMode::MergeTypes => {
+                        let label = self.input_buffer.clone();
+                        self.finalize_merge_with_label(label);
+                    }
                     InputMode::None => {}
                 }
                 self.input_mode = InputMode::None;
@@ -2315,6 +2555,7 @@ impl App {
                 normalized_field_overrides: saved.normalized_field_overrides.clone(),
                 negative_filters: self.event_filters.clone(),
                 whitelist_terms: self.whitelist_terms.clone(),
+                merge_groups: saved.merge_groups.clone(),
             };
             return profile_fingerprint(&profile);
         }
@@ -2329,6 +2570,7 @@ impl App {
             normalized_field_overrides: self.current_normalized_field_overrides(),
             negative_filters: self.event_filters.clone(),
             whitelist_terms: self.whitelist_terms.clone(),
+            merge_groups: self.model.merge_groups.values().cloned().collect(),
         };
         profile_fingerprint(&profile)
     }
@@ -2789,7 +3031,8 @@ impl App {
         let Some(event) = self.live_selected_event() else {
             return Vec::new();
         };
-        collect_indexed_paths(&event.obj)
+        let paths = collect_indexed_paths(&event.obj);
+        filter_paths_by_collapsed(paths, self.collapsed_paths.get(&event.type_id))
     }
 
     /// Collect unique values for `values_key` across all currently filtered events.
@@ -2979,6 +3222,10 @@ impl App {
     }
 
     fn set_ui_mode(&mut self, mode: UiMode) {
+        if self.mode == UiMode::Types && mode != UiMode::Types {
+            // Drop pending merge selection when leaving the Types view.
+            self.selected_type_ids.clear();
+        }
         self.mode = mode;
         self.return_to_live_object_on_types_esc = false;
         self.return_to_types_on_live_esc = false;
@@ -3924,7 +4171,7 @@ impl App {
                     return true;
                 }
                 let name = tp.name.clone().unwrap_or_default().to_lowercase();
-                let default = format!("type-{}", &type_id[..8]).to_lowercase();
+                let default = default_type_label(type_id).to_lowercase();
                 type_id.to_lowercase().contains(&query)
                     || name.contains(&query)
                     || default.contains(&query)
@@ -3954,7 +4201,9 @@ impl App {
     }
 
     pub fn has_modal_confirmation(&self) -> bool {
-        self.pending_delete_period_id.is_some() || self.pending_profile_override.is_some()
+        self.pending_delete_period_id.is_some()
+            || self.pending_profile_override.is_some()
+            || self.pending_unmerge_group_id.is_some()
     }
 
     pub fn type_preview_open(&self) -> bool {
@@ -4006,6 +4255,24 @@ impl App {
                 ],
             });
         }
+        if let Some(group_id) = self.pending_unmerge_group_id.as_ref() {
+            let label = self.model.canonical_type_name(group_id);
+            let n = self
+                .model
+                .merge_groups
+                .get(group_id)
+                .map(|g| g.members.len())
+                .unwrap_or(0);
+            return Some(ModalConfirmation {
+                title: "Unmerge Type".to_string(),
+                lines: vec![
+                    "`y` to unmerge, `n`/`Esc` to disregard".to_string(),
+                    "".to_string(),
+                    format!("Unmerge '{label}' back into its {n} member types?"),
+                    "Member-level type filters will be restored from the saved label.".to_string(),
+                ],
+            });
+        }
         None
     }
 
@@ -4019,7 +4286,8 @@ impl App {
         let Some(event) = self.selected_period_event() else {
             return Vec::new();
         };
-        collect_indexed_paths(&event.obj)
+        let paths = collect_indexed_paths(&event.obj);
+        filter_paths_by_collapsed(paths, self.collapsed_paths.get(&event.type_id))
     }
 
     pub fn selected_data_event(&self) -> Option<&EventRecord> {
@@ -4031,11 +4299,107 @@ impl App {
         let Some(event) = self.selected_data_event() else {
             return Vec::new();
         };
-        collect_indexed_paths(&event.obj)
+        let paths = collect_indexed_paths(&event.obj);
+        filter_paths_by_collapsed(paths, self.collapsed_paths.get(&event.type_id))
     }
 
     pub fn baseline_tab_enabled(&self) -> bool {
         self.baseline_tab_enabled
+    }
+
+    pub fn collapsed_paths_for_type(&self, type_id: &str) -> Option<&HashSet<String>> {
+        self.collapsed_paths.get(type_id)
+    }
+
+    fn toggle_collapse(&mut self, type_id: &str, path: &str, container: bool) {
+        if path.is_empty() || !container {
+            return;
+        }
+        let set = self
+            .collapsed_paths
+            .entry(type_id.to_string())
+            .or_default();
+        if !set.insert(path.to_string()) {
+            set.remove(path);
+            if set.is_empty() {
+                self.collapsed_paths.remove(type_id);
+            }
+        }
+    }
+
+    fn toggle_collapse_live(&mut self) {
+        let Some(event) = self.live_selected_event() else {
+            return;
+        };
+        let type_id = event.type_id.clone();
+        let paths = collect_indexed_paths(&event.obj);
+        let visible =
+            filter_paths_by_collapsed(paths.clone(), self.collapsed_paths.get(&type_id));
+        let Some(path) = visible.get(self.live_key_index).cloned() else {
+            return;
+        };
+        let container = path_value_is_container(&event.obj, &path);
+        self.toggle_collapse(&type_id, &path, container);
+        if container {
+            self.reanchor_live_key_index(&path);
+        }
+    }
+
+    fn toggle_collapse_period(&mut self) {
+        let Some(event) = self.selected_period_event() else {
+            return;
+        };
+        let type_id = event.type_id.clone();
+        let paths = collect_indexed_paths(&event.obj);
+        let visible =
+            filter_paths_by_collapsed(paths.clone(), self.collapsed_paths.get(&type_id));
+        let Some(path) = visible.get(self.period_json_key_index).cloned() else {
+            return;
+        };
+        let container = path_value_is_container(&event.obj, &path);
+        self.toggle_collapse(&type_id, &path, container);
+        if container {
+            self.reanchor_period_key_index(&path);
+        }
+    }
+
+    fn toggle_collapse_data(&mut self) {
+        let Some(event) = self.selected_data_event() else {
+            return;
+        };
+        let type_id = event.type_id.clone();
+        let paths = collect_indexed_paths(&event.obj);
+        let visible =
+            filter_paths_by_collapsed(paths.clone(), self.collapsed_paths.get(&type_id));
+        let Some(path) = visible.get(self.data_key_index).cloned() else {
+            return;
+        };
+        let container = path_value_is_container(&event.obj, &path);
+        self.toggle_collapse(&type_id, &path, container);
+        if container {
+            self.reanchor_data_key_index(&path);
+        }
+    }
+
+    fn reanchor_live_key_index(&mut self, path: &str) {
+        let paths = self.live_selected_key_paths();
+        if let Some(idx) = paths.iter().position(|p| p == path) {
+            self.live_key_index = idx;
+        }
+    }
+
+    fn reanchor_period_key_index(&mut self, path: &str) {
+        let paths = self.period_selected_key_paths();
+        if let Some(idx) = paths.iter().position(|p| p == path) {
+            self.period_json_key_index = idx;
+        }
+    }
+
+    fn reanchor_data_key_index(&mut self, path: &str) {
+        let paths = self.data_selected_key_paths();
+        if let Some(idx) = paths.iter().position(|p| p == path) {
+            self.data_key_index = idx;
+        }
     }
 
     pub fn type_excluded_by_type_filter(&self, type_id: &str) -> bool {
@@ -4297,6 +4661,185 @@ impl App {
         }
     }
 
+    pub fn is_type_selected_for_merge(&self, type_id: &str) -> bool {
+        self.selected_type_ids.contains(type_id)
+    }
+
+    fn toggle_type_merge_selection(&mut self) {
+        if self.mode != UiMode::Types {
+            return;
+        }
+        let visible = self.visible_types();
+        let Some(type_id) = visible.get(self.type_index).cloned() else {
+            return;
+        };
+        if self.selected_type_ids.contains(&type_id) {
+            self.selected_type_ids.remove(&type_id);
+        } else {
+            self.selected_type_ids.insert(type_id);
+        }
+        let n = self.selected_type_ids.len();
+        self.status = if n == 0 {
+            "Merge selection cleared".to_string()
+        } else if n == 1 {
+            "1 type selected for merge (need >=2, press 's' on more rows)".to_string()
+        } else {
+            format!("{n} types selected for merge (press 'g' to merge)")
+        };
+    }
+
+    fn begin_merge_or_unmerge(&mut self) {
+        if self.mode != UiMode::Types {
+            return;
+        }
+        if self.selected_type_ids.len() >= 2 {
+            self.input_mode = crate::tui::InputMode::MergeTypes;
+            self.input_buffer.clear();
+            self.status = format!(
+                "Enter a label for the merged type ({} members). Esc to cancel",
+                self.selected_type_ids.len()
+            );
+            return;
+        }
+        let visible = self.visible_types();
+        if let Some(type_id) = visible.get(self.type_index).cloned() {
+            if self.model.merge_groups.contains_key(&type_id) {
+                self.pending_unmerge_group_id = Some(type_id.clone());
+                let label = self.model.canonical_type_name(&type_id);
+                self.status = format!("Unmerge '{label}'? `y` to confirm, `n`/`Esc` to disregard");
+                return;
+            }
+        }
+        self.status = "Select >=2 types with 's' to merge, or highlight a merged group to unmerge"
+            .to_string();
+    }
+
+    fn confirm_unmerge_pending(&mut self) {
+        let Some(group_id) = self.pending_unmerge_group_id.take() else {
+            return;
+        };
+        let label = self.model.canonical_type_name(&group_id);
+        let Some(group) = self.model.unmerge_group(&group_id) else {
+            self.status = format!("Group {group_id} not found");
+            return;
+        };
+        // Rebuild App.baseline_events: restore each event's type_id from
+        // original_type_id so member-keyed downstream views are correct.
+        for ev in self.baseline_events.iter_mut() {
+            if ev.type_id == group_id {
+                let restored = ev
+                    .original_type_id
+                    .take()
+                    .unwrap_or_else(|| group_id.clone());
+                ev.type_id = restored;
+            }
+        }
+        // Expand filter terms.
+        let member_names: Vec<String> = group
+            .members
+            .iter()
+            .zip(group.members_prior_name.iter())
+            .map(|(member_id, prior)| {
+                prior
+                    .clone()
+                    .unwrap_or_else(|| default_type_label(member_id))
+            })
+            .collect();
+        self.event_filters.type_filter =
+            expand_merged_label_in_filter(&self.event_filters.type_filter, &label, &member_names);
+        if let Some(stashed) = self.stashed_event_filters.as_mut() {
+            stashed.type_filter =
+                expand_merged_label_in_filter(&stashed.type_filter, &label, &member_names);
+        }
+        self.commit_filter_change(FilterOrigin::TypeView);
+        self.pending_live_recompute = true;
+        // Remember the removal so a stale concurrent writer can't re-add this
+        // group on its next merge pass.
+        self.user_removed_merge_groups.insert(group_id.clone());
+        self.user_modified_merge_groups.remove(&group_id);
+        self.mark_shared_dirty();
+        self.mark_local_dirty();
+        self.status = format!("Unmerged '{label}' ({} members)", group.members.len());
+    }
+
+    fn cancel_pending_unmerge(&mut self) {
+        if self.pending_unmerge_group_id.take().is_some() {
+            self.status = "Unmerge cancelled".to_string();
+        }
+    }
+
+    fn finalize_merge_with_label(&mut self, label: String) {
+        let members: Vec<String> = self.selected_type_ids.iter().cloned().collect();
+        if members.len() < 2 {
+            self.status = "Need at least 2 types selected to merge".to_string();
+            self.selected_type_ids.clear();
+            return;
+        }
+        // Capture each member's prior canonical name BEFORE the merge mutates
+        // self.model.types — we need them to rewrite the filter.
+        let prior_names: Vec<String> = members
+            .iter()
+            .map(|m| self.model.canonical_type_name(m))
+            .collect();
+        let cleaned_label = label.trim().to_string();
+        let Some(group_id) = self.model.merge_types(&members, cleaned_label.clone()) else {
+            self.status = "Merge failed (insufficient valid members)".to_string();
+            return;
+        };
+        // Rewrite the type filter: replace each member's prior name with the
+        // merged label, then dedupe.
+        for prior in &prior_names {
+            self.event_filters.type_filter =
+                rename_type_terms_in_filter(&self.event_filters.type_filter, prior, &cleaned_label);
+            if let Some(stashed) = self.stashed_event_filters.as_mut() {
+                stashed.type_filter =
+                    rename_type_terms_in_filter(&stashed.type_filter, prior, &cleaned_label);
+            }
+        }
+        self.event_filters.type_filter = dedupe_filter_terms(&self.event_filters.type_filter);
+        if let Some(stashed) = self.stashed_event_filters.as_mut() {
+            stashed.type_filter = dedupe_filter_terms(&stashed.type_filter);
+        }
+        // Rebuild App.baseline_events: any event whose type_id was a merged
+        // member now points to the group id.
+        let member_set: HashSet<String> = members.iter().cloned().collect();
+        for ev in self.baseline_events.iter_mut() {
+            if member_set.contains(&ev.type_id) {
+                let prev = std::mem::replace(&mut ev.type_id, group_id.clone());
+                if ev.original_type_id.is_none() {
+                    ev.original_type_id = Some(prev);
+                }
+            }
+        }
+        self.commit_filter_change(FilterOrigin::TypeView);
+        self.selected_type_ids.clear();
+        self.pending_live_recompute = true;
+        // Track that this process authored the new group so the shared merge
+        // keeps our copy as authoritative.
+        self.user_modified_merge_groups.insert(group_id.clone());
+        self.user_removed_merge_groups.remove(&group_id);
+        self.mark_shared_dirty();
+        self.mark_local_dirty();
+        // Point the cursor at the newly created merged group so the user sees
+        // the row they just acted on. Path-focus was over a now-gone member,
+        // so reset it to the list pane.
+        let visible_after = self.visible_types();
+        if let Some(idx) = visible_after.iter().position(|id| id == &group_id) {
+            self.type_index = idx;
+            self.types_path_focus = false;
+            self.path_index = 0;
+        }
+        self.status = format!(
+            "Merged {} types into '{}'",
+            members.len(),
+            if cleaned_label.is_empty() {
+                "merged group"
+            } else {
+                cleaned_label.as_str()
+            }
+        );
+    }
+
     fn loading_locked(&self) -> bool {
         if self.baseline_reader.is_some() && !self.baseline_loaded {
             return true;
@@ -4552,6 +5095,19 @@ fn supports_unicode_blocks() -> bool {
     false
 }
 
+fn validate_type_field(obj: &Value) -> Result<()> {
+    let Some(raw) = obj.get("_type") else {
+        return Ok(());
+    };
+    match raw {
+        Value::String(s) if !s.trim().is_empty() => Ok(()),
+        Value::String(_) => {
+            bail!("Unsupported input: `_type` must be a non-empty string when present.")
+        }
+        _ => bail!("Unsupported input: `_type` must be a string when present."),
+    }
+}
+
 fn parse_event_timestamp_millis(obj: &Value) -> Result<Option<f64>> {
     let Some(raw) = obj.get("_timestamp") else {
         return Ok(None);
@@ -4651,6 +5207,9 @@ fn normalize_profile(mut profile: SourceProfile) -> SourceProfile {
     wl.dedup();
     profile.whitelist_terms = wl;
     profile
+        .merge_groups
+        .sort_by(|a, b| a.group_id.cmp(&b.group_id));
+    profile
 }
 
 fn is_scalar_array_item_path(path: &str) -> bool {
@@ -4676,11 +5235,50 @@ fn rewrite_filter_terms_for_renames(
     *types_filter = apply_rename_batch_to_filter(types_filter, renames);
 }
 
+fn filter_paths_by_collapsed(
+    paths: Vec<String>,
+    collapsed: Option<&HashSet<String>>,
+) -> Vec<String> {
+    let Some(collapsed) = collapsed else {
+        return paths;
+    };
+    if collapsed.is_empty() {
+        return paths;
+    }
+    paths
+        .into_iter()
+        .filter(|p| !has_collapsed_ancestor(p, collapsed))
+        .collect()
+}
+
+fn has_collapsed_ancestor(path: &str, collapsed: &HashSet<String>) -> bool {
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'.' || c == b'[' {
+            if collapsed.contains(&path[..i]) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn path_value_is_container(root: &Value, path: &str) -> bool {
+    use crate::domain::value_at_path;
+    matches!(
+        value_at_path(root, path),
+        Some(Value::Object(_)) | Some(Value::Array(_))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_navigation_code, parse_event_timestamp_millis, App, NavIntent, PeriodsFocus,
-        UiMode, MENU_PAGE_STEP,
+        normalize_navigation_code, parse_event_timestamp_millis, validate_type_field, App,
+        NavIntent, PeriodsFocus, UiMode, MENU_PAGE_STEP,
     };
     use crate::domain::prepare_event;
     use crate::persistence::{SessionEvent, SessionExport, SourceProfile};
@@ -4744,6 +5342,30 @@ mod tests {
         assert!(parse_event_timestamp_millis(&json!({"_timestamp": 999_999_999_999i64})).is_err());
         assert!(parse_event_timestamp_millis(&json!({"_timestamp": 1.5f64})).is_err());
         assert!(parse_event_timestamp_millis(&json!({"_timestamp": "1739952000123"})).is_err());
+    }
+
+    #[test]
+    fn validate_type_field_accepts_missing_and_string() {
+        assert!(validate_type_field(&json!({"x": 1})).is_ok());
+        assert!(validate_type_field(&json!({"_type": "login", "x": 1})).is_ok());
+    }
+
+    #[test]
+    fn validate_type_field_rejects_non_string_and_empty() {
+        for bad in [
+            json!({"_type": 42}),
+            json!({"_type": true}),
+            json!({"_type": null}),
+            json!({"_type": ["a"]}),
+            json!({"_type": {}}),
+            json!({"_type": ""}),
+            json!({"_type": "   "}),
+        ] {
+            assert!(
+                validate_type_field(&bad).is_err(),
+                "expected error for {bad}"
+            );
+        }
     }
 
     #[test]
@@ -4847,6 +5469,7 @@ mod tests {
             normalized_field_overrides: vec![],
             negative_filters: session.event_filters.clone(),
             whitelist_terms: vec![],
+            merge_groups: vec![],
         };
         session.profile = Some(profile.clone());
         app.import_session(session, Some(profile)).expect("import");
@@ -4868,6 +5491,7 @@ mod tests {
             normalized_field_overrides: vec![],
             negative_filters: crate::domain::DataFilters::default(),
             whitelist_terms: vec![],
+            merge_groups: vec![],
         });
         let override_profile = SourceProfile {
             renames: vec![],
@@ -4878,6 +5502,7 @@ mod tests {
                 ..crate::domain::DataFilters::default()
             },
             whitelist_terms: vec![],
+            merge_groups: vec![],
         };
         app.import_session(session, Some(override_profile))
             .expect("import");
@@ -5330,6 +5955,7 @@ mod tests {
             in_action_period: false,
             live_rate_score: 0.0,
             live_uniq_score: 0.0,
+            original_type_id: None,
         });
         app.baseline_visible_indices = vec![0];
         app.baseline_cache_dirty = false;
@@ -5356,6 +5982,7 @@ mod tests {
             in_action_period: false,
             live_rate_score: 0.0,
             live_uniq_score: 0.0,
+            original_type_id: None,
         });
         app.baseline_visible_indices = vec![0];
         app.baseline_cache_dirty = false;
@@ -5486,5 +6113,284 @@ mod tests {
         // The filter still matches the underlying type.
         let filtered = app.model.filtered_events(&app.event_filters);
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn merge_via_s_s_g_enter_label_creates_visible_group() {
+        let mut app = test_app();
+        app.model.ingest(json!({"event": "login", "x": 1}), 1.0);
+        app.model.ingest(json!({"event": "logout", "y": 2}), 2.0);
+        app.mode = UiMode::Types;
+        // Select first two visible rows.
+        let visible = app.visible_types();
+        assert!(visible.len() >= 2);
+        let a = visible[0].clone();
+        let b = visible[1].clone();
+        app.type_index = 0;
+        app.handle_key(key(KeyCode::Char('s')));
+        app.type_index = 1;
+        app.handle_key(key(KeyCode::Char('s')));
+        assert!(app.selected_type_ids.contains(&a));
+        assert!(app.selected_type_ids.contains(&b));
+        // Press 'g' to begin merge.
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.input_mode, crate::tui::InputMode::MergeTypes);
+        // Type a label.
+        for ch in "Auth".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        // The merged group should appear in visible_types().
+        let visible = app.visible_types();
+        let has_group = visible
+            .iter()
+            .any(|id| app.model.merge_groups.contains_key(id));
+        assert!(has_group, "expected a merged group in visible types");
+        // Selection cleared.
+        assert!(app.selected_type_ids.is_empty());
+    }
+
+    #[test]
+    fn merge_repositions_cursor_onto_merged_group() {
+        // After a successful merge, the cursor should point at the newly
+        // created group row rather than staying at the previous numeric index.
+        let mut app = test_app();
+        // Ingest three distinct shapes so we have stable rows around the
+        // merged group.
+        app.model.ingest(json!({"event": "login", "x": 1}), 1.0);
+        app.model.ingest(json!({"event": "logout", "y": 2}), 2.0);
+        app.model.ingest(json!({"event": "ping", "z": 3}), 3.0);
+        app.mode = UiMode::Types;
+        let visible_before = app.visible_types();
+        assert!(visible_before.len() >= 2);
+        // Select first two and merge under a recognisable label.
+        app.type_index = 0;
+        app.handle_key(key(KeyCode::Char('s')));
+        app.type_index = 1;
+        app.handle_key(key(KeyCode::Char('s')));
+        // Pretend the user was in path-focus before pressing g.
+        app.types_path_focus = true;
+        app.handle_key(key(KeyCode::Char('g')));
+        for ch in "Auth".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        // Cursor should be on the merged group row.
+        let visible_after = app.visible_types();
+        let cursor_id = &visible_after[app.type_index];
+        assert!(
+            app.model.merge_groups.contains_key(cursor_id),
+            "expected cursor to land on the merged group, got id {cursor_id}"
+        );
+        // Path-focus is reset so the user is back on the list pane.
+        assert!(!app.types_path_focus);
+    }
+
+    /// Helper: ingest two distinct shapes into a fresh app and return their
+    /// (login, logout) structural type ids.
+    fn seed_two_types(app: &mut App) -> (String, String) {
+        for _ in 0..3 {
+            app.model
+                .ingest(json!({"event": "login", "user": "a"}), 1.0);
+        }
+        for _ in 0..2 {
+            app.model
+                .ingest(json!({"event": "logout", "session": "z"}), 2.0);
+        }
+        let login_id = app
+            .model
+            .events
+            .iter()
+            .find(|e| e.obj.get("user").is_some())
+            .map(|e| e.type_id.clone())
+            .expect("login event");
+        let logout_id = app
+            .model
+            .events
+            .iter()
+            .find(|e| e.obj.get("session").is_some())
+            .map(|e| e.type_id.clone())
+            .expect("logout event");
+        (login_id, logout_id)
+    }
+
+    #[test]
+    fn profile_import_applies_saved_merge_groups() {
+        // Build a model with two ingested types and assemble a profile whose
+        // merge_groups list joins them. Importing that profile should produce
+        // the merged group in `model.merge_groups` and a corresponding entry
+        // in `model.types`.
+        let mut app = test_app();
+        let (login_id, logout_id) = seed_two_types(&mut app);
+        let members = vec![login_id.clone(), logout_id.clone()];
+        let mut sorted_members = members.clone();
+        sorted_members.sort();
+        let group_id = crate::domain::AnalyzerModel::compute_group_id(&sorted_members);
+        let group = crate::domain::MergeGroup {
+            group_id: group_id.clone(),
+            label: "Auth".to_string(),
+            members: sorted_members,
+            members_prior_name: vec![None, None],
+        };
+        let profile = SourceProfile {
+            renames: vec![],
+            known_unrelated_types: vec![],
+            normalized_field_overrides: vec![],
+            negative_filters: crate::domain::DataFilters::default(),
+            whitelist_terms: vec![],
+            merge_groups: vec![group],
+        };
+        app.apply_profile(profile, false);
+        assert!(app.model.merge_groups.contains_key(&group_id));
+        assert!(app.model.types.contains_key(&group_id));
+        assert!(!app.model.types.contains_key(&login_id));
+        assert!(!app.model.types.contains_key(&logout_id));
+        // Merged count == sum of member counts (3 + 2).
+        assert_eq!(app.model.types.get(&group_id).unwrap().count, 5);
+    }
+
+    #[test]
+    fn profile_import_registers_aliases_when_members_absent() {
+        // Members referenced by the profile don't exist in this model's
+        // ingested types yet. We can't tell "ghost / handcrafted" apart from
+        // "pre-ingest: members will arrive later", so we register the alias
+        // hook + seed an empty TypeProfile. This is what makes CLI
+        // `--profile` work at boot.
+        let mut app = test_app();
+        let (login_id, _logout_id) = seed_two_types(&mut app);
+        let ghost_a = "ghost-a-doesnotexist".to_string();
+        let ghost_b = "ghost-b-doesnotexist".to_string();
+        let mut sorted_members = vec![ghost_a.clone(), ghost_b.clone()];
+        sorted_members.sort();
+        let group_id = crate::domain::AnalyzerModel::compute_group_id(&sorted_members);
+        let group = crate::domain::MergeGroup {
+            group_id: group_id.clone(),
+            label: "Phantom".to_string(),
+            members: sorted_members.clone(),
+            members_prior_name: vec![None, None],
+        };
+        let profile = SourceProfile {
+            renames: vec![],
+            known_unrelated_types: vec![],
+            normalized_field_overrides: vec![],
+            negative_filters: crate::domain::DataFilters::default(),
+            whitelist_terms: vec![],
+            merge_groups: vec![group],
+        };
+        app.apply_profile(profile, false);
+        assert!(app.model.merge_groups.contains_key(&group_id));
+        // Empty TypeProfile seeded.
+        let tp = app
+            .model
+            .types
+            .get(&group_id)
+            .expect("group TypeProfile seeded");
+        assert_eq!(tp.count, 0);
+        // Aliases registered so future ingest of those member ids redirects
+        // into the group.
+        for m in &sorted_members {
+            assert_eq!(app.model.type_aliases.get(m), Some(&group_id));
+        }
+        // Original sibling types untouched.
+        assert!(app.model.types.contains_key(&login_id));
+    }
+
+    #[test]
+    fn profile_import_at_boot_redirects_ingest_into_group() {
+        // The actual CLI --profile + --reset flow: apply the profile to an
+        // empty model, then ingest. The alias hook registered by
+        // apply_profile_merge_groups should fold every matching event into
+        // the merged group instead of leaving the merge label as a phantom.
+        let mut app = test_app();
+        // Compute the structural ids the two shapes will hash to, without
+        // touching the live model's types map (so members are genuinely
+        // absent when apply_profile runs).
+        let mut probe = crate::domain::AnalyzerModel::new();
+        probe.ingest(json!({"event": "login", "user": "a"}), 1.0);
+        probe.ingest(json!({"event": "logout", "session": "z"}), 2.0);
+        let login_id = probe
+            .events
+            .iter()
+            .find(|e| e.obj.get("user").is_some())
+            .map(|e| e.type_id.clone())
+            .expect("login id");
+        let logout_id = probe
+            .events
+            .iter()
+            .find(|e| e.obj.get("session").is_some())
+            .map(|e| e.type_id.clone())
+            .expect("logout id");
+        let mut members = vec![login_id.clone(), logout_id.clone()];
+        members.sort();
+        let group_id = crate::domain::AnalyzerModel::compute_group_id(&members);
+        let group = crate::domain::MergeGroup {
+            group_id: group_id.clone(),
+            label: "Auth".to_string(),
+            members: members.clone(),
+            members_prior_name: vec![None, None],
+        };
+        let profile = SourceProfile {
+            renames: vec![],
+            known_unrelated_types: vec![],
+            normalized_field_overrides: vec![],
+            negative_filters: crate::domain::DataFilters {
+                type_filter: format!("!{}", crate::domain::default_type_label(&login_id)),
+                ..crate::domain::DataFilters::default()
+            },
+            whitelist_terms: vec![],
+            merge_groups: vec![group],
+        };
+        // Model is empty — exactly the CLI boot precondition.
+        assert!(app.model.types.is_empty());
+        app.apply_profile(profile, false);
+        // Filter rewrite happened even though no types are present yet.
+        assert_eq!(app.event_filters.type_filter, "!Auth");
+        // Now stream events through and confirm they land in the group.
+        app.model
+            .ingest(json!({"event": "login", "user": "a"}), 10.0);
+        app.model
+            .ingest(json!({"event": "login", "user": "b"}), 11.0);
+        app.model
+            .ingest(json!({"event": "logout", "session": "z"}), 12.0);
+        assert!(!app.model.types.contains_key(&login_id));
+        assert!(!app.model.types.contains_key(&logout_id));
+        assert_eq!(app.model.types.get(&group_id).unwrap().count, 3);
+    }
+
+    #[test]
+    fn profile_import_rewrites_filter_to_group_label() {
+        // event_filters.type_filter references "login" (the prior canonical
+        // name of one of the merged members). After import, the filter should
+        // be rewritten to the merged label "Auth".
+        let mut app = test_app();
+        let (login_id, logout_id) = seed_two_types(&mut app);
+        // Rename one of the members so the filter rewrite has something
+        // user-recognisable to match.
+        app.model.rename_type(&login_id, "LoginEvt".to_string());
+        let prior_login_name = app.model.canonical_type_name(&login_id);
+        assert_eq!(prior_login_name, "LoginEvt");
+        let mut sorted_members = vec![login_id.clone(), logout_id.clone()];
+        sorted_members.sort();
+        let group_id = crate::domain::AnalyzerModel::compute_group_id(&sorted_members);
+        let group = crate::domain::MergeGroup {
+            group_id: group_id.clone(),
+            label: "Merged".to_string(),
+            members: sorted_members,
+            members_prior_name: vec![None, None],
+        };
+        let profile = SourceProfile {
+            renames: vec![],
+            known_unrelated_types: vec![],
+            normalized_field_overrides: vec![],
+            negative_filters: crate::domain::DataFilters {
+                type_filter: "LoginEvt".to_string(),
+                ..crate::domain::DataFilters::default()
+            },
+            whitelist_terms: vec![],
+            merge_groups: vec![group],
+        };
+        app.apply_profile(profile, false);
+        assert_eq!(app.event_filters.type_filter, "Merged");
+        assert!(app.model.merge_groups.contains_key(&group_id));
     }
 }

@@ -21,6 +21,25 @@ pub struct EventRecord {
     pub in_action_period: bool,
     pub live_rate_score: f64,
     pub live_uniq_score: f64,
+    /// When the event went through a type alias (merged group), this records the
+    /// original structural type_id so it can be restored on unmerge.
+    pub original_type_id: Option<String>,
+}
+
+/// A logical grouping of structural types into a single "merged" identity.
+/// All downstream rendering, filtering, and scoring treat the group as one type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeGroup {
+    /// "g:" + 10 hex (deterministic over sorted members).
+    pub group_id: String,
+    /// User-chosen label for the merged type.
+    pub label: String,
+    /// Sorted original structural hashes.
+    pub members: Vec<String>,
+    /// Each member's canonical name at the moment of merging, so we can preserve
+    /// user-facing names through unmerge. None means the member had no rename
+    /// (its display name was the default `type-<hex>` label).
+    pub members_prior_name: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +250,13 @@ pub struct AnalyzerModel {
     pub events: Vec<EventRecord>,
     pub periods: Vec<ActionPeriod>,
     pub current_label: String,
+    /// group_id -> MergeGroup; iteration order is preserved for deterministic
+    /// serialization.
+    pub merge_groups: IndexMap<String, MergeGroup>,
+    /// original_type_id -> group_id. Hot-path lookup: every `ingest_prepared` /
+    /// `ingest_baseline_prepared` consults this once. Empty when nothing is
+    /// merged, so the hook is a no-op for users who never use the feature.
+    pub type_aliases: HashMap<String, String>,
 
     baseline_elapsed_secs: f64,
     baseline_counts: HashMap<String, u64>,
@@ -250,6 +276,8 @@ impl AnalyzerModel {
             events: Vec::new(),
             periods: Vec::new(),
             current_label: DEFAULT_ACTION_LABEL.to_string(),
+            merge_groups: IndexMap::new(),
+            type_aliases: HashMap::new(),
             baseline_elapsed_secs: 0.0,
             baseline_counts: HashMap::new(),
             baseline_last_ts: None,
@@ -334,20 +362,32 @@ impl AnalyzerModel {
             keys,
             scalar_paths,
         } = prepared;
+        // Type-alias redirect: when this structural type is part of a merge
+        // group, every downstream map/counter receives the group id instead.
+        let (effective_type_id, original_type_id) =
+            if let Some(group_id) = self.type_aliases.get(&type_id) {
+                let group_id = group_id.clone();
+                (group_id, Some(type_id))
+            } else {
+                (type_id, None)
+            };
         let period_id = self.period_id_for_ts(ts);
         let in_action_period = period_id.is_some();
 
         let uniq = {
-            let entry = self.get_or_create_type_profile(&type_id, &obj);
+            let entry = self.get_or_create_type_profile(&effective_type_id, &obj);
             entry.count += 1;
             if entry.count == 1 {
                 entry.example = obj.clone();
             }
             update_uniqueness(entry, &scalar_paths, in_action_period)
         };
-        let prev_seen_ts = self.last_seen_by_type.get(type_id.as_str()).copied();
-        let rate = self.update_rate_scores(&type_id, period_id, prev_seen_ts, ts);
-        if let Some(entry) = self.types.get_mut(&type_id) {
+        let prev_seen_ts = self
+            .last_seen_by_type
+            .get(effective_type_id.as_str())
+            .copied();
+        let rate = self.update_rate_scores(&effective_type_id, period_id, prev_seen_ts, ts);
+        if let Some(entry) = self.types.get_mut(&effective_type_id) {
             entry.latest_rate = rate;
             entry.latest_uniq = uniq;
         }
@@ -355,7 +395,7 @@ impl AnalyzerModel {
         let size_bytes = obj.to_string().len() as u32;
         self.events.push(EventRecord {
             ts,
-            type_id: type_id.clone(),
+            type_id: effective_type_id.clone(),
             obj,
             keys,
             size_bytes,
@@ -363,8 +403,9 @@ impl AnalyzerModel {
             in_action_period,
             live_rate_score: rate,
             live_uniq_score: uniq,
+            original_type_id,
         });
-        self.last_seen_by_type.insert(type_id, ts);
+        self.last_seen_by_type.insert(effective_type_id, ts);
     }
 
     pub fn ingest_baseline(&mut self, obj: Value, ts: f64) {
@@ -379,12 +420,21 @@ impl AnalyzerModel {
         self.baseline_last_ts = Some(ts);
 
         let obj = &prepared.obj;
-        let type_id = &prepared.type_id;
-        *self.baseline_counts.entry(type_id.clone()).or_insert(0) += 1;
-        self.baseline_last_seen_by_type.insert(type_id.clone(), ts);
+        let raw_type_id = &prepared.type_id;
+        let effective_type_id = self
+            .type_aliases
+            .get(raw_type_id)
+            .cloned()
+            .unwrap_or_else(|| raw_type_id.clone());
+        *self
+            .baseline_counts
+            .entry(effective_type_id.clone())
+            .or_insert(0) += 1;
+        self.baseline_last_seen_by_type
+            .insert(effective_type_id.clone(), ts);
 
         let uniq = {
-            let entry = self.get_or_create_type_profile(type_id, obj);
+            let entry = self.get_or_create_type_profile(&effective_type_id, obj);
             entry.count += 1;
             if entry.count == 1 {
                 entry.example = obj.clone();
@@ -392,10 +442,10 @@ impl AnalyzerModel {
             update_uniqueness(entry, &prepared.scalar_paths, false)
         };
 
-        if let Some(entry) = self.types.get_mut(type_id) {
+        if let Some(entry) = self.types.get_mut(&effective_type_id) {
             entry.latest_uniq = uniq;
         }
-        self.last_seen_by_type.insert(type_id.clone(), ts);
+        self.last_seen_by_type.insert(effective_type_id, ts);
     }
 
     pub fn refresh_live_anomaly_scores(&mut self) {
@@ -696,6 +746,356 @@ impl AnalyzerModel {
         }
     }
 
+    /// Compute the deterministic group_id for a sorted member list.
+    /// Sorts internally so callers don't have to.
+    pub fn compute_group_id(members: &[String]) -> String {
+        let mut sorted: Vec<String> = members.to_vec();
+        sorted.sort();
+        let payload = serde_json::to_vec(&sorted).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        let digest = hasher.finalize();
+        let full = format!("{:x}", digest);
+        format!("g:{}", &full[..10])
+    }
+
+    /// Merge `members` into a single logical type with `label`. Returns the
+    /// new group id, or None if fewer than 2 valid (non-grouped, existing)
+    /// members remain after filtering. Caller is responsible for filter-string
+    /// rewrites and calling `refresh_live_anomaly_scores`.
+    pub fn merge_types(&mut self, members: &[String], label: String) -> Option<String> {
+        let filtered: Vec<String> = members
+            .iter()
+            .filter(|m| self.types.contains_key(m.as_str()))
+            .filter(|m| !self.merge_groups.contains_key(m.as_str()))
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        if filtered.len() < 2 {
+            return None;
+        }
+        let mut sorted = filtered;
+        sorted.sort();
+        let group_id = Self::compute_group_id(&sorted);
+
+        // Capture each member's display name at merge time.
+        let members_prior_name: Vec<Option<String>> = sorted
+            .iter()
+            .map(|m| self.types.get(m).and_then(|tp| tp.name.clone()))
+            .collect();
+
+        // Build the merged TypeProfile by combining each member's stats.
+        let cleaned_label = label.trim();
+        let label_value = if cleaned_label.is_empty() {
+            None
+        } else {
+            Some(cleaned_label.to_string())
+        };
+        let mut merged = TypeProfile {
+            type_id: group_id.clone(),
+            name: label_value,
+            count: 0,
+            example: Value::Null,
+            considered_paths: IndexMap::new(),
+            path_overrides: IndexMap::new(),
+            path_stats: IndexMap::new(),
+            baseline_path_stats: IndexMap::new(),
+            known_unrelated: false,
+            latest_rate: 0.0,
+            latest_uniq: 0.0,
+        };
+        let mut example_set = false;
+        for m in &sorted {
+            let Some(tp) = self.types.get(m) else {
+                continue;
+            };
+            if !example_set {
+                merged.example = tp.example.clone();
+                example_set = true;
+            }
+            merged.count += tp.count;
+            merged.known_unrelated |= tp.known_unrelated;
+            for (path, stats) in &tp.path_stats {
+                let entry = merged.path_stats.entry(path.clone()).or_default();
+                entry.total += stats.total;
+                for (tok, cnt) in &stats.values {
+                    *entry.values.entry(tok.clone()).or_insert(0) += cnt;
+                }
+            }
+            for (path, stats) in &tp.baseline_path_stats {
+                let entry = merged.baseline_path_stats.entry(path.clone()).or_default();
+                entry.total += stats.total;
+                for (tok, cnt) in &stats.values {
+                    *entry.values.entry(tok.clone()).or_insert(0) += cnt;
+                }
+            }
+            for (path, mode) in &tp.path_overrides {
+                // ForcedOff wins on conflict.
+                match merged.path_overrides.get(path).copied() {
+                    Some(PathOverride::ForcedOff) => {}
+                    Some(PathOverride::ForcedOn) => {
+                        merged.path_overrides.insert(path.clone(), *mode);
+                    }
+                    None => {
+                        merged.path_overrides.insert(path.clone(), *mode);
+                    }
+                }
+            }
+        }
+        sync_type_considered_paths(&mut merged);
+
+        // Roll up model-level type-keyed maps onto the group id.
+        let mut sum_baseline = 0u64;
+        for m in &sorted {
+            if let Some(v) = self.baseline_counts.remove(m) {
+                sum_baseline += v;
+            }
+        }
+        if sum_baseline > 0 {
+            *self
+                .baseline_counts
+                .entry(group_id.clone())
+                .or_insert(0) += sum_baseline;
+        }
+
+        let mut max_baseline_ts: Option<f64> = None;
+        for m in &sorted {
+            if let Some(v) = self.baseline_last_seen_by_type.remove(m) {
+                max_baseline_ts = Some(match max_baseline_ts {
+                    Some(cur) => cur.max(v),
+                    None => v,
+                });
+            }
+        }
+        if let Some(v) = max_baseline_ts {
+            self.baseline_last_seen_by_type.insert(group_id.clone(), v);
+        }
+
+        let mut max_last_seen: Option<f64> = None;
+        for m in &sorted {
+            if let Some(v) = self.last_seen_by_type.remove(m) {
+                max_last_seen = Some(match max_last_seen {
+                    Some(cur) => cur.max(v),
+                    None => v,
+                });
+            }
+        }
+        if let Some(v) = max_last_seen {
+            self.last_seen_by_type.insert(group_id.clone(), v);
+        }
+
+        // Sum per-period state.
+        let pids: Vec<u64> = self.period_rate_states.keys().copied().collect();
+        for pid in pids {
+            let pr = self.period_rate_states.entry(pid).or_default();
+            let mut sum_count = 0u64;
+            let mut min_first: Option<f64> = None;
+            let mut max_last: Option<f64> = None;
+            for m in &sorted {
+                if let Some(v) = pr.counts.remove(m) {
+                    sum_count += v;
+                }
+                if let Some(v) = pr.type_first_ts.remove(m) {
+                    min_first = Some(match min_first {
+                        Some(cur) => cur.min(v),
+                        None => v,
+                    });
+                }
+                if let Some(v) = pr.type_last_ts.remove(m) {
+                    max_last = Some(match max_last {
+                        Some(cur) => cur.max(v),
+                        None => v,
+                    });
+                }
+            }
+            if sum_count > 0 {
+                *pr.counts.entry(group_id.clone()).or_insert(0) += sum_count;
+            }
+            if let Some(v) = min_first {
+                pr.type_first_ts.insert(group_id.clone(), v);
+            }
+            if let Some(v) = max_last {
+                pr.type_last_ts.insert(group_id.clone(), v);
+            }
+        }
+
+        // Rewrite existing events.
+        let member_set: HashSet<String> = sorted.iter().cloned().collect();
+        for ev in self.events.iter_mut() {
+            if member_set.contains(&ev.type_id) {
+                let prev = std::mem::replace(&mut ev.type_id, group_id.clone());
+                if ev.original_type_id.is_none() {
+                    ev.original_type_id = Some(prev);
+                }
+            }
+        }
+
+        // Replace member entries in `types` with the merged profile, then add
+        // aliases and register the group.
+        for m in &sorted {
+            self.types.shift_remove(m);
+        }
+        self.types.insert(group_id.clone(), merged);
+
+        for m in &sorted {
+            self.type_aliases.insert(m.clone(), group_id.clone());
+        }
+        let group = MergeGroup {
+            group_id: group_id.clone(),
+            label: cleaned_label.to_string(),
+            members: sorted,
+            members_prior_name,
+        };
+        self.merge_groups.insert(group_id.clone(), group);
+
+        Some(group_id)
+    }
+
+    /// Unmerge a previously-merged group. Returns the removed `MergeGroup` so
+    /// the caller can fan out filter terms. Caller is responsible for filter
+    /// expansion and calling `refresh_live_anomaly_scores`.
+    pub fn unmerge_group(&mut self, group_id: &str) -> Option<MergeGroup> {
+        let group = self.merge_groups.shift_remove(group_id)?;
+
+        // Restore original type ids on events that flowed through this group.
+        for ev in self.events.iter_mut() {
+            if ev.type_id == group_id {
+                let restored = ev
+                    .original_type_id
+                    .take()
+                    .unwrap_or_else(|| group_id.to_string());
+                ev.type_id = restored;
+            }
+        }
+
+        // Remove the group from all type-keyed maps; member entries will be
+        // rebuilt by replaying events below.
+        self.types.shift_remove(group_id);
+        self.baseline_counts.remove(group_id);
+        self.baseline_last_seen_by_type.remove(group_id);
+        self.last_seen_by_type.remove(group_id);
+        for pr in self.period_rate_states.values_mut() {
+            pr.counts.remove(group_id);
+            pr.type_first_ts.remove(group_id);
+            pr.type_last_ts.remove(group_id);
+        }
+
+        for m in &group.members {
+            self.type_aliases.remove(m);
+        }
+
+        // Rebuild per-member state from the live event log. Baseline events are
+        // owned by the App layer; the caller is responsible for invoking
+        // `recompute_member_state_from_baseline` with those events.
+        self.recompute_type_state_for_members(&group.members);
+
+        // Restore each member's prior name (if any) after the rebuild.
+        for (m, prior) in group.members.iter().zip(group.members_prior_name.iter()) {
+            if let Some(name) = prior.clone() {
+                if let Some(tp) = self.types.get_mut(m) {
+                    tp.name = Some(name);
+                }
+            }
+        }
+
+        Some(group)
+    }
+
+    /// Rebuilds live-event-driven state for the given members by replaying the
+    /// current `self.events`. Resets each member's `TypeProfile` and rebuilds
+    /// path_stats / baseline_path_stats (the latter from events with no action
+    /// period), period_rate_states, last_seen_by_type, and TypeProfile.count.
+    /// Does NOT touch baseline_counts / baseline_last_seen_by_type — those are
+    /// driven by `App.baseline_events`, not `self.events`.
+    pub fn recompute_type_state_for_members(&mut self, members: &[String]) {
+        let member_set: HashSet<String> = members.iter().cloned().collect();
+
+        // Reset per-member TypeProfile placeholders and period maps for these members.
+        for m in members {
+            self.types.shift_remove(m);
+        }
+        for pr in self.period_rate_states.values_mut() {
+            for m in members {
+                pr.counts.remove(m);
+                pr.type_first_ts.remove(m);
+                pr.type_last_ts.remove(m);
+            }
+        }
+        for m in members {
+            self.last_seen_by_type.remove(m);
+        }
+
+        // Collect a temporary scalar-path cache by re-deriving from each event.
+        // We iterate events in order, rebuilding state in lockstep with how
+        // ingest would have populated it.
+        let events_snapshot = self.events.clone();
+        for ev in &events_snapshot {
+            let raw = ev.original_type_id.as_ref().unwrap_or(&ev.type_id).clone();
+            if !member_set.contains(&raw) {
+                continue;
+            }
+            let mut scalar_paths: Vec<(String, String)> = Vec::new();
+            collect_scalar_paths(&ev.obj, "", &mut scalar_paths);
+            let in_action_period = ev.in_action_period;
+
+            // Update TypeProfile.
+            let tp = self.get_or_create_type_profile(&raw, &ev.obj);
+            tp.count += 1;
+            if tp.count == 1 {
+                tp.example = ev.obj.clone();
+            }
+            let _ = update_uniqueness(tp, &scalar_paths, in_action_period);
+
+            // Update period_rate_states.
+            if let Some(pid) = ev.action_period_id {
+                let pr = self.period_rate_states.entry(pid).or_default();
+                *pr.counts.entry(raw.clone()).or_insert(0) += 1;
+                pr.type_first_ts.entry(raw.clone()).or_insert(ev.ts);
+                pr.type_last_ts.insert(raw.clone(), ev.ts);
+            }
+
+            self.last_seen_by_type.insert(raw, ev.ts);
+        }
+    }
+
+    /// Apply a list of saved MergeGroups to a model that has not yet ingested
+    /// events. After this call the type_aliases hook will redirect every
+    /// matching incoming event into the appropriate group during ingest.
+    /// The merged TypeProfile is initialized empty; it will accumulate from
+    /// the event stream just like any other type.
+    pub fn apply_merge_groups(&mut self, groups: &[MergeGroup]) {
+        for g in groups {
+            for m in &g.members {
+                self.type_aliases.insert(m.clone(), g.group_id.clone());
+            }
+            self.merge_groups.insert(g.group_id.clone(), g.clone());
+            // Seed an empty TypeProfile so renames/filters/etc. work before any
+            // events flow in.
+            let cleaned = g.label.trim();
+            let name = if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned.to_string())
+            };
+            self.types
+                .entry(g.group_id.clone())
+                .or_insert_with(|| TypeProfile {
+                    type_id: g.group_id.clone(),
+                    name,
+                    count: 0,
+                    example: Value::Null,
+                    considered_paths: IndexMap::new(),
+                    path_overrides: IndexMap::new(),
+                    path_stats: IndexMap::new(),
+                    baseline_path_stats: IndexMap::new(),
+                    known_unrelated: false,
+                    latest_rate: 0.0,
+                    latest_uniq: 0.0,
+                });
+        }
+    }
+
     pub fn set_periods(&mut self, periods: Vec<ActionPeriod>) {
         let mut sorted = periods;
         sorted.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.id.cmp(&b.id)));
@@ -947,7 +1347,10 @@ impl AnalyzerModel {
     }
 }
 
-fn default_type_label(type_id: &str) -> String {
+pub fn default_type_label(type_id: &str) -> String {
+    if let Some(rest) = type_id.strip_prefix(TYPE_OVERRIDE_PREFIX) {
+        return rest.to_string();
+    }
     format!("type-{}", &type_id[..type_id.len().min(8)])
 }
 
@@ -1121,15 +1524,13 @@ fn collect_scalar_paths(v: &Value, path: &str, out: &mut Vec<(String, String)>) 
 }
 
 pub fn classify_event(obj: &Value) -> (String, Vec<String>) {
-    let shape = extract_shape(obj);
-    let type_id = structural_hash(&shape);
+    let type_id = type_id_for(obj);
     let keys = collect_all_paths(obj);
     (type_id, keys)
 }
 
 pub fn prepare_event(obj: Value) -> PreparedEvent {
-    let shape = extract_shape(&obj);
-    let type_id = structural_hash(&shape);
+    let type_id = type_id_for(&obj);
     let keys = collect_all_paths(&obj);
     let mut scalar_paths = Vec::new();
     collect_scalar_paths(&obj, "", &mut scalar_paths);
@@ -1139,6 +1540,25 @@ pub fn prepare_event(obj: Value) -> PreparedEvent {
         keys,
         scalar_paths,
     }
+}
+
+const TYPE_OVERRIDE_PREFIX: &str = "t:";
+
+fn type_id_for(obj: &Value) -> String {
+    if let Some(name) = type_field_value(obj) {
+        return format!("{}{}", TYPE_OVERRIDE_PREFIX, name);
+    }
+    let shape = extract_shape(obj);
+    structural_hash(&shape)
+}
+
+/// Returns the `_type` override value when it is a non-empty trimmed string.
+/// Non-string / empty values fall through to structural classification; the
+/// strict validation that rejects those lives in the ingest pipeline.
+pub fn type_field_value(obj: &Value) -> Option<String> {
+    let raw = obj.get("_type")?.as_str()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 pub fn value_token(v: &Value) -> String {
@@ -1181,17 +1601,23 @@ pub fn toggle_negated_type_in_filter(filter: &str, canonical_name: &str) -> Stri
             group.retain(|term| !(term.negated && term.value.to_lowercase() == needle));
         }
         expr.groups.retain(|group| !group.is_empty());
-    } else if expr.groups.is_empty() {
-        expr.groups.push(vec![FilterTerm {
-            negated: true,
-            value: canonical.to_string(),
-        }]);
     } else {
         for group in &mut expr.groups {
-            group.push(FilterTerm {
+            group.retain(|term| !(!term.negated && term.value.to_lowercase() == needle));
+        }
+        expr.groups.retain(|group| !group.is_empty());
+        if expr.groups.is_empty() {
+            expr.groups.push(vec![FilterTerm {
                 negated: true,
                 value: canonical.to_string(),
-            });
+            }]);
+        } else {
+            for group in &mut expr.groups {
+                group.push(FilterTerm {
+                    negated: true,
+                    value: canonical.to_string(),
+                });
+            }
         }
     }
     format_filter_expr(&expr)
@@ -1199,8 +1625,10 @@ pub fn toggle_negated_type_in_filter(filter: &str, canonical_name: &str) -> Stri
 
 pub fn replace_positive_type_filters(filter: &str, canonical_name: &str) -> String {
     let canonical = canonical_name.trim();
+    let needle = canonical.to_lowercase();
     let mut terms = common_negated_type_terms(filter);
     if !canonical.is_empty() {
+        terms.retain(|term| term.value.to_lowercase() != needle);
         terms.push(FilterTerm {
             negated: false,
             value: canonical.to_string(),
@@ -1252,6 +1680,97 @@ pub fn apply_rename_batch_to_filter(filter: &str, renames: &[(String, String)]) 
         out = rename_type_terms_in_filter(&out, old, new);
     }
     out
+}
+
+/// Drop duplicate terms within each AND group and drop duplicate groups.
+pub fn dedupe_filter_terms(filter: &str) -> String {
+    let mut expr = FilterExpr::parse(filter);
+    for group in &mut expr.groups {
+        let mut seen: HashSet<(bool, String)> = HashSet::new();
+        group.retain(|term| seen.insert((term.negated, term.value.to_lowercase())));
+    }
+    expr.groups.retain(|g| !g.is_empty());
+    // Deduplicate identical groups.
+    let mut group_seen: HashSet<String> = HashSet::new();
+    expr.groups.retain(|g| {
+        let key = g
+            .iter()
+            .map(|t| format!("{}{}", if t.negated { "!" } else { "" }, t.value.to_lowercase()))
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        group_seen.insert(key)
+    });
+    format_filter_expr(&expr)
+}
+
+/// Expand a merged group's label into its member names. Positive references
+/// to the label fan a group out into one copy per member; negative references
+/// to the label stack !member terms within the group.
+pub fn expand_merged_label_in_filter(
+    filter: &str,
+    label: &str,
+    member_names: &[String],
+) -> String {
+    let label = label.trim();
+    if label.is_empty() || member_names.is_empty() {
+        return filter.trim().to_string();
+    }
+    let label_lc = label.to_lowercase();
+    let expr = FilterExpr::parse(filter);
+    if expr.groups.is_empty() {
+        return filter.trim().to_string();
+    }
+
+    let mut out_groups: Vec<Vec<FilterTerm>> = Vec::new();
+    for group in expr.groups {
+        // Determine if any positive label term is present.
+        let positive_indices: Vec<usize> = group
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.negated && t.value.to_lowercase() == label_lc)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Stage 1: positive fan-out.
+        let stage_groups: Vec<Vec<FilterTerm>> = if positive_indices.is_empty() {
+            vec![group.clone()]
+        } else {
+            let mut variants: Vec<Vec<FilterTerm>> = Vec::new();
+            for member in member_names {
+                let mut g = group.clone();
+                for &idx in &positive_indices {
+                    g[idx] = FilterTerm {
+                        negated: false,
+                        value: member.clone(),
+                    };
+                }
+                variants.push(g);
+            }
+            variants
+        };
+
+        // Stage 2: for each stage group, expand negative label terms by
+        // replacing each one with a sequence of !member terms (stacked).
+        for g in stage_groups {
+            let mut expanded: Vec<FilterTerm> = Vec::new();
+            for term in g {
+                if term.negated && term.value.to_lowercase() == label_lc {
+                    for member in member_names {
+                        expanded.push(FilterTerm {
+                            negated: true,
+                            value: member.clone(),
+                        });
+                    }
+                } else {
+                    expanded.push(term);
+                }
+            }
+            out_groups.push(expanded);
+        }
+    }
+    let expanded_expr = FilterExpr { groups: out_groups };
+    let formatted = format_filter_expr(&expanded_expr);
+    dedupe_filter_terms(&formatted)
 }
 
 fn parse_exact_filter(filter: &str) -> Option<(&str, String)> {
@@ -2018,5 +2537,275 @@ mod tests {
 
         let cleared = clear_positive_type_filters(&filter);
         assert_eq!(cleared, "!Noise");
+    }
+
+    #[test]
+    fn applying_t_strips_matching_negation_for_same_type() {
+        let filter = replace_positive_type_filters("!login", "login");
+        assert_eq!(filter, "login");
+        assert!(!type_is_negated_in_filter(&filter, "login"));
+    }
+
+    #[test]
+    fn applying_t_preserves_unrelated_negations_for_same_type() {
+        let filter = replace_positive_type_filters("!login && !other", "login");
+        assert_eq!(filter, "!other && login");
+        assert!(!type_is_negated_in_filter(&filter, "login"));
+    }
+
+    #[test]
+    fn applying_u_strips_matching_positive_for_same_type() {
+        let filter = toggle_negated_type_in_filter("login", "login");
+        assert_eq!(filter, "!login");
+        assert!(type_is_negated_in_filter(&filter, "login"));
+    }
+
+    #[test]
+    fn applying_u_strips_positive_alongside_unrelated_term() {
+        let filter = toggle_negated_type_in_filter("foo && login", "login");
+        assert_eq!(filter, "foo && !login");
+        assert!(type_is_negated_in_filter(&filter, "login"));
+    }
+
+    #[test]
+    fn applying_u_strips_positive_across_or_groups() {
+        let filter = toggle_negated_type_in_filter("foo || login", "login");
+        assert_eq!(filter, "foo && !login");
+        assert!(type_is_negated_in_filter(&filter, "login"));
+    }
+
+    #[test]
+    fn type_field_overrides_structural_hash() {
+        let a = prepare_event(json!({"_type": "login", "user": "alice"}));
+        let b = prepare_event(json!({"_type": "login", "user": "bob", "extra": 1}));
+        let c = prepare_event(json!({"_type": "logout", "user": "alice"}));
+        assert_eq!(a.type_id, "t:login");
+        assert_eq!(b.type_id, "t:login");
+        assert_eq!(c.type_id, "t:logout");
+        assert_ne!(a.type_id, c.type_id);
+    }
+
+    #[test]
+    fn type_field_label_renders_without_type_prefix() {
+        assert_eq!(default_type_label("t:login"), "login");
+        assert_eq!(default_type_label("abcdef012345"), "type-abcdef01");
+    }
+
+    #[test]
+    fn type_field_overridden_event_can_be_renamed() {
+        let mut model = AnalyzerModel::new();
+        model.ingest(json!({"_type": "login", "user": "a"}), 1.0);
+        model.rename_type("t:login", "User Login".to_string());
+        assert_eq!(model.canonical_type_name("t:login"), "User Login");
+        assert_eq!(model.type_display_name("t:login"), "User Login (login)");
+    }
+
+    #[test]
+    fn type_field_non_string_falls_back_to_shape_in_prepare() {
+        // prepare_event itself is silent on bad _type; strict validation lives
+        // in the ingest pipeline. Here, the override is simply ignored.
+        let p = prepare_event(json!({"_type": 42, "k": 1}));
+        assert!(!p.type_id.starts_with("t:"));
+    }
+
+    #[test]
+    fn type_field_empty_or_whitespace_falls_back_to_shape() {
+        let a = prepare_event(json!({"_type": "", "k": 1}));
+        let b = prepare_event(json!({"_type": "   ", "k": 1}));
+        assert!(!a.type_id.starts_with("t:"));
+        assert!(!b.type_id.starts_with("t:"));
+    }
+
+    fn type_id_of(model: &AnalyzerModel, predicate: impl Fn(&Value) -> bool) -> String {
+        model
+            .events
+            .iter()
+            .find(|e| predicate(&e.obj))
+            .map(|e| e.type_id.clone())
+            .expect("matching event")
+    }
+
+    fn structural_type_id(v: &Value) -> String {
+        structural_hash(&extract_shape(v))
+    }
+
+    #[test]
+    fn merge_two_types_sums_baseline_counts() {
+        let mut model = AnalyzerModel::new();
+        let login_id =
+            structural_type_id(&json!({"event": "login", "user": "u0"}));
+        let purchase_id = structural_type_id(&json!({"event": "purchase", "amount": 0}));
+        // Baseline events of two distinct shapes.
+        for i in 0..5 {
+            model.ingest_baseline(json!({"event": "login", "user": format!("u{i}")}), i as f64);
+        }
+        for i in 0..3 {
+            model.ingest_baseline(
+                json!({"event": "purchase", "amount": i}),
+                (10 + i) as f64,
+            );
+        }
+        assert_ne!(login_id, purchase_id);
+
+        let group_id = model
+            .merge_types(&[login_id.clone(), purchase_id.clone()], "Auth".to_string())
+            .expect("merged");
+        assert_eq!(*model.baseline_counts.get(&group_id).unwrap(), 5 + 3);
+        assert!(!model.baseline_counts.contains_key(&login_id));
+        assert!(!model.baseline_counts.contains_key(&purchase_id));
+    }
+
+    #[test]
+    fn merge_two_types_unions_path_stats() {
+        let mut model = AnalyzerModel::new();
+        // Distinct shapes (different key sets) so structural hashes differ.
+        for _ in 0..7 {
+            model.ingest(json!({"event": "login", "user": "a"}), 1.0);
+        }
+        for _ in 0..7 {
+            model.ingest(json!({"event": "logout", "session": "z"}), 2.0);
+        }
+        let login_id = type_id_of(&model, |v| v.get("user").is_some());
+        let logout_id = type_id_of(&model, |v| v.get("session").is_some());
+        assert_ne!(login_id, logout_id);
+        let group_id = model
+            .merge_types(&[login_id, logout_id], "AuthEvent".to_string())
+            .expect("merged");
+        let tp = model.types.get(&group_id).expect("group exists");
+        let stats = tp.path_stats.get("event").expect("event path");
+        assert_eq!(stats.total, 14);
+        assert_eq!(stats.values.get("s:login").copied(), Some(7));
+        assert_eq!(stats.values.get("s:logout").copied(), Some(7));
+    }
+
+    #[test]
+    fn merge_then_unmerge_restores_state() {
+        // Build a control model that never merges.
+        let mut control = AnalyzerModel::new();
+        for _ in 0..3 {
+            control.ingest(json!({"event": "login", "user": "a"}), 1.0);
+        }
+        for _ in 0..2 {
+            control.ingest(json!({"event": "logout", "session": "z"}), 2.0);
+        }
+
+        let mut subj = AnalyzerModel::new();
+        for _ in 0..3 {
+            subj.ingest(json!({"event": "login", "user": "a"}), 1.0);
+        }
+        for _ in 0..2 {
+            subj.ingest(json!({"event": "logout", "session": "z"}), 2.0);
+        }
+        let login_id = type_id_of(&subj, |v| v.get("user").is_some());
+        let logout_id = type_id_of(&subj, |v| v.get("session").is_some());
+        let group_id = subj
+            .merge_types(&[login_id.clone(), logout_id.clone()], "Auth".to_string())
+            .expect("merge");
+        subj.unmerge_group(&group_id).expect("unmerge");
+
+        // Both members should be present, with the same counts.
+        assert!(subj.types.contains_key(&login_id));
+        assert!(subj.types.contains_key(&logout_id));
+        assert_eq!(
+            subj.types.get(&login_id).unwrap().count,
+            control.types.get(&login_id).unwrap().count
+        );
+        assert_eq!(
+            subj.types.get(&logout_id).unwrap().count,
+            control.types.get(&logout_id).unwrap().count
+        );
+        assert!(!subj.merge_groups.contains_key(&group_id));
+        assert!(subj.type_aliases.is_empty());
+    }
+
+    #[test]
+    fn merge_with_conflicting_path_overrides_prefers_forced_off() {
+        let mut model = AnalyzerModel::new();
+        model.ingest(json!({"k": "a"}), 1.0);
+        model.ingest(json!({"k": "b", "y": 1}), 2.0);
+        let a_id = type_id_of(&model, |v| v.get("y").is_none());
+        let b_id = type_id_of(&model, |v| v.get("y").is_some());
+        // a forces 'k' OFF; b forces 'k' ON.
+        if let Some(tp) = model.types.get_mut(&a_id) {
+            tp.path_overrides.insert("k".to_string(), PathOverride::ForcedOff);
+        }
+        if let Some(tp) = model.types.get_mut(&b_id) {
+            tp.path_overrides.insert("k".to_string(), PathOverride::ForcedOn);
+        }
+        let group_id = model
+            .merge_types(&[a_id, b_id], "Mixed".to_string())
+            .expect("merge");
+        let merged = model.types.get(&group_id).expect("merged");
+        assert_eq!(
+            merged.path_overrides.get("k").copied(),
+            Some(PathOverride::ForcedOff)
+        );
+    }
+
+    #[test]
+    fn merge_group_id_is_deterministic() {
+        let mut m1 = AnalyzerModel::new();
+        m1.ingest(json!({"event": "x", "user": "a"}), 1.0);
+        m1.ingest(json!({"event": "y", "session": "b"}), 2.0);
+        let ids1: Vec<String> = m1.types.keys().cloned().collect();
+        assert_eq!(ids1.len(), 2);
+
+        let mut m2 = AnalyzerModel::new();
+        // Reverse ingest order, same shapes.
+        m2.ingest(json!({"event": "y", "session": "b"}), 1.0);
+        m2.ingest(json!({"event": "x", "user": "a"}), 2.0);
+
+        let g1 = m1.merge_types(&ids1, "G".to_string()).expect("merge");
+        let g2 = m2.merge_types(&ids1, "G".to_string()).expect("merge");
+        assert_eq!(g1, g2);
+    }
+
+    #[test]
+    fn merge_filter_rewrite_replaces_member_names_with_label() {
+        let original = "TypeA && something";
+        let renamed = rename_type_terms_in_filter(original, "TypeA", "Merged");
+        assert_eq!(renamed, "Merged && something");
+    }
+
+    #[test]
+    fn expand_merged_label_in_filter_negative_stacks() {
+        let out = expand_merged_label_in_filter(
+            "!Merged",
+            "Merged",
+            &["A".to_string(), "B".to_string()],
+        );
+        assert_eq!(out, "!A && !B");
+    }
+
+    #[test]
+    fn expand_merged_label_in_filter_positive_fans_out() {
+        let out = expand_merged_label_in_filter(
+            "Merged && other",
+            "Merged",
+            &["A".to_string(), "B".to_string()],
+        );
+        assert_eq!(out, "A && other || B && other");
+    }
+
+    #[test]
+    fn negative_type_filter_via_u_works_on_group_label() {
+        let mut model = AnalyzerModel::new();
+        model.ingest(json!({"event": "x", "user": "a"}), 1.0);
+        model.ingest(json!({"event": "y", "session": "b"}), 2.0);
+        let ids: Vec<String> = model.types.keys().cloned().collect();
+        let _ = model
+            .merge_types(&ids, "Merged".to_string())
+            .expect("merge");
+        let label = model.canonical_type_name(
+            &model
+                .merge_groups
+                .keys()
+                .next()
+                .expect("group exists")
+                .clone(),
+        );
+        assert_eq!(label, "Merged");
+        let filter = toggle_negated_type_in_filter("", &label);
+        assert!(type_is_negated_in_filter(&filter, &label));
     }
 }

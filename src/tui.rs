@@ -5,6 +5,7 @@ use crate::domain::{
 use crate::persistence::RestoredState;
 use indexmap::IndexMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use std::collections::HashSet;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
@@ -36,6 +37,7 @@ pub enum InputMode {
     EditPeriodRange,
     ExportSessionPath,
     ExportProfilePath,
+    MergeTypes,
 }
 
 pub fn draw_file_changed_prompt(frame: &mut Frame<'_>, state: &RestoredState) {
@@ -579,18 +581,24 @@ fn types_list_title(
     unfiltered: usize,
     path_focus: bool,
     search: &str,
+    selected_for_merge: usize,
     pane_width: u16,
 ) -> Line<'static> {
     let focus = if path_focus { "details" } else { "list" };
+    let sel_suffix = if selected_for_merge > 0 {
+        format!(", {selected_for_merge} selected")
+    } else {
+        String::new()
+    };
     let (counter_len, counter_spans) = if search.is_empty() {
-        let counter = format!("Types {}/{} ({focus}) ", row, total);
+        let counter = format!("Types {}/{} ({focus}{sel_suffix}) ", row, total);
         (counter.len(), vec![Span::raw(counter)])
     } else {
         let omitted = unfiltered.saturating_sub(total);
         let search = truncate_text(search, 16);
         (
             format!(
-                "Types {}/{} ({omitted} omitted, filter: {}) ",
+                "Types {}/{} ({omitted} omitted, filter: {}{sel_suffix}) ",
                 row, total, search
             )
             .len(),
@@ -600,7 +608,7 @@ fn types_list_title(
                     row, total
                 )),
                 Span::styled(search, Style::default().fg(Color::LightGreen)),
-                Span::raw(") "),
+                Span::raw(format!("{sel_suffix}) ")),
             ],
         )
     };
@@ -610,11 +618,27 @@ fn types_list_title(
     if (pane_width as usize) < counter_len + 4 {
         return Line::from(counter_spans);
     }
+    // Path focus has its own hint set (space toggles include/exclude); s/g
+    // are list-focus only.
+    if path_focus {
+        let mut spans = counter_spans.clone();
+        spans.extend([
+            styled_hotkey("space"),
+            Span::raw(" include/exclude, "),
+            styled_hotkey("←"),
+            Span::raw(" back to list"),
+        ]);
+        return Line::from(spans);
+    }
     // Narrow: just show keys without descriptions
-    if pane_width < 56 {
+    if pane_width < 64 {
         let mut spans = counter_spans.clone();
         spans.extend([
             styled_hotkey("↵"),
+            Span::raw("/"),
+            styled_hotkey("s"),
+            Span::raw("/"),
+            styled_hotkey("g"),
             Span::raw("/"),
             styled_hotkey("r"),
             Span::raw("/"),
@@ -627,17 +651,21 @@ fn types_list_title(
         return Line::from(spans);
     }
     // Medium: short descriptions
-    if pane_width < 80 {
+    if pane_width < 96 {
         let mut spans = counter_spans.clone();
         spans.extend([
             styled_hotkey("↵"),
             Span::raw(" details, "),
+            styled_hotkey("s"),
+            Span::raw(" select, "),
+            styled_hotkey("g"),
+            Span::raw(" merge, "),
             styled_hotkey("r"),
             Span::raw(" rename, "),
             styled_hotkey("t"),
             Span::raw(" filter, "),
             styled_hotkey("u"),
-            Span::raw(" exclude, "),
+            Span::raw(" !type, "),
             styled_hotkey("/"),
             Span::raw(" search"),
         ]);
@@ -648,14 +676,18 @@ fn types_list_title(
     spans.extend([
         styled_hotkey("↵"),
         Span::raw(" details, "),
+        styled_hotkey("s"),
+        Span::raw(" select, "),
+        styled_hotkey("g"),
+        Span::raw(" merge/unmerge, "),
         styled_hotkey("r"),
         Span::raw(" rename, "),
         styled_hotkey("t"),
         Span::raw(" filter, "),
         styled_hotkey("u"),
-        Span::raw(" toggle !type, "),
+        Span::raw(" !type, "),
         styled_hotkey("/"),
-        Span::raw(" search, by count"),
+        Span::raw(" search"),
     ]);
     Line::from(spans)
 }
@@ -749,6 +781,8 @@ fn selected_json_title(is_key_focus: bool, value_focus: bool, pane_width: u16) -
             Span::raw(" value, "),
             styled_hotkey("v"),
             Span::raw(" browse, "),
+            styled_hotkey("f"),
+            Span::raw(" fold, "),
             styled_hotkey("t"),
             Span::raw(" type)"),
         ]);
@@ -761,6 +795,8 @@ fn selected_json_title(is_key_focus: bool, value_focus: bool, pane_width: u16) -
         Span::raw(" value, "),
         styled_hotkey("v"),
         Span::raw(" browse values, "),
+        styled_hotkey("f"),
+        Span::raw(" fold, "),
         styled_hotkey("t"),
         Span::raw(" jump type)"),
     ])
@@ -856,6 +892,8 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
     {
         let idx = type_start + vis_idx;
         let excluded = app.type_excluded_by_type_filter(type_id);
+        let selected_for_merge = app.is_type_selected_for_merge(type_id);
+        let is_group = app.model.merge_groups.contains_key(*type_id);
         let mut style = Style::default();
         if idx == app.type_index {
             style = if app.types_path_focus {
@@ -867,13 +905,22 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 style.fg(Color::Yellow).add_modifier(Modifier::BOLD)
             };
+        } else if selected_for_merge {
+            style = style.fg(Color::Magenta).add_modifier(Modifier::BOLD);
         } else if excluded {
             style = style.fg(Color::Gray).add_modifier(Modifier::DIM);
         }
         let name = app.model.canonical_type_name(type_id);
-        let marker = if excluded { "[-] " } else { "    " };
+        let marker = if selected_for_merge {
+            "[*] "
+        } else if excluded {
+            "[-] "
+        } else {
+            "    "
+        };
+        let group_suffix = if is_group { " [merged]" } else { "" };
         type_items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!("{}{}  count={}", marker, name, tp.count),
+            format!("{}{}{}  count={}", marker, name, group_suffix, tp.count),
             style,
         )])));
     }
@@ -887,6 +934,7 @@ fn draw_types(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.model.types.len(),
         app.types_path_focus,
         &app.types_filter,
+        app.selected_type_ids.len(),
         cols[0].width,
     );
     frame.render_widget(
@@ -1193,27 +1241,31 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
         format!("Connected: {}", entries.join(", "))
     };
     if app.input_mode != InputMode::None {
-        let title = match app.input_mode {
-            InputMode::None => "",
-            InputMode::Label => "set label",
+        let title: String = match app.input_mode {
+            InputMode::None => String::new(),
+            InputMode::Label => "set label".to_string(),
             InputMode::EventFilter(field) => match field {
-                FilterField::Key => "keys (expr: a && !b, a || b)",
-                FilterField::Type => "type (expr: login && !debug)",
-                FilterField::Fuzzy => "fuzzy (expr: abc && !xyz)",
-                FilterField::Exact => "exact key=value (expr supported)",
-                FilterField::Substring => "substring (expr: foo && !bar)",
+                FilterField::Key => "keys (expr: a && !b, a || b)".to_string(),
+                FilterField::Type => "type (expr: login && !debug)".to_string(),
+                FilterField::Fuzzy => "fuzzy (expr: abc && !xyz)".to_string(),
+                FilterField::Exact => "exact key=value (expr supported)".to_string(),
+                FilterField::Substring => "substring (expr: foo && !bar)".to_string(),
             },
-            InputMode::TypesFilter => "type list filter",
-            InputMode::RenameType => "rename type",
-            InputMode::RenamePeriod => "rename period",
+            InputMode::TypesFilter => "type list filter".to_string(),
+            InputMode::RenameType => "rename type".to_string(),
+            InputMode::RenamePeriod => "rename period".to_string(),
             InputMode::InsertPeriodRange => {
-                "insert period in format <row_start>-<row_end> (e.g. 234-268)"
+                "insert period in format <row_start>-<row_end> (e.g. 234-268)".to_string()
             }
             InputMode::EditPeriodRange => {
-                "edit period in format <row_start>-<row_end> (e.g. 234-268)"
+                "edit period in format <row_start>-<row_end> (e.g. 234-268)".to_string()
             }
-            InputMode::ExportSessionPath => "export session path (Enter to write)",
-            InputMode::ExportProfilePath => "export profile path (Enter to write)",
+            InputMode::ExportSessionPath => "export session path (Enter to write)".to_string(),
+            InputMode::ExportProfilePath => "export profile path (Enter to write)".to_string(),
+            InputMode::MergeTypes => {
+                let n = app.selected_type_ids.len();
+                format!("label for merging {n} types into one")
+            }
         };
         let prefix = format!("{}: ", title);
         let available = inner_width.saturating_sub(prefix.chars().count());
@@ -1597,34 +1649,31 @@ fn draw_full_help(frame: &mut Frame<'_>, app: &App) {
         Line::from("  left returns from key selection to event list"),
         Line::from("  Home/End jump to top/bottom"),
         Line::from("  PageUp/PageDown move viewport and cursor (Ctrl+U / Ctrl+D also)"),
-        Line::from("  with key focus: up/down select key, k apply key filter, t jump to type"),
-        Line::from("  k/t///z/e set filters (/ substring, z fuzzy), c clear filters, y suspend/restore filters, w cycle whitelist"),
-        Line::from("  filter expression syntax: AND with &&, OR with ||, negate with !"),
-        Line::from("  examples: type 'login && !debug' | exact 'user=alice && !event=logout'"),
+        Line::from("  with key focus: up/down select key, k apply key filter, t jump to type, f fold/unfold object or array"),
+        Line::from("  k/t///z/e/y/w filters | c clear | filter syntax: && || ! | e.g. type 'login && !debug'"),
         Line::from(""),
         Line::from("Periods"),
         Line::from("  3 panes: periods | events | selected JSON"),
         Line::from("  enter/right move focus right, left move focus left"),
         Line::from("  up/down choose row in active pane"),
         Line::from("  with periods focus: i insert start-end, e edit selected, d delete selected (asks confirm)"),
+        Line::from("  with json focus: f fold/unfold selected object or array"),
         Line::from(""),
         Line::from("Types"),
         Line::from("  / filter types by id or name"),
         Line::from("  t apply selected type as event filter and jump to Live"),
-        Line::from("  after t: esc returns to Types"),
         Line::from("  r rename selected type"),
         Line::from("  j popup preview of first-seen sample object"),
         Line::from("  enter/right focus paths, left return to type list"),
         Line::from("  with path focus: up/down choose path, space toggle include/exclude"),
         Line::from("  u toggle selected type in negative type filter (!\"type name\")"),
+        Line::from("  s toggle selection for merge | g merge >=2 selected (or unmerge highlighted group)"),
         Line::from(""),
         Line::from("Baseline"),
         Line::from("  up/down scroll events"),
         Line::from("  right or enter focus key selection in selected-object pane"),
-        Line::from("  left returns from key/value focus to event list"),
-        Line::from("  with key focus: up/down select key, k apply key filter, t jump to type"),
+        Line::from("  with key focus: up/down select key, k apply key filter, t jump to type, f fold/unfold object or array"),
         Line::from("  with value focus: e apply exact path=value filter"),
-        Line::from("  / substring filter, z fuzzy filter, e exact filter input, w whitelist"),
     ];
     frame.render_widget(
         Paragraph::new(Text::from(body))
@@ -1658,6 +1707,7 @@ fn draw_type_preview_modal(frame: &mut Frame<'_>, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
+        let collapsed_paths = app.collapsed_paths_for_type(type_id);
         let rendered = render_json_keypicker(
             &sample,
             None,
@@ -1667,6 +1717,7 @@ fn draw_type_preview_modal(frame: &mut Frame<'_>, app: &App) {
             "",
             &[],
             None,
+            collapsed_paths,
             app.escape_strings,
         );
         lines.extend(rendered.lines);
@@ -1694,6 +1745,7 @@ fn render_json_keypicker(
     substring_filter: &str,
     whitelist_terms: &[String],
     considered_paths: Option<&IndexMap<String, bool>>,
+    collapsed_paths: Option<&HashSet<String>>,
     escape_strings: bool,
 ) -> JsonRender {
     let mut lines = Vec::new();
@@ -1709,6 +1761,7 @@ fn render_json_keypicker(
         substring_filter,
         whitelist_terms,
         considered_paths,
+        collapsed_paths,
         &mut lines,
         &mut selected_line,
         escape_strings,
@@ -1794,6 +1847,7 @@ fn build_event_preview(
     } else {
         &[]
     };
+    let collapsed_paths = app.collapsed_paths_for_type(&event.type_id);
     let rendered = render_json_keypicker(
         &event.obj,
         selected_path,
@@ -1803,6 +1857,7 @@ fn build_event_preview(
         &sub_lc,
         whitelist_terms,
         considered_paths,
+        collapsed_paths,
         app.escape_strings,
     );
     let preview_prefix_lines = lines.len();
@@ -1825,6 +1880,7 @@ fn render_json_value_lines(
     substring_filter: &str,
     whitelist_terms: &[String],
     considered_paths: Option<&IndexMap<String, bool>>,
+    collapsed_paths: Option<&HashSet<String>>,
     out: &mut Vec<Line<'static>>,
     selected_line: &mut Option<usize>,
     escape_strings: bool,
@@ -1852,6 +1908,7 @@ fn render_json_value_lines(
                     substring_filter,
                     whitelist_terms,
                     considered_paths,
+                    collapsed_paths,
                     out,
                     selected_line,
                     escape_strings,
@@ -1877,6 +1934,7 @@ fn render_json_value_lines(
                     substring_filter,
                     whitelist_terms,
                     considered_paths,
+                    collapsed_paths,
                     out,
                     selected_line,
                     escape_strings,
@@ -1928,6 +1986,33 @@ fn push_open_bracket(
             json_punctuation_style()
         },
     ));
+    out.push(Line::from(prefix));
+}
+
+fn push_collapsed_placeholder(
+    mut prefix: Vec<Span<'static>>,
+    placeholder: &str,
+    is_last: bool,
+    sel_or_filt: bool,
+    punctuation_override: Style,
+    normalized_out: bool,
+    out: &mut Vec<Line<'static>>,
+) {
+    let style = if sel_or_filt {
+        punctuation_override
+    } else {
+        apply_normalized_out_style(
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            normalized_out,
+        )
+    };
+    prefix.push(Span::styled(placeholder.to_string(), style));
+    if !is_last {
+        prefix.push(Span::styled(
+            ",",
+            apply_normalized_out_style(json_punctuation_style(), normalized_out),
+        ));
+    }
     out.push(Line::from(prefix));
 }
 
@@ -2028,6 +2113,7 @@ fn render_json_keyed_value_line(
     substring_filter: &str,
     whitelist_terms: &[String],
     considered_paths: Option<&IndexMap<String, bool>>,
+    collapsed_paths: Option<&HashSet<String>>,
     out: &mut Vec<Line<'static>>,
     selected_line: &mut Option<usize>,
     escape_strings: bool,
@@ -2093,7 +2179,39 @@ fn render_json_keyed_value_line(
     }
 
     let sel_or_filt = selected || filtered;
+    let is_collapsed = !path.is_empty()
+        && collapsed_paths
+            .map(|set| set.contains(path))
+            .unwrap_or(false);
     match value {
+        serde_json::Value::Object(map) if is_collapsed => {
+            if selected && selected_line.is_none() {
+                *selected_line = Some(out.len());
+            }
+            push_collapsed_placeholder(
+                prefix,
+                &format!("{{\u{2026}{}}}", map.len()),
+                is_last,
+                sel_or_filt,
+                punctuation_override,
+                normalized_out,
+                out,
+            );
+        }
+        serde_json::Value::Array(arr) if is_collapsed => {
+            if selected && selected_line.is_none() {
+                *selected_line = Some(out.len());
+            }
+            push_collapsed_placeholder(
+                prefix,
+                &format!("[\u{2026}{}]", arr.len()),
+                is_last,
+                sel_or_filt,
+                punctuation_override,
+                normalized_out,
+                out,
+            );
+        }
         serde_json::Value::Object(map) => {
             if selected && selected_line.is_none() {
                 *selected_line = Some(out.len());
@@ -2114,6 +2232,7 @@ fn render_json_keyed_value_line(
                     substring_filter,
                     whitelist_terms,
                     considered_paths,
+                    collapsed_paths,
                     out,
                     selected_line,
                     escape_strings,
@@ -2140,6 +2259,7 @@ fn render_json_keyed_value_line(
                     substring_filter,
                     whitelist_terms,
                     considered_paths,
+                    collapsed_paths,
                     out,
                     selected_line,
                     escape_strings,
@@ -2671,6 +2791,7 @@ mod tests {
             "",
             &[],
             None,
+            None,
             false,
         );
         assert_eq!(rendered.selected_line, Some(6));
@@ -2689,6 +2810,7 @@ mod tests {
             "",
             "",
             &[],
+            None,
             None,
             false,
         );
@@ -2728,6 +2850,7 @@ mod tests {
             "",
             "",
             &[],
+            None,
             None,
             false,
         );
