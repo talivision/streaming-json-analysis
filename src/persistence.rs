@@ -6,13 +6,14 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{create_dir_all, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
 const SHARED_VERSION: u32 = 1;
+const LOCAL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEvent {
@@ -103,17 +104,63 @@ impl SharedState {
     }
 }
 
-/// In-memory representation of state restored from disk on startup. View
-/// state (filters, label, current selection) is intentionally NOT persisted
-/// — it would clobber other operators' filters under the same Unix login.
+/// Per-process state: the cursor into the stream file and the operator's
+/// personal UI view (filters, label, etc.). Never shared across operators.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalState {
+    pub version: u32,
+    pub stream_path: String,
+    pub saved_len: u64,
+    pub prefix_hash_hex: String,
+    pub current_label: String,
+    pub event_filters: DataFilters,
+    pub stashed_event_filters: Option<DataFilters>,
+    pub types_filter: String,
+    /// Only populated by profile-import paths; no interactive key binding writes
+    /// to it. Kept local so each operator's import choices don't fight.
+    pub known_unrelated_types: Vec<String>,
+}
+
+impl LocalState {
+    pub fn empty(stream_path: String) -> Self {
+        Self {
+            version: LOCAL_VERSION,
+            stream_path,
+            saved_len: 0,
+            prefix_hash_hex: String::new(),
+            current_label: String::new(),
+            event_filters: DataFilters::default(),
+            stashed_event_filters: None,
+            types_filter: String::new(),
+            known_unrelated_types: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RestoredState {
     pub periods: Vec<ActionPeriod>,
     pub renames: Vec<(String, String)>,
+    pub known_unrelated_types: Vec<String>,
     pub normalized_field_overrides: Vec<NormalizedFieldOverride>,
+    pub current_label: String,
+    pub event_filters: DataFilters,
+    pub stashed_event_filters: Option<DataFilters>,
+    pub types_filter: String,
     /// Materialized triage identifiers — converted back to Vec<usize> in App
     /// by matching (ts, type_id) against the loaded EventRecord stream.
     pub triaged_events: Vec<(f64, String)>,
+}
+
+/// Outcome of attempting to load the per-stream state on startup.
+pub enum StateLoadResult {
+    /// File identity confirmed — full state can be restored.
+    Clean(RestoredState),
+    /// Stream content changed since the last local checkpoint. Periods are
+    /// included so callers can display the count in the prompt, but they
+    /// reference timestamps from the previous file and shouldn't be applied
+    /// blindly.
+    Changed(RestoredState),
 }
 
 // ---------------------------------------------------------------------------
@@ -123,11 +170,9 @@ pub struct RestoredState {
 #[derive(Debug, Clone)]
 pub struct StatePaths {
     pub shared: PathBuf,
+    pub local: PathBuf,
     pub lock: PathBuf,
     pub dir: PathBuf,
-    /// Stable per-stream prefix (the SHA-256 hex). Used by sibling files in
-    /// the same state directory (presence heartbeats, etc.).
-    pub id: String,
 }
 
 pub fn state_paths_for_stream(stream_path: &Path) -> Result<StatePaths> {
@@ -138,9 +183,9 @@ pub fn state_paths_for_stream(stream_path: &Path) -> Result<StatePaths> {
     let dir = base_state_dir()?;
     Ok(StatePaths {
         shared: dir.join(format!("{}.shared.json", id)),
+        local: dir.join(format!("{}.local.json", id)),
         lock: dir.join(format!("{}.shared.lock", id)),
         dir,
-        id,
     })
 }
 
@@ -311,58 +356,169 @@ pub fn save_shared_state(stream_path: &Path, state: &SharedState) -> Result<()> 
 }
 
 // ---------------------------------------------------------------------------
-// Startup load: returns the shared state for this stream if one exists.
-// View state (filters / label / cursor) is in-memory only and not loaded.
+// Local state IO (single process, no lock needed)
 // ---------------------------------------------------------------------------
 
-pub fn load_full_state(stream_path: &Path) -> Result<Option<RestoredState>> {
+pub fn read_local_state(stream_path: &Path) -> Result<Option<LocalState>> {
     let paths = state_paths_for_stream(stream_path)?;
-    let shared = if paths.shared.exists() {
-        // Take the lock briefly: we may be observing mid-write from another op.
-        let _lock = SharedLock::acquire(&paths)?;
-        read_shared_state_unlocked(&paths)?
-    } else {
-        None
-    };
-    let Some(shared) = shared else {
+    if !paths.local.exists() {
         return Ok(None);
-    };
-    Ok(Some(RestoredState {
-        periods: shared.periods,
-        renames: shared.renames,
-        normalized_field_overrides: shared.normalized_field_overrides,
-        triaged_events: shared.triaged_events,
-    }))
+    }
+    let bytes = std::fs::read(&paths.local).with_context(|| {
+        format!("failed to read local state {}", paths.local.display())
+    })?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let state: LocalState =
+        serde_json::from_slice(&bytes).context("invalid local state payload")?;
+    if state.version != LOCAL_VERSION {
+        return Ok(None);
+    }
+    if state.stream_path != stream_path.to_string_lossy() {
+        return Ok(None);
+    }
+    Ok(Some(state))
 }
 
-/// Best-effort cleanup of legacy per-process state files from older builds.
-/// Deletes `<sha>.local.json` and `<sha>.local.<pid>.json` for this stream's
-/// id from the state directory. Errors are intentionally swallowed: this is
-/// hygiene, not correctness.
-pub fn cleanup_legacy_local_files(stream_path: &Path) {
-    let Ok(paths) = state_paths_for_stream(stream_path) else {
-        return;
-    };
-    let Ok(entries) = std::fs::read_dir(&paths.dir) else {
-        return;
-    };
-    let prefix_dot_local = format!("{}.local", paths.id);
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(&prefix_dot_local) {
-            continue;
-        }
-        // Match exactly `<id>.local.json` or `<id>.local.<anything>.json`.
-        let tail = &name[prefix_dot_local.len()..];
-        let matches = tail == ".json"
-            || (tail.starts_with('.') && tail.ends_with(".json"));
-        if !matches {
-            continue;
-        }
-        let _ = std::fs::remove_file(entry.path());
+pub fn save_local_state(stream_path: &Path, state: &LocalState) -> Result<()> {
+    let paths = state_paths_for_stream(stream_path)?;
+    let mut adjusted = state.clone();
+    adjusted.version = LOCAL_VERSION;
+    if adjusted.stream_path.is_empty() {
+        adjusted.stream_path = stream_path.to_string_lossy().to_string();
     }
+    let payload = serde_json::to_vec(&adjusted).context("failed to serialize local state")?;
+    atomic_write(&paths.local, &payload)
 }
+
+/// Marks the local file so that the next `load_full_state` will treat the
+/// stream as gone (saved_len=0, sentinel hash) — used when the stream file
+/// disappears mid-session. Shared state is left untouched: other operators
+/// may still want their periods/renames.
+pub fn invalidate_local_state(stream_path: &Path) -> Result<()> {
+    let paths = state_paths_for_stream(stream_path)?;
+    if !paths.local.exists() {
+        return Ok(());
+    }
+    let mut state = LocalState::empty(stream_path.to_string_lossy().to_string());
+    // Reuse fields if we can, so the operator's filters survive the next start.
+    if let Ok(Some(prev)) = read_local_state(stream_path) {
+        state.current_label = prev.current_label;
+        state.event_filters = prev.event_filters;
+        state.stashed_event_filters = prev.stashed_event_filters;
+        state.types_filter = prev.types_filter;
+        state.known_unrelated_types = prev.known_unrelated_types;
+    }
+    state.saved_len = 0;
+    state.prefix_hash_hex = String::new(); // sentinel: never matches a real SHA-256
+    save_local_state(stream_path, &state)
+}
+
+// ---------------------------------------------------------------------------
+// Combined load (called on startup): combines local + shared into one result
+// and re-derives the Clean/Changed verdict from the stream-file identity.
+// ---------------------------------------------------------------------------
+
+pub fn load_full_state(stream_path: &Path) -> Result<Option<StateLoadResult>> {
+    let local = read_local_state(stream_path)?;
+    let shared = {
+        // Take the lock briefly: we may be observing mid-write from another op.
+        let paths = state_paths_for_stream(stream_path)?;
+        if paths.shared.exists() {
+            let _lock = SharedLock::acquire(&paths)?;
+            read_shared_state_unlocked(&paths)?
+        } else {
+            None
+        }
+    };
+    if local.is_none() && shared.is_none() {
+        return Ok(None);
+    }
+
+    // Whether this process has its own file-identity record. When it doesn't
+    // (first time on this stream from this machine) we skip the prefix-hash
+    // check entirely — there's no prior claim to compare the file against, so
+    // a "file changed" prompt would be meaningless. Shared state still
+    // restores cleanly so a new operator joining mid-session gets the team's
+    // renames, periods, overrides, and triage.
+    let local_known = local.is_some();
+    let local = local.unwrap_or_else(|| LocalState::empty(stream_path.to_string_lossy().to_string()));
+    let shared = shared.unwrap_or_else(|| SharedState::empty(stream_path.to_string_lossy().to_string()));
+
+    let restored = RestoredState {
+        periods: shared.periods.clone(),
+        renames: shared.renames.clone(),
+        known_unrelated_types: local.known_unrelated_types.clone(),
+        normalized_field_overrides: shared.normalized_field_overrides.clone(),
+        current_label: local.current_label.clone(),
+        event_filters: local.event_filters.clone(),
+        stashed_event_filters: local.stashed_event_filters.clone(),
+        types_filter: local.types_filter.clone(),
+        triaged_events: shared.triaged_events.clone(),
+    };
+
+    if !local_known {
+        return Ok(Some(StateLoadResult::Clean(restored)));
+    }
+
+    if !stream_path.exists() {
+        // If we never advanced the cursor, treat as clean restore so we can
+        // still apply renames/filters to a brand-new file at the same path.
+        return Ok((local.saved_len == 0).then_some(StateLoadResult::Clean(restored)));
+    }
+
+    let len = std::fs::metadata(stream_path)?.len();
+    if len < local.saved_len {
+        return Ok(Some(StateLoadResult::Changed(restored)));
+    }
+
+    let current_prefix_hash = hash_prefix(stream_path, local.saved_len)?;
+    if current_prefix_hash != local.prefix_hash_hex {
+        return Ok(Some(StateLoadResult::Changed(restored)));
+    }
+
+    Ok(Some(StateLoadResult::Clean(restored)))
+}
+
+// ---------------------------------------------------------------------------
+// File identity helpers (unchanged from the old single-file format)
+// ---------------------------------------------------------------------------
+
+pub fn hash_stream_prefix(path: &Path, prefix_len: u64) -> Result<String> {
+    hash_prefix(path, prefix_len)
+}
+
+fn hash_prefix(path: &Path, prefix_len: u64) -> Result<String> {
+    if prefix_len == 0 || !path.exists() {
+        return Ok(EMPTY_SHA256.to_string());
+    }
+
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut remaining = prefix_len;
+    let mut buf = [0u8; 64 * 1024];
+
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());
+        let n = file.read(&mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        remaining = remaining.saturating_sub(n as u64);
+    }
+
+    if remaining > 0 {
+        return Ok(String::new());
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+// SHA-256 of empty input
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 // ---------------------------------------------------------------------------
 // Session/profile export — unchanged, written via atomic_write for safety.
@@ -519,38 +675,25 @@ mod tests {
         );
         let _ = std::fs::remove_file(&stream);
         let _ = std::fs::remove_file(&paths.shared);
+        let _ = std::fs::remove_file(&paths.local);
         let _ = std::fs::remove_file(&paths.lock);
     }
 
     #[test]
-    fn cleanup_legacy_local_files_removes_old_per_stream_files() {
-        let stream = tmp_path("stream-cleanup.jsonl");
+    fn local_state_round_trips() {
+        let stream = tmp_path("stream-local.jsonl");
         std::fs::write(&stream, b"").unwrap();
+        let mut local = LocalState::empty(stream.to_string_lossy().to_string());
+        local.current_label = "myop".to_string();
+        local.types_filter = "http".to_string();
+        save_local_state(&stream, &local).unwrap();
+        let loaded = read_local_state(&stream).unwrap().unwrap();
+        assert_eq!(loaded.current_label, "myop");
+        assert_eq!(loaded.types_filter, "http");
         let paths = state_paths_for_stream(&stream).unwrap();
-        std::fs::create_dir_all(&paths.dir).unwrap();
-        // Sentinels owned by THIS stream — must be deleted.
-        let mine_plain = paths.dir.join(format!("{}.local.json", paths.id));
-        let mine_pid = paths.dir.join(format!("{}.local.4242.json", paths.id));
-        std::fs::write(&mine_plain, b"x").unwrap();
-        std::fs::write(&mine_pid, b"x").unwrap();
-        // A sibling stream's file — must NOT be touched.
-        let other_id = "0".repeat(64);
-        let other_plain = paths.dir.join(format!("{}.local.json", other_id));
-        std::fs::write(&other_plain, b"x").unwrap();
-        // A shared file with the same prefix must also remain.
-        let mine_shared_existing = paths.shared.clone();
-        std::fs::write(&mine_shared_existing, b"x").unwrap();
-
-        cleanup_legacy_local_files(&stream);
-
-        assert!(!mine_plain.exists(), "mine_plain should be deleted");
-        assert!(!mine_pid.exists(), "mine_pid should be deleted");
-        assert!(other_plain.exists(), "other stream's file must remain");
-        assert!(mine_shared_existing.exists(), "shared file must remain");
-
-        let _ = std::fs::remove_file(&other_plain);
-        let _ = std::fs::remove_file(&mine_shared_existing);
         let _ = std::fs::remove_file(&stream);
+        let _ = std::fs::remove_file(&paths.shared);
+        let _ = std::fs::remove_file(&paths.local);
         let _ = std::fs::remove_file(&paths.lock);
     }
 
@@ -586,6 +729,7 @@ mod tests {
         assert_eq!(loaded.renames.len(), 40);
         let _ = std::fs::remove_file(&stream);
         let _ = std::fs::remove_file(&paths.shared);
+        let _ = std::fs::remove_file(&paths.local);
         let _ = std::fs::remove_file(&paths.lock);
     }
 }

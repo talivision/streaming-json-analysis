@@ -240,6 +240,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&stream);
         let _ = std::fs::remove_file(&paths.shared);
+        let _ = std::fs::remove_file(&paths.local);
         let _ = std::fs::remove_file(&paths.lock);
     }
 }
