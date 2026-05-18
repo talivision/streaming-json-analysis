@@ -723,19 +723,20 @@ impl App {
                 .model
                 .merge_types(&group.members, cleaned_label.clone())
                 .is_some();
-            if !merged_via_stats {
-                // Either fewer than 2 members present in the current model, or
-                // members already belong to a group locally. Distinguish via
-                // merge_groups membership: if already registered we no-op,
-                // otherwise we register aliases for a future ingest stream.
-                if self.model.merge_groups.contains_key(&group.group_id) {
-                    continue;
-                }
+            if !merged_via_stats && !self.model.merge_groups.contains_key(&group.group_id) {
+                // Pre-ingest path: model has no member types yet, so register
+                // the alias hook so the upcoming event stream redirects into
+                // the group. Same approach as session restore.
                 self.model.apply_merge_groups(std::slice::from_ref(group));
                 if !self.model.merge_groups.contains_key(&group.group_id) {
                     continue;
                 }
             }
+            // Always rewrite filter terms when the group is present, even if
+            // it was already registered locally. A re-applied profile whose
+            // negative_filters reference member names needs the rename so the
+            // resulting filter targets the merged label instead of phantom
+            // member ids.
             any_applied = true;
             for prior in &prior_names {
                 self.event_filters.type_filter = rename_type_terms_in_filter(
