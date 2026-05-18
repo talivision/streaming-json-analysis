@@ -1710,11 +1710,47 @@ impl App {
         self.pending_live_recompute = true;
         self.mark_live_cache_dirty();
 
-        // Apply merge_groups from disk. If we hadn't seen them before, they get
-        // applied to model.merge_groups + model.types via the same path the
-        // profile-import flow uses.
-        if !staged.merge_groups.is_empty() {
-            self.model.apply_merge_groups(&staged.merge_groups);
+        // Reconcile merge_groups with disk:
+        // - For groups present locally but absent on disk, unmerge them so
+        //   another op's `g` -> unmerge propagates here.
+        // - For groups present on disk but not locally, fold them in. When the
+        //   members are all materialised we use `merge_types` (rewrites
+        //   existing events and rolls up stats — same effect as if the local
+        //   user had pressed `g`). Otherwise fall back to `apply_merge_groups`
+        //   which sets up the alias hook for future ingest.
+        let disk_group_ids: HashSet<String> = staged
+            .merge_groups
+            .iter()
+            .map(|g| g.group_id.clone())
+            .collect();
+        let local_only: Vec<String> = self
+            .model
+            .merge_groups
+            .keys()
+            .filter(|gid| !disk_group_ids.contains(gid.as_str()))
+            .cloned()
+            .collect();
+        for gid in local_only {
+            // Don't unmerge groups this process is in the middle of creating
+            // (their shared write may not have landed yet).
+            if self.user_modified_merge_groups.contains(&gid) {
+                continue;
+            }
+            self.model.unmerge_group(&gid);
+        }
+        for g in &staged.merge_groups {
+            if self.model.merge_groups.contains_key(&g.group_id) {
+                continue;
+            }
+            let all_present = g
+                .members
+                .iter()
+                .all(|m| self.model.types.contains_key(m));
+            if all_present {
+                let _ = self.model.merge_types(&g.members, g.label.clone());
+            } else {
+                self.model.apply_merge_groups(std::slice::from_ref(g));
+            }
         }
 
         // Replace triage set wholesale — the on-disk identity list is the
