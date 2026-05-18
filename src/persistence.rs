@@ -173,6 +173,9 @@ pub struct StatePaths {
     pub local: PathBuf,
     pub lock: PathBuf,
     pub dir: PathBuf,
+    /// Stable per-stream prefix (the SHA-256 hex). Used by sibling files in
+    /// the same state directory (presence heartbeats, etc.).
+    pub id: String,
 }
 
 pub fn state_paths_for_stream(stream_path: &Path) -> Result<StatePaths> {
@@ -186,6 +189,7 @@ pub fn state_paths_for_stream(stream_path: &Path) -> Result<StatePaths> {
         local: dir.join(format!("{}.local.json", id)),
         lock: dir.join(format!("{}.shared.lock", id)),
         dir,
+        id,
     })
 }
 
