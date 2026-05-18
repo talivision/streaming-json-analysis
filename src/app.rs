@@ -8,13 +8,12 @@ use crate::domain::{
 };
 use crate::io::StreamReader;
 use crate::persistence::{
-    export_session, hash_stream_prefix, invalidate_local_state, load_full_state,
-    read_shared_state_unlocked, save_local_state, save_profile, state_paths_for_stream,
-    update_shared_state, LocalState, NormalizedFieldOverride, RestoredState, SessionEvent,
-    SessionExport, SharedState, SourceProfile, StateLoadResult,
+    cleanup_legacy_local_files, export_session, load_full_state, read_shared_state_unlocked,
+    save_profile, state_paths_for_stream, update_shared_state, NormalizedFieldOverride,
+    RestoredState, SessionEvent, SessionExport, SharedState, SourceProfile,
 };
 use crate::state_watcher::{spawn_shared_state_watcher, WatchMessage, WatcherHandle};
-use crate::tui::{draw_file_changed_prompt, draw_ui, InputMode, UiMode};
+use crate::tui::{draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -142,7 +141,6 @@ pub struct App {
     offline_loaded: bool,
     offline_fallback_ts: f64,
     pending_restore: Option<RestoredState>,
-    file_changed_state: Option<RestoredState>,
     startup_hint: Option<String>,
     live_visible_indices: Vec<usize>,
     baseline_visible_indices: Vec<usize>,
@@ -161,7 +159,6 @@ pub struct App {
     whitelist_terms: Vec<String>,
     whitelist_mode: WhitelistMode,
     profile_renames: Vec<(String, String)>,
-    session_renames: Vec<(String, String)>,
     profile_known_unrelated_types: Vec<String>,
     profile_normalized_field_overrides: Vec<NormalizedFieldOverride>,
     user_renamed_types: HashSet<String>,
@@ -184,7 +181,6 @@ pub struct App {
     /// fired). Drained by `apply_persisted_overrides_if_ready`.
     pending_triaged_identities: Vec<(f64, String)>,
     shared_dirty: bool,
-    local_dirty: bool,
     state_reload_rx: Option<Receiver<WatchMessage>>,
     _state_watcher: Option<WatcherHandle>,
 }
@@ -265,7 +261,6 @@ impl App {
             offline_loaded: false,
             offline_fallback_ts: unix_ts(),
             pending_restore: None,
-            file_changed_state: None,
             startup_hint: None,
             live_visible_indices: Vec::new(),
             baseline_visible_indices: Vec::new(),
@@ -284,7 +279,6 @@ impl App {
             whitelist_terms: Vec::new(),
             whitelist_mode: WhitelistMode::Off,
             profile_renames: Vec::new(),
-            session_renames: Vec::new(),
             profile_known_unrelated_types: Vec::new(),
             profile_normalized_field_overrides: Vec::new(),
             user_renamed_types: HashSet::new(),
@@ -296,10 +290,12 @@ impl App {
             user_toggled_triage_identities: HashSet::new(),
             pending_triaged_identities: Vec::new(),
             shared_dirty: false,
-            local_dirty: false,
             state_reload_rx: None,
             _state_watcher: None,
         };
+        // Best-effort: remove any legacy per-process state files left behind
+        // by older builds. View state is no longer persisted at all.
+        cleanup_legacy_local_files(app.reader.path());
         if !reset_state {
             app.restore_persisted_state();
         }
@@ -329,13 +325,6 @@ impl App {
 
         let backend = CrosstermBackend::new(out);
         let mut terminal = Terminal::new(backend)?;
-
-        if let Some(changed) = self.file_changed_state.take() {
-            let accepted = self.run_file_changed_prompt(&mut terminal, &changed)?;
-            if accepted {
-                self.apply_transferable_state(changed);
-            }
-        }
 
         // Start watching <sha>.shared.json for cross-operator updates.
         if self.state_reload_rx.is_none() {
@@ -411,9 +400,7 @@ impl App {
                     break;
                 }
 
-                if (self.shared_dirty || self.local_dirty)
-                    && last_autosave.elapsed() >= AUTOSAVE_INTERVAL
-                {
+                if self.shared_dirty && last_autosave.elapsed() >= AUTOSAVE_INTERVAL {
                     self.autosave_dirty_states();
                     last_autosave = Instant::now();
                 }
@@ -471,12 +458,10 @@ impl App {
             }
         }
         self.model.close_open_period(unix_ts());
-        // Ensure both files are written at shutdown, regardless of dirty flags
-        // — the close_open_period above may have closed a period without going
-        // through a dirty-marking helper, and we'd rather write twice than miss
-        // an in-flight change.
+        // Ensure the shared file is written at shutdown, regardless of the
+        // dirty flag — the close_open_period above may have closed a period
+        // without going through a dirty-marking helper.
         self.shared_dirty = true;
-        self.local_dirty = true;
         self.autosave_dirty_states();
         if let Err(err) = self.export_session_if_configured() {
             eprintln!("{WARNING_PREFIX_ORANGE} failed to export session: {err}");
@@ -565,7 +550,6 @@ impl App {
             let trimmed = next_label.trim();
             if !trimmed.is_empty() {
                 self.model.current_label = trimmed.to_string();
-                self.mark_local_dirty();
             }
         }
         if !self.do_toggle_period("HTTP") {
@@ -656,12 +640,8 @@ impl App {
         self.apply_profile_overrides_to_types();
         self.add_whitelist_terms(profile.whitelist_terms);
         self.apply_profile_filters(profile.negative_filters);
-        // The profile import path mutates renames and overrides (shared) plus
-        // the local known_unrelated_types list. apply_profile_filters already
-        // marks local; bump shared too so other operators see the imported
-        // renames/overrides.
+        // The profile import path mutates renames and overrides (shared).
         self.mark_shared_dirty();
-        self.mark_local_dirty();
     }
 
     fn apply_profile_forced(&mut self, profile: SourceProfile) {
@@ -700,7 +680,6 @@ impl App {
         self.event_filters = negative_filters;
         self.mark_live_cache_dirty();
         self.mark_shared_dirty();
-        self.mark_local_dirty();
         self.refresh_live_position();
     }
 
@@ -987,31 +966,14 @@ impl App {
 
     fn restore_persisted_state(&mut self) {
         match load_full_state(self.reader.path()) {
-            Ok(Some(StateLoadResult::Clean(saved))) => {
+            Ok(Some(saved)) => {
                 let msg = format!(
-                    "Restored session: {} periods, {} renames, {} unrelated, {} normalized fields, filters {}/5{}{}",
+                    "Restored session: {} periods, {} renames, {} normalized fields, {} triaged events",
                     saved.periods.len(),
                     saved.renames.len(),
-                    saved.known_unrelated_types.len(),
                     saved.normalized_field_overrides.len(),
-                    saved.event_filters.active_count(),
-                    if saved.stashed_event_filters.is_some() {
-                        " (suspended set saved)"
-                    } else {
-                        ""
-                    },
-                    if saved.types_filter.is_empty() {
-                        ""
-                    } else {
-                        ", type list filter set"
-                    },
+                    saved.triaged_events.len(),
                 );
-                if !saved.current_label.trim().is_empty() {
-                    self.model.current_label = saved.current_label.clone();
-                }
-                self.event_filters = saved.event_filters.clone();
-                self.stashed_event_filters = saved.stashed_event_filters.clone();
-                self.types_filter = saved.types_filter.clone();
                 self.mark_live_cache_dirty();
                 self.refresh_live_position();
                 if !saved.periods.is_empty() {
@@ -1022,45 +984,12 @@ impl App {
                 self.status = msg.clone();
                 self.startup_hint = Some(msg);
             }
-            Ok(Some(StateLoadResult::Changed(saved))) => {
-                // Don't apply anything yet — prompt the user first in run().
-                self.file_changed_state = Some(saved);
-            }
             Ok(None) => {}
             Err(err) => {
                 self.status = format!("State restore skipped: {err}");
                 self.startup_hint = Some(self.status.clone());
             }
         }
-    }
-
-    /// Applies the transferable portion of a file-changed state: everything
-    /// except periods, which reference timestamps in the old file content.
-    fn apply_transferable_state(&mut self, saved: RestoredState) {
-        if !saved.current_label.trim().is_empty() {
-            self.model.current_label = saved.current_label.clone();
-        }
-        self.event_filters = saved.event_filters.clone();
-        self.stashed_event_filters = saved.stashed_event_filters.clone();
-        self.types_filter = saved.types_filter.clone();
-        self.mark_live_cache_dirty();
-        self.refresh_live_position();
-        // Store renames in session_renames so they persist across ingest cycles and
-        // survive even if no matching type IDs appear in the new file.
-        self.session_renames = saved.renames.clone();
-        // Carry periods forward as empty so apply_persisted_overrides_if_ready
-        // still applies renames, unrelated flags, and field overrides.
-        let transferable = RestoredState {
-            periods: vec![],
-            ..saved
-        };
-        self.pending_restore = Some(transferable);
-        let msg =
-            "Session restored (file changed: renames and filters restored, periods discarded)"
-                .to_string();
-        self.status = msg.clone();
-        self.startup_hint = Some(msg);
-        self.mark_state_dirty();
     }
 
     fn apply_persisted_overrides_if_ready(&mut self) {
@@ -1071,11 +1000,6 @@ impl App {
         let saved = self.pending_restore.take().unwrap();
         if !saved.renames.is_empty() {
             self.model.apply_renames(&saved.renames);
-        }
-        for type_id in &saved.known_unrelated_types {
-            if let Some(tp) = self.model.types.get_mut(type_id) {
-                tp.known_unrelated = true;
-            }
         }
         if !saved.normalized_field_overrides.is_empty() {
             self.model.apply_normalized_field_overrides(
@@ -1152,63 +1076,13 @@ impl App {
             }
             self.model.apply_normalized_field_overrides(&current);
         }
-        // Apply renames restored from a previous session (file-changed path) at lowest
-        // priority: skip if a profile or the user already set a name for this type.
-        for (type_id, name) in &self.session_renames {
-            if self.user_renamed_types.contains(type_id) {
-                continue;
-            }
-            if let Some(tp) = self.model.types.get(type_id) {
-                if tp.name.is_none() {
-                    self.model.rename_type(type_id, name.clone());
-                }
-            }
-        }
-    }
-
-    fn run_file_changed_prompt(
-        &self,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-        state: &RestoredState,
-    ) -> Result<bool> {
-        loop {
-            terminal.draw(|f| draw_file_changed_prompt(f, state))?;
-            if event::poll(Duration::from_millis(50))? {
-                if let Event::Key(key) = event::read()? {
-                    if !matches!(key.kind, KeyEventKind::Press) {
-                        continue;
-                    }
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                            return Ok(true);
-                        }
-                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                            return Ok(false);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
     }
 
     fn autosave_dirty_states(&mut self) {
         if !self.reader.path().exists() {
-            // The stream file was deleted while we were running. The reader
-            // resets its offset to 0 on detecting a missing file, so saved_len
-            // would be 0 and any new file at the same path would pass the
-            // hash check. Invalidate the local state file so nothing is
-            // restored next session; shared state is left in place so other
-            // operators against (a new file at) the same path keep their renames.
-            if self.local_dirty {
-                if let Err(err) = invalidate_local_state(self.reader.path()) {
-                    eprintln!(
-                        "{WARNING_PREFIX_ORANGE} failed to invalidate local state: {err}"
-                    );
-                } else {
-                    self.local_dirty = false;
-                }
-            }
+            // The stream file was deleted while we were running. Shared state
+            // is left in place so other operators against (a new file at) the
+            // same path keep their renames.
             return;
         }
         if self.shared_dirty {
@@ -1221,32 +1095,10 @@ impl App {
                 }
             }
         }
-        if self.local_dirty {
-            match self.persist_local_state() {
-                Ok(()) => self.local_dirty = false,
-                Err(err) => {
-                    eprintln!(
-                        "{WARNING_PREFIX_ORANGE} failed to persist local state: {err}"
-                    );
-                }
-            }
-        }
     }
 
     fn build_shared_state_for_save(&self) -> SharedState {
-        // Merge model renames (applied) with session renames (may be unmatched
-        // if the file changed and some type IDs haven't appeared yet). Model
-        // renames win for any type_id present in both.
-        let mut all_renames = self.model.renamed_types();
-        {
-            let applied: std::collections::HashSet<String> =
-                all_renames.iter().map(|(id, _)| id.clone()).collect();
-            for (type_id, name) in &self.session_renames {
-                if !applied.contains(type_id) {
-                    all_renames.push((type_id.clone(), name.clone()));
-                }
-            }
-        }
+        let all_renames = self.model.renamed_types();
         // Triage: store (ts, type_id) so the identity is stable across
         // processes — Vec<EventRecord> indices aren't shared.
         let triaged_events: Vec<(f64, String)> = self
@@ -1268,25 +1120,6 @@ impl App {
             normalized_field_overrides: self.current_normalized_field_overrides(),
             triaged_events,
         }
-    }
-
-    fn build_local_state_for_save(&self) -> Result<LocalState> {
-        Ok(LocalState {
-            version: 1,
-            stream_path: self.reader.path().to_string_lossy().to_string(),
-            saved_len: self.reader.offset(),
-            prefix_hash_hex: hash_stream_prefix(self.reader.path(), self.reader.offset())?,
-            current_label: self.model.current_label.clone(),
-            event_filters: self.event_filters.clone(),
-            stashed_event_filters: self.stashed_event_filters.clone(),
-            types_filter: self.types_filter.clone(),
-            known_unrelated_types: self
-                .model
-                .types
-                .iter()
-                .filter_map(|(type_id, tp)| tp.known_unrelated.then_some(type_id.clone()))
-                .collect(),
-        })
     }
 
     fn persist_shared_state(&self) -> Result<()> {
@@ -1429,11 +1262,6 @@ impl App {
         })
     }
 
-    fn persist_local_state(&self) -> Result<()> {
-        let state = self.build_local_state_for_save()?;
-        save_local_state(self.reader.path(), &state)
-    }
-
     fn start_state_watcher(&mut self) -> Result<()> {
         let paths = state_paths_for_stream(self.reader.path())?;
         let (tx, rx) = std::sync::mpsc::channel::<WatchMessage>();
@@ -1477,25 +1305,20 @@ impl App {
     /// read-modify-write, so it's authoritative; cell-by-cell merging would
     /// just reintroduce lost-update problems.
     ///
-    /// Local fields (input buffer, filter UI, cursor) are untouched.
+    /// View state (input buffer, filter UI, cursor) is untouched.
     fn reload_shared_state_from_disk(&mut self) -> Result<()> {
         let paths = state_paths_for_stream(self.reader.path())?;
         let Some(shared) = read_shared_state_unlocked(&paths)? else {
             return Ok(());
         };
-        // Build a fresh RestoredState carrying only the shared fields and pump
-        // it through the same code path that applied them on startup. This
-        // keeps the apply_persisted_overrides_if_ready semantics identical
-        // (in particular: re-applying once enough types have ingested).
+        // Build a fresh RestoredState and pump it through the same code path
+        // that applied them on startup. This keeps the
+        // apply_persisted_overrides_if_ready semantics identical (in
+        // particular: re-applying once enough types have ingested).
         let staged = RestoredState {
             periods: shared.periods.clone(),
             renames: shared.renames.clone(),
-            known_unrelated_types: Vec::new(), // shared file doesn't own this list
             normalized_field_overrides: shared.normalized_field_overrides.clone(),
-            current_label: String::new(),       // local-only, leave in place
-            event_filters: self.event_filters.clone(), // local-only, leave in place
-            stashed_event_filters: self.stashed_event_filters.clone(),
-            types_filter: self.types_filter.clone(),
             triaged_events: shared.triaged_events.clone(),
         };
 
@@ -1813,7 +1636,6 @@ impl App {
                 self.stashed_live_visible_indices = None;
                 self.stashed_baseline_visible_indices = None;
                 self.mark_live_cache_dirty();
-                self.mark_local_dirty();
                 self.refresh_live_position();
                 self.live_key_focus = false;
                 self.live_value_focus = false;
@@ -2058,7 +1880,6 @@ impl App {
                     InputMode::Label => {
                         if !self.input_buffer.trim().is_empty() {
                             self.model.current_label = self.input_buffer.trim().to_string();
-                            self.mark_local_dirty();
                             self.status = format!("Current label: {}", self.model.current_label);
                         }
                     }
@@ -2091,7 +1912,6 @@ impl App {
                         self.type_index = 0;
                         self.path_index = 0;
                         self.types_path_focus = false;
-                        self.mark_local_dirty();
                     }
                     InputMode::RenameType => {
                         let visible = self.visible_types();
@@ -2111,10 +1931,7 @@ impl App {
                             );
                             self.user_renamed_types.insert(type_id);
                             self.mark_live_cache_dirty();
-                            // The rename itself is shared; the side-effect on
-                            // event_filters/stashed_event_filters touches local fields.
                             self.mark_shared_dirty();
-                            self.mark_local_dirty();
                         }
                     }
                     InputMode::InsertPeriodRange => {
@@ -2208,7 +2025,6 @@ impl App {
         };
         if let Some(saved) = self.stashed_event_filters.take() {
             self.event_filters = saved;
-            self.mark_local_dirty();
             let live_count = self.model.events.len();
             let baseline_count = self.baseline_events.len();
             let restored = self
@@ -2253,7 +2069,6 @@ impl App {
         self.stashed_event_filters = Some(self.event_filters.clone());
         self.event_filters = DataFilters::default();
         self.mark_live_cache_dirty();
-        self.mark_local_dirty();
         self.after_filter_change(anchor);
         self.status = "Event filters suspended (press y to restore)".to_string();
     }
@@ -2265,7 +2080,6 @@ impl App {
             self.stashed_baseline_visible_indices = None;
             self.event_filters = filters;
             self.mark_live_cache_dirty();
-            self.mark_local_dirty();
             self.refresh_live_position();
         }
     }
@@ -2294,7 +2108,15 @@ impl App {
         if let Some(saved) = self.pending_restore.as_ref() {
             let profile = SourceProfile {
                 renames: saved.renames.clone(),
-                known_unrelated_types: saved.known_unrelated_types.clone(),
+                // RestoredState no longer carries known_unrelated_types
+                // (view state isn't persisted); fingerprint with the live
+                // model's flags instead.
+                known_unrelated_types: self
+                    .model
+                    .types
+                    .iter()
+                    .filter_map(|(type_id, tp)| tp.known_unrelated.then_some(type_id.clone()))
+                    .collect(),
                 normalized_field_overrides: saved.normalized_field_overrides.clone(),
                 negative_filters: self.event_filters.clone(),
                 whitelist_terms: self.whitelist_terms.clone(),
@@ -3211,8 +3033,6 @@ impl App {
         self.stashed_event_filters = None;
         self.stashed_live_visible_indices = None;
         self.stashed_baseline_visible_indices = None;
-        // Filters live in local state.
-        self.mark_local_dirty();
         match origin {
             FilterOrigin::KeyShortcut { anchor } => {
                 self.mark_live_cache_dirty();
@@ -3576,20 +3396,6 @@ impl App {
                 );
             }
         }
-    }
-
-    /// Marks fields persisted in the local file (cursor, filters, label,
-    /// types_filter, profile-imported unrelated types) as needing a write to
-    /// `<sha>.local.json`.
-    fn mark_local_dirty(&mut self) {
-        self.local_dirty = true;
-    }
-
-    /// Backwards-compatible shim for sites that mutate both shared and local
-    /// data (e.g. import_session). Marks both flags.
-    fn mark_state_dirty(&mut self) {
-        self.shared_dirty = true;
-        self.local_dirty = true;
     }
 
     fn rebuild_live_cache_if_needed(&mut self) {

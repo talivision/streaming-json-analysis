@@ -1,8 +1,7 @@
 use crate::app::{App, ModalConfirmation, PeriodsFocus};
 use crate::domain::{
-    normalize_path, EventRecord, FilterField, PathOverride, RateDebugInfo, DEFAULT_ACTION_LABEL,
+    normalize_path, EventRecord, FilterField, PathOverride, RateDebugInfo,
 };
-use crate::persistence::RestoredState;
 use indexmap::IndexMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -38,130 +37,6 @@ pub enum InputMode {
     ExportProfilePath,
 }
 
-pub fn draw_file_changed_prompt(frame: &mut Frame<'_>, state: &RestoredState) {
-    let area = frame.area();
-
-    // Build the content lines.
-    let mut restore_items: Vec<Line> = Vec::new();
-    if !state.renames.is_empty() {
-        restore_items.push(Line::from(format!(
-            "  • {} type rename{}",
-            state.renames.len(),
-            if state.renames.len() == 1 { "" } else { "s" }
-        )));
-    }
-    if !state.known_unrelated_types.is_empty() {
-        restore_items.push(Line::from(format!(
-            "  • {} suppressed type{}",
-            state.known_unrelated_types.len(),
-            if state.known_unrelated_types.len() == 1 {
-                ""
-            } else {
-                "s"
-            }
-        )));
-    }
-    if !state.normalized_field_overrides.is_empty() {
-        restore_items.push(Line::from(format!(
-            "  • {} field normalization rule{}",
-            state.normalized_field_overrides.len(),
-            if state.normalized_field_overrides.len() == 1 {
-                ""
-            } else {
-                "s"
-            }
-        )));
-    }
-    let filter_count = state.event_filters.active_count();
-    if filter_count > 0 {
-        restore_items.push(Line::from(format!(
-            "  • {} active filter{}",
-            filter_count,
-            if filter_count == 1 { "" } else { "s" }
-        )));
-    }
-    if state.stashed_event_filters.is_some() {
-        restore_items.push(Line::from("  • suspended filter set"));
-    }
-    if !state.types_filter.is_empty() {
-        restore_items.push(Line::from(format!(
-            "  • type list filter: \"{}\"",
-            state.types_filter
-        )));
-    }
-    let trimmed_label = state.current_label.trim();
-    if !trimmed_label.is_empty() && trimmed_label != DEFAULT_ACTION_LABEL {
-        restore_items.push(Line::from(format!(
-            "  • session label: \"{}\"",
-            state.current_label.trim()
-        )));
-    }
-
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  The stream file has changed since your last session.",
-        Style::default().fg(Color::Yellow),
-    )));
-    lines.push(Line::from(""));
-
-    if restore_items.is_empty() {
-        lines.push(Line::from(
-            "  Nothing to restore from the previous session.",
-        ));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "  Will be restored:",
-            Style::default().fg(Color::Green),
-        )));
-        lines.extend(restore_items);
-    }
-
-    if !state.periods.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Cannot be restored (file content changed):",
-            Style::default().fg(Color::Red),
-        )));
-        lines.push(Line::from(format!(
-            "  • {} action period{}",
-            state.periods.len(),
-            if state.periods.len() == 1 { "" } else { "s" }
-        )));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "  [Y] ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("Restore"),
-        Span::raw("    "),
-        Span::styled(
-            "[N] ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("Start fresh"),
-    ]));
-    lines.push(Line::from(""));
-
-    let content_height = lines.len() as u16 + 2; // +2 for block borders
-    let content_width = 62u16;
-    let popup = centered_rect_abs(content_width, content_height, area);
-
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Session from previous run "),
-        ),
-        popup,
-    );
-}
 
 pub fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     let root = Layout::default()
