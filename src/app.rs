@@ -679,11 +679,14 @@ impl App {
     }
 
     /// Apply merge groups carried by an imported profile to the current model.
-    /// Unlike the restore path (which uses `apply_merge_groups` before any
-    /// ingest so the alias hook redirects incoming events), profile-import
-    /// happens after the live/baseline events have already populated stats, so
-    /// we use `merge_types` which correctly folds each member's existing
-    /// TypeProfile into the merged group.
+    ///
+    /// Two cases are handled per group:
+    /// * Runtime import after events have streamed in: `merge_types` folds
+    ///   each member's existing TypeProfile into the merged group.
+    /// * Boot-time import (CLI `--profile` with `--reset`) when no events have
+    ///   been ingested yet: `merge_types` returns None because members aren't
+    ///   present, so we fall back to `model.apply_merge_groups` to register
+    ///   the alias hook before ingest — same path used by session restore.
     ///
     /// Returns true if at least one group was successfully applied. Caller is
     /// responsible for triggering `pending_live_recompute`.
@@ -693,28 +696,45 @@ impl App {
         }
         let mut any_applied = false;
         for group in groups {
-            // Snapshot member display names BEFORE the merge mutates types — we
-            // need them to rewrite the type filter the same way an interactive
-            // merge does. `merge_types` already filters to present, non-grouped
-            // members internally and returns None if fewer than 2 remain, so we
-            // pre-collect names only for the members that are about to land.
+            let cleaned_label = group.label.trim().to_string();
+            // Snapshot prior display names BEFORE any mutation: prefer the
+            // live canonical name (catches user renames), fall back to the
+            // profile's saved prior name, then to the default `type-<hex>`
+            // label. Pre-ingest we won't have a live canonical, but the
+            // saved/default chain still gives us the names that any
+            // hand-edited filter term would reference.
             let prior_names: Vec<String> = group
                 .members
                 .iter()
-                .filter(|m| self.model.types.contains_key(m.as_str()))
-                .map(|m| self.model.canonical_type_name(m))
+                .enumerate()
+                .map(|(i, m)| {
+                    if self.model.types.contains_key(m.as_str()) {
+                        self.model.canonical_type_name(m)
+                    } else {
+                        group
+                            .members_prior_name
+                            .get(i)
+                            .and_then(|o| o.clone())
+                            .unwrap_or_else(|| default_type_label(m))
+                    }
+                })
                 .collect();
-            let cleaned_label = group.label.trim().to_string();
-            if self
+            let merged_via_stats = self
                 .model
                 .merge_types(&group.members, cleaned_label.clone())
-                .is_none()
-            {
+                .is_some();
+            if !merged_via_stats {
                 // Either fewer than 2 members present in the current model, or
-                // members already belong to a group locally. Skip without
-                // mutating anything — this is the documented "safely a no-op"
-                // path for re-applying the same profile.
-                continue;
+                // members already belong to a group locally. Distinguish via
+                // merge_groups membership: if already registered we no-op,
+                // otherwise we register aliases for a future ingest stream.
+                if self.model.merge_groups.contains_key(&group.group_id) {
+                    continue;
+                }
+                self.model.apply_merge_groups(std::slice::from_ref(group));
+                if !self.model.merge_groups.contains_key(&group.group_id) {
+                    continue;
+                }
             }
             any_applied = true;
             for prior in &prior_names {
@@ -5612,10 +5632,12 @@ mod tests {
     }
 
     #[test]
-    fn profile_import_skips_merge_with_missing_members() {
+    fn profile_import_registers_aliases_when_members_absent() {
         // Members referenced by the profile don't exist in this model's
-        // ingested types. apply_profile_merge_groups should bail without
-        // panicking and without inserting a spurious group.
+        // ingested types yet. We can't tell "ghost / handcrafted" apart from
+        // "pre-ingest: members will arrive later", so we register the alias
+        // hook + seed an empty TypeProfile. This is what makes CLI
+        // `--profile` work at boot.
         let mut app = test_app();
         let (login_id, _logout_id) = seed_two_types(&mut app);
         let ghost_a = "ghost-a-doesnotexist".to_string();
@@ -5626,7 +5648,7 @@ mod tests {
         let group = crate::domain::MergeGroup {
             group_id: group_id.clone(),
             label: "Phantom".to_string(),
-            members: sorted_members,
+            members: sorted_members.clone(),
             members_prior_name: vec![None, None],
         };
         let profile = SourceProfile {
@@ -5638,10 +5660,83 @@ mod tests {
             merge_groups: vec![group],
         };
         app.apply_profile(profile, false);
-        assert!(!app.model.merge_groups.contains_key(&group_id));
-        assert!(!app.model.types.contains_key(&group_id));
-        // Original types untouched.
+        assert!(app.model.merge_groups.contains_key(&group_id));
+        // Empty TypeProfile seeded.
+        let tp = app
+            .model
+            .types
+            .get(&group_id)
+            .expect("group TypeProfile seeded");
+        assert_eq!(tp.count, 0);
+        // Aliases registered so future ingest of those member ids redirects
+        // into the group.
+        for m in &sorted_members {
+            assert_eq!(app.model.type_aliases.get(m), Some(&group_id));
+        }
+        // Original sibling types untouched.
         assert!(app.model.types.contains_key(&login_id));
+    }
+
+    #[test]
+    fn profile_import_at_boot_redirects_ingest_into_group() {
+        // The actual CLI --profile + --reset flow: apply the profile to an
+        // empty model, then ingest. The alias hook registered by
+        // apply_profile_merge_groups should fold every matching event into
+        // the merged group instead of leaving the merge label as a phantom.
+        let mut app = test_app();
+        // Compute the structural ids the two shapes will hash to, without
+        // touching the live model's types map (so members are genuinely
+        // absent when apply_profile runs).
+        let mut probe = crate::domain::AnalyzerModel::new();
+        probe.ingest(json!({"event": "login", "user": "a"}), 1.0);
+        probe.ingest(json!({"event": "logout", "session": "z"}), 2.0);
+        let login_id = probe
+            .events
+            .iter()
+            .find(|e| e.obj.get("user").is_some())
+            .map(|e| e.type_id.clone())
+            .expect("login id");
+        let logout_id = probe
+            .events
+            .iter()
+            .find(|e| e.obj.get("session").is_some())
+            .map(|e| e.type_id.clone())
+            .expect("logout id");
+        let mut members = vec![login_id.clone(), logout_id.clone()];
+        members.sort();
+        let group_id = crate::domain::AnalyzerModel::compute_group_id(&members);
+        let group = crate::domain::MergeGroup {
+            group_id: group_id.clone(),
+            label: "Auth".to_string(),
+            members: members.clone(),
+            members_prior_name: vec![None, None],
+        };
+        let profile = SourceProfile {
+            renames: vec![],
+            known_unrelated_types: vec![],
+            normalized_field_overrides: vec![],
+            negative_filters: crate::domain::DataFilters {
+                type_filter: format!("!{}", crate::domain::default_type_label(&login_id)),
+                ..crate::domain::DataFilters::default()
+            },
+            whitelist_terms: vec![],
+            merge_groups: vec![group],
+        };
+        // Model is empty — exactly the CLI boot precondition.
+        assert!(app.model.types.is_empty());
+        app.apply_profile(profile, false);
+        // Filter rewrite happened even though no types are present yet.
+        assert_eq!(app.event_filters.type_filter, "!Auth");
+        // Now stream events through and confirm they land in the group.
+        app.model
+            .ingest(json!({"event": "login", "user": "a"}), 10.0);
+        app.model
+            .ingest(json!({"event": "login", "user": "b"}), 11.0);
+        app.model
+            .ingest(json!({"event": "logout", "session": "z"}), 12.0);
+        assert!(!app.model.types.contains_key(&login_id));
+        assert!(!app.model.types.contains_key(&logout_id));
+        assert_eq!(app.model.types.get(&group_id).unwrap().count, 3);
     }
 
     #[test]
