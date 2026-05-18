@@ -1,8 +1,8 @@
 use crate::browser::{JsonFocusNav, JsonFocusState};
 use crate::control_http::{ControlCommand, ControlReply};
 use crate::domain::{
-    clear_positive_type_filters, collect_indexed_paths, normalize_path, prepare_event,
-    rename_type_terms_in_filter, replace_positive_type_filters, toggle_negated_type_in_filter,
+    apply_rename_batch_to_filter, clear_positive_type_filters, collect_indexed_paths,
+    normalize_path, prepare_event, replace_positive_type_filters, toggle_negated_type_in_filter,
     type_is_negated_in_filter, value_at_path, value_token, values_at_path, ActionPeriod,
     AnalyzerModel, DataFilters, EventRecord, FilterField, PreparedEvent,
 };
@@ -1511,11 +1511,47 @@ impl App {
         self.pending_triaged_identities.clear();
         self.apply_triaged_identities(&staged.triaged_events);
 
+        // Snapshot display names BEFORE applying the staged renames so that we
+        // can detect which type IDs changed name. We only care about IDs that
+        // already exist in the model — anything else can't be referenced by an
+        // active filter term yet.
+        let before_names: Vec<(String, String)> = staged
+            .renames
+            .iter()
+            .filter_map(|(type_id, _)| {
+                if self.model.types.contains_key(type_id) {
+                    Some((type_id.clone(), self.model.canonical_type_name(type_id)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         // Apply renames + overrides via the same readiness gate the startup
         // path uses. If the model has zero events ingested yet, this stashes
         // them in pending_restore; otherwise it applies immediately.
         self.pending_restore = Some(staged);
         self.apply_persisted_overrides_if_ready();
+
+        // Build (old, new) pairs by re-reading display names after the apply.
+        let rename_pairs: Vec<(String, String)> = before_names
+            .into_iter()
+            .filter_map(|(type_id, old_name)| {
+                let new_name = self.model.canonical_type_name(&type_id);
+                (new_name != old_name).then_some((old_name, new_name))
+            })
+            .collect();
+        if !rename_pairs.is_empty() {
+            rewrite_filter_terms_for_renames(
+                &rename_pairs,
+                &mut self.event_filters.type_filter,
+                self.stashed_event_filters
+                    .as_mut()
+                    .map(|f| &mut f.type_filter),
+                &mut self.types_filter,
+            );
+            self.mark_live_cache_dirty();
+        }
 
         // We just consumed the on-disk version; don't immediately write it
         // back. Any further user edits will set shared_dirty again.
@@ -2064,18 +2100,15 @@ impl App {
                             let old_name = self.model.canonical_type_name(&type_id);
                             self.model.rename_type(&type_id, self.input_buffer.clone());
                             let new_name = self.model.canonical_type_name(&type_id);
-                            self.event_filters.type_filter = rename_type_terms_in_filter(
-                                &self.event_filters.type_filter,
-                                &old_name,
-                                &new_name,
+                            let renames = vec![(old_name, new_name)];
+                            rewrite_filter_terms_for_renames(
+                                &renames,
+                                &mut self.event_filters.type_filter,
+                                self.stashed_event_filters
+                                    .as_mut()
+                                    .map(|f| &mut f.type_filter),
+                                &mut self.types_filter,
                             );
-                            if let Some(stashed) = self.stashed_event_filters.as_mut() {
-                                stashed.type_filter = rename_type_terms_in_filter(
-                                    &stashed.type_filter,
-                                    &old_name,
-                                    &new_name,
-                                );
-                            }
                             self.user_renamed_types.insert(type_id);
                             self.mark_live_cache_dirty();
                             // The rename itself is shared; the side-effect on
@@ -4597,6 +4630,25 @@ fn is_scalar_array_item_path(path: &str) -> bool {
     path.ends_with(']')
 }
 
+/// Rewrites filter strings in-place so that terms referencing renamed type
+/// display names continue to match. Pure helper (no `App` dependency) so it
+/// can be unit-tested directly. `renames` are `(old_name, new_name)` pairs.
+fn rewrite_filter_terms_for_renames(
+    renames: &[(String, String)],
+    event_type_filter: &mut String,
+    stashed_type_filter: Option<&mut String>,
+    types_filter: &mut String,
+) {
+    if renames.is_empty() {
+        return;
+    }
+    *event_type_filter = apply_rename_batch_to_filter(event_type_filter, renames);
+    if let Some(stashed) = stashed_type_filter {
+        *stashed = apply_rename_batch_to_filter(stashed, renames);
+    }
+    *types_filter = apply_rename_batch_to_filter(types_filter, renames);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5334,5 +5386,78 @@ mod tests {
         let stopped = app.control_stop_action();
         assert_eq!(stopped.status, 409);
         assert_eq!(stopped.body["ok"], json!(false));
+    }
+
+    #[test]
+    fn rewrite_filter_terms_rewrites_event_stashed_and_types_filters() {
+        use super::rewrite_filter_terms_for_renames;
+        let renames = vec![("OldA".to_string(), "NewA".to_string())];
+        let mut event_filter = "OldA && other".to_string();
+        let mut stashed = "OldA".to_string();
+        let mut types_filter = "OldA".to_string();
+        rewrite_filter_terms_for_renames(
+            &renames,
+            &mut event_filter,
+            Some(&mut stashed),
+            &mut types_filter,
+        );
+        assert!(event_filter.contains("NewA"));
+        assert!(!event_filter.contains("OldA"));
+        assert_eq!(stashed, "NewA");
+        assert_eq!(types_filter, "NewA");
+    }
+
+    #[test]
+    fn rewrite_filter_terms_noop_for_empty_renames() {
+        use super::rewrite_filter_terms_for_renames;
+        let mut event_filter = "Alpha".to_string();
+        let mut types_filter = "Alpha".to_string();
+        rewrite_filter_terms_for_renames(&[], &mut event_filter, None, &mut types_filter);
+        assert_eq!(event_filter, "Alpha");
+        assert_eq!(types_filter, "Alpha");
+    }
+
+    #[test]
+    fn remote_rename_rewrites_event_and_types_filters() {
+        // Simulate the watcher reload path applying a rename pushed by another
+        // operator. The model already has the type ingested under its default
+        // label; our local event/types filters reference that label.
+        let mut app = test_app();
+        app.model.ingest(json!({"kind": "alpha", "a": 1}), 1.0);
+        let type_id = app.visible_types()[0].clone();
+        let old_name = app.model.canonical_type_name(&type_id);
+        app.event_filters.type_filter = old_name.clone();
+        app.types_filter = old_name.clone();
+        app.stashed_event_filters = Some(crate::domain::DataFilters {
+            type_filter: old_name.clone(),
+            ..crate::domain::DataFilters::default()
+        });
+
+        // Mimic what reload_shared_state_from_disk does after pulling the new
+        // shared state from disk: apply the rename to the model, then rewrite
+        // local filter strings using the (old, new) display-name diff.
+        let renames = vec![(type_id.clone(), "Renamed".to_string())];
+        app.model.apply_renames(&renames);
+        let new_name = app.model.canonical_type_name(&type_id);
+        let pairs = vec![(old_name.clone(), new_name.clone())];
+        super::rewrite_filter_terms_for_renames(
+            &pairs,
+            &mut app.event_filters.type_filter,
+            app.stashed_event_filters
+                .as_mut()
+                .map(|f| &mut f.type_filter),
+            &mut app.types_filter,
+        );
+
+        assert!(app.event_filters.type_filter.contains(&new_name));
+        assert!(!app.event_filters.type_filter.contains(&old_name));
+        assert_eq!(app.types_filter, new_name);
+        assert_eq!(
+            app.stashed_event_filters.as_ref().unwrap().type_filter,
+            new_name
+        );
+        // The filter still matches the underlying type.
+        let filtered = app.model.filtered_events(&app.event_filters);
+        assert_eq!(filtered.len(), 1);
     }
 }

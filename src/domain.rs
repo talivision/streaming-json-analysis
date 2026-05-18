@@ -1243,6 +1243,17 @@ pub fn rename_type_terms_in_filter(filter: &str, old_name: &str, new_name: &str)
     format_filter_expr(&expr)
 }
 
+/// Applies a batch of `(old_name, new_name)` substitutions to a filter string.
+/// Used when a remote operator renames a type and we need to rewrite the local
+/// filter terms in-place so they keep matching.
+pub fn apply_rename_batch_to_filter(filter: &str, renames: &[(String, String)]) -> String {
+    let mut out = filter.to_string();
+    for (old, new) in renames {
+        out = rename_type_terms_in_filter(&out, old, new);
+    }
+    out
+}
+
 fn parse_exact_filter(filter: &str) -> Option<(&str, String)> {
     let (k, v) = filter.split_once('=')?;
     Some((k.trim(), v.trim().to_string()))
