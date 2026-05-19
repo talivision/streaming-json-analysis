@@ -203,40 +203,6 @@ fn canonical_for_hashing(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
-fn hash_path_string(s: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(s.as_bytes());
-    format!("{:x}", h.finalize())
-}
-
-/// One-time best-effort migration: previous builds hashed the literal input
-/// string (relative or absolute), so a session opened as `./foo.jsonl` lives
-/// under a different SHA than `/full/path/foo.jsonl`. The fix to canonicalise
-/// the path before hashing changes the SHA, which would orphan all pre-fix
-/// state. If the canonical-keyed state file is missing but the literal-keyed
-/// one exists, rename it across. No-op once the new scheme has anything on
-/// disk, and never overwrites an existing canonical file.
-pub fn migrate_legacy_state_paths(stream_path: &Path) -> Result<()> {
-    let canonical = canonical_for_hashing(stream_path);
-    let literal_id = hash_path_string(&stream_path.to_string_lossy());
-    let canonical_id = hash_path_string(&canonical.to_string_lossy());
-    if literal_id == canonical_id {
-        return Ok(());
-    }
-    let dir = base_state_dir()?;
-    if !dir.exists() {
-        return Ok(());
-    }
-    for ext in &["shared.json", "local.json", "shared.lock"] {
-        let legacy = dir.join(format!("{}.{}", literal_id, ext));
-        let modern = dir.join(format!("{}.{}", canonical_id, ext));
-        if legacy.exists() && !modern.exists() {
-            let _ = std::fs::rename(&legacy, &modern);
-        }
-    }
-    Ok(())
-}
-
 pub fn state_paths_for_stream(stream_path: &Path) -> Result<StatePaths> {
     // Hash the canonical absolute path so `./foo.jsonl` and `/full/path/foo.jsonl`
     // (and any other relative form) resolve to the same state file. Falls back
