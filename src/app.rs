@@ -11,9 +11,9 @@ use crate::domain::{
 use crate::io::StreamReader;
 use crate::persistence::{
     export_session, hash_stream_prefix, invalidate_local_state, load_full_state,
-    read_shared_state_unlocked, save_local_state, save_profile, state_paths_for_stream,
-    update_shared_state, LocalState, NormalizedFieldOverride, RestoredState, SessionEvent,
-    SessionExport, SharedState, SourceProfile, StateLoadResult,
+    migrate_legacy_state_paths, read_shared_state_unlocked, save_local_state, save_profile,
+    state_paths_for_stream, update_shared_state, LocalState, NormalizedFieldOverride,
+    RestoredState, SessionEvent, SessionExport, SharedState, SourceProfile, StateLoadResult,
 };
 use crate::presence::{start_heartbeat, PresenceHandle};
 use crate::state_watcher::{spawn_shared_state_watcher, WatchMessage, WatcherHandle};
@@ -319,6 +319,11 @@ impl App {
             selected_type_ids: HashSet::new(),
             pending_unmerge_group_id: None,
         };
+        // One-time migration for sessions originally opened under a relative
+        // or symlinked path. Old state files lived under SHA256(literal input);
+        // new code uses SHA256(canonical path). If the canonical-keyed file
+        // doesn't exist but a legacy-keyed one does, rename it across.
+        let _ = migrate_legacy_state_paths(app.reader.path());
         if !reset_state {
             app.restore_persisted_state();
         }
