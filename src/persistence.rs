@@ -190,9 +190,27 @@ pub struct StatePaths {
     pub id: String,
 }
 
+fn canonical_for_hashing(p: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        return cwd.join(p);
+    }
+    p.to_path_buf()
+}
+
 pub fn state_paths_for_stream(stream_path: &Path) -> Result<StatePaths> {
+    // Hash the canonical absolute path so `./foo.jsonl` and `/full/path/foo.jsonl`
+    // (and any other relative form) resolve to the same state file. Falls back
+    // to an unresolved absolute path if `canonicalize` fails (e.g. the stream
+    // file doesn't exist yet) and to the original input if even that fails.
+    let canonical = canonical_for_hashing(stream_path);
     let mut hasher = Sha256::new();
-    hasher.update(stream_path.to_string_lossy().as_bytes());
+    hasher.update(canonical.to_string_lossy().as_bytes());
     let digest = hasher.finalize();
     let id = format!("{:x}", digest);
     let dir = base_state_dir()?;

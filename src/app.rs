@@ -1939,7 +1939,10 @@ impl App {
         {
             return true;
         }
-        if matches!(key.code, KeyCode::Char('q')) {
+        // Don't intercept `q` for quit-confirm while the user is typing into
+        // an input prompt (rename, filter, label, etc.) — let `q` reach the
+        // input buffer like any other character.
+        if matches!(key.code, KeyCode::Char('q')) && self.input_mode == InputMode::None {
             let now = Instant::now();
             if self
                 .quit_pending_until
