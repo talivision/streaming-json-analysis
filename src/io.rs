@@ -69,10 +69,6 @@ struct HttpBackend {
     blocked_on_partial_tail: bool,
     /// Counter for the periodic full-prefix verification.
     polls_since_verify: u32,
-    /// True if the most recent poll observed a server-side rotation (200
-    /// instead of 206, or 416, or etag mismatch). The main loop will pick
-    /// this up at the next opportunity to surface a "stream changed" UX.
-    pending_rotation: bool,
 }
 
 enum Backend {
@@ -113,7 +109,6 @@ impl StreamReader {
                 partial_tail: Vec::new(),
                 blocked_on_partial_tail: false,
                 polls_since_verify: 0,
-                pending_rotation: false,
             }),
             offset: 0,
         }
@@ -182,19 +177,6 @@ impl StreamReader {
             // local annotation persistence. A transient 404/416/transport
             // state should not prevent saving UI edits for this URL.
             Backend::Http(_) => true,
-        }
-    }
-
-    pub fn pending_rotation(&self) -> bool {
-        match &self.backend {
-            Backend::File(_) => false,
-            Backend::Http(b) => b.pending_rotation,
-        }
-    }
-
-    pub fn clear_pending_rotation(&mut self) {
-        if let Backend::Http(b) = &mut self.backend {
-            b.pending_rotation = false;
         }
     }
 
@@ -337,8 +319,20 @@ impl StreamReader {
         let len = file.metadata()?.len();
         b.last_known_len = len;
         if len < self.offset {
-            self.offset = 0;
-            b.blocked_on_partial_tail = false;
+            // In-place truncation (or replacement) under a running session
+            // produces an inconsistent in-memory model: the events we already
+            // ingested no longer exist on disk, and any persisted annotations
+            // are anchored to byte offsets that the new content doesn't share.
+            // Bail fast and let the user restart — startup verify_resume will
+            // see the prefix-hash mismatch and prompt to keep / discard the
+            // annotations cleanly.
+            bail!(
+                "source file {} shrank from {} to {} bytes mid-session (truncated or replaced). \
+                 Restart the analyzer; it will detect the rotation at startup and prompt to keep or discard annotations.",
+                b.path.display(),
+                self.offset,
+                len
+            );
         }
         let remaining = len.saturating_sub(self.offset) as usize;
         if remaining == 0 {
@@ -376,8 +370,13 @@ impl StreamReader {
             ));
         }
         let reached_eof = self.offset + bytes_read as u64 >= len;
-        let has_uncommitted_tail = consumed < chunk.len();
-        b.blocked_on_partial_tail = reached_eof && has_uncommitted_tail;
+        let last_newline_in_chunk = chunk
+            .iter()
+            .rposition(|&c| c == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let parsed_all_lines = consumed >= last_newline_in_chunk;
+        b.blocked_on_partial_tail = reached_eof && parsed_all_lines && consumed < chunk.len();
         self.offset += consumed as u64;
         Ok(parsed)
     }
@@ -401,17 +400,29 @@ impl StreamReader {
                     b.last_known_len = total;
                     if total == self.offset {
                         b.blocked_on_partial_tail = false;
-                        b.pending_rotation = false;
                         return Ok(Vec::new());
                     }
+                    bail!(
+                        "HTTP source {} shrank from {} to {} bytes mid-session (truncated or rotated). \
+                         Restart the analyzer; startup verify_resume will detect the rotation and prompt to keep or discard annotations.",
+                        b.url,
+                        self.offset,
+                        total
+                    );
                 }
-                // Range past EOF, but not exactly at EOF: file likely shrank
-                // or rotated under us.
-                b.pending_rotation = true;
-                return Ok(Vec::new());
+                // 416 without parseable Content-Range — server is non-compliant
+                // or in a weird state. Treat as rotation and bail.
+                bail!(
+                    "HTTP source {} returned 416 past offset {} without a Content-Range header; \
+                     cannot verify whether the stream rotated. Restart the analyzer.",
+                    b.url,
+                    self.offset
+                );
             }
             Err(ureq::Error::Status(404, _)) => {
-                b.pending_rotation = true;
+                // 404 may be transient (server restart, DNS blip); treat as
+                // "no new bytes this poll" rather than rotation. The user can
+                // notice via the loading indicator stalling.
                 return Ok(Vec::new());
             }
             Err(ureq::Error::Status(code, _)) => {
@@ -438,22 +449,19 @@ impl StreamReader {
             .context("reading HTTP response body")?;
 
         if status == 200 {
-            // Server didn't honor Range. Treat as "file rotated", reset
-            // offset to 0, ingest from scratch. This shouldn't happen
-            // with our own server but does happen with some caches.
-            b.pending_rotation = true;
-            b.partial_tail.clear();
-            b.blocked_on_partial_tail = false;
-            self.offset = 0;
-            b.etag = new_etag;
-            if let Some(cl) = content_length {
-                b.last_known_len = cl;
-            }
-            return Ok(Vec::new());
+            // Server didn't honor Range — either it doesn't support Range or
+            // (more interestingly) the resource changed under us and the
+            // server is sending the whole file. Either way the offset we hold
+            // is no longer meaningful; bail and let the user restart.
+            bail!(
+                "HTTP source {} returned 200 OK for Range: bytes={}- (expected 206 Partial Content). \
+                 The server either doesn't support range requests or the stream rotated. Restart the analyzer.",
+                b.url,
+                start
+            );
         }
 
         // Update bookkeeping.
-        b.pending_rotation = false;
         if let Some(total) = total_from_range {
             b.last_known_len = total;
         } else if let Some(cl) = content_length {

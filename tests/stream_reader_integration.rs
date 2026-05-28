@@ -98,7 +98,12 @@ fn stream_reader_verify_resume_validates_but_replays_from_start() {
 }
 
 #[test]
-fn stream_reader_resets_offset_after_truncate() {
+fn stream_reader_fails_fast_on_mid_session_truncate() {
+    // In-place truncation under a running session produces an inconsistent
+    // in-memory model (already-ingested events are gone from disk, persisted
+    // annotations are anchored to byte offsets that no longer mean the same
+    // thing). The reader bails so the app exits cleanly and the user can
+    // restart — startup verify_resume will detect the rotation and prompt.
     let path = temp_stream_path();
     fs::write(&path, "{\"id\":1}\n{\"id\":2}\n").expect("write initial");
 
@@ -107,9 +112,12 @@ fn stream_reader_resets_offset_after_truncate() {
     assert_eq!(first.len(), 2);
 
     fs::write(&path, "{\"id\":9}\n").expect("truncate and rewrite");
-    let second = reader.poll().expect("second poll");
-    assert_eq!(second.len(), 1);
-    assert_eq!(second[0], json!({"id":9}));
+    let err = reader.poll().expect_err("second poll must bail on shrink");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("shrank") && msg.contains("Restart"),
+        "expected shrank/restart message, got: {msg}"
+    );
 
     let _ = fs::remove_file(path);
 }
