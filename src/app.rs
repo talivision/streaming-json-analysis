@@ -41,7 +41,12 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LIVE_WINDOW_DEFAULT: usize = 120;
-const LIVE_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// File backend: poll every 50ms (20 Hz). Faster than the HTTP idle path's
+// 100ms so a local writer's events show up promptly, but slower than the
+// previous 10ms cadence which made every per-event O(n) refresh visible
+// as a stutter (e.g. pressing `m` to mark a period).
+const FILE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const HTTP_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const UI_FRAME_SLEEP: Duration = Duration::from_millis(16);
 const UI_BURST_SLEEP: Duration = Duration::from_millis(1);
 const MENU_PAGE_STEP: usize = 30;
@@ -359,7 +364,7 @@ impl App {
 
         terminal.draw(|f| draw_ui(f, self))?;
 
-        let mut last_poll = Instant::now() - LIVE_FALLBACK_POLL_INTERVAL;
+        let mut last_poll = Instant::now() - FILE_POLL_INTERVAL;
         let mut last_autosave = Instant::now();
 
         let loop_result = (|| -> Result<()> {
@@ -376,7 +381,12 @@ impl App {
                 if !self.offline || !self.offline_loaded {
                     let mut should_poll = self.offline && !self.offline_loaded;
                     if !self.offline {
-                        if last_poll.elapsed() >= LIVE_FALLBACK_POLL_INTERVAL {
+                        let poll_interval = if self.reader.is_http() && self.initial_load_complete {
+                            HTTP_IDLE_POLL_INTERVAL
+                        } else {
+                            FILE_POLL_INTERVAL
+                        };
+                        if last_poll.elapsed() >= poll_interval {
                             should_poll = true;
                         }
                     }
