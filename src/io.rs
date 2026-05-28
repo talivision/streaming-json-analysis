@@ -353,14 +353,16 @@ impl StreamReader {
         }
 
         let path_display = b.path.display().to_string();
-        let (parsed, consumed) = split_and_parse_chunk(
+        let reached_eof = self.offset + bytes_read as u64 >= len;
+        let (parsed, consumed, blocked) = process_chunk(
             &chunk,
             self.offset,
             &path_display,
-            /* allow_final_partial */ self.offset + bytes_read as u64 >= len,
+            reached_eof,
+            /* allow_final_partial */ reached_eof,
             max_lines,
         )?;
-        if consumed == 0 && !chunk.is_empty() && chunk.len() >= max_bytes {
+        if consumed == 0 && chunk.len() >= max_bytes {
             let line_number = self.current_line_number();
             return Err(anyhow!(
                 "JSON line in {} line {} exceeded {} bytes before a newline was seen; aborting read",
@@ -369,14 +371,7 @@ impl StreamReader {
                 max_bytes
             ));
         }
-        let reached_eof = self.offset + bytes_read as u64 >= len;
-        let last_newline_in_chunk = chunk
-            .iter()
-            .rposition(|&c| c == b'\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let parsed_all_lines = consumed >= last_newline_in_chunk;
-        b.blocked_on_partial_tail = reached_eof && parsed_all_lines && consumed < chunk.len();
+        b.blocked_on_partial_tail = blocked;
         self.offset += consumed as u64;
         Ok(parsed)
     }
@@ -500,12 +495,11 @@ impl StreamReader {
         }
 
         // Parse up to max_lines complete lines from the response. We commit
-        // exactly the bytes covered by the lines we parsed — `consumed` from
-        // `split_and_parse_chunk` is the position past the last newline we
-        // accepted. Anything past it is either a partial line still being
-        // written by the producer (waiting for newline) OR more complete
-        // lines that the max_lines cap made us defer to the next poll. In
-        // both cases the next `Range: bytes=consumed-` re-fetches them.
+        // exactly the bytes covered by the lines we parsed. Anything past
+        // it is either a partial line still being written by the producer
+        // (waiting for newline) OR more complete lines that the max_lines
+        // cap made us defer. In both cases the next `Range: bytes=consumed-`
+        // re-fetches them.
         //
         // The earlier design also cached the trailing partial bytes in
         // `partial_tail` and prepended them to the next response. That
@@ -514,10 +508,16 @@ impl StreamReader {
         // (yielding "object1{object2" parse errors). The single-source-
         // of-truth fix is "trust the wire; commit only complete lines."
         let path_display = b.url.clone();
-        let (parsed, consumed) = split_and_parse_chunk(
+        let reached_eof = b
+            .last_known_len
+            .checked_sub(start)
+            .map(|remaining| body.len() as u64 >= remaining)
+            .unwrap_or(false);
+        let (parsed, consumed, blocked) = process_chunk(
             &body,
             self.offset,
             &path_display,
+            reached_eof,
             /* allow_final_partial */ false,
             max_lines,
         )?;
@@ -529,26 +529,49 @@ impl StreamReader {
                 max_bytes
             );
         }
-        let reached_eof = b
-            .last_known_len
-            .checked_sub(start)
-            .map(|remaining| body.len() as u64 >= remaining)
-            .unwrap_or(false);
-        // Partial-tail-at-EOF: only flag if we parsed up to the body's last
-        // newline AND there are leftover non-newline bytes. If max_lines
-        // made us stop short, there are more complete lines pending — that's
-        // not a "partial tail waiting on newline", it's just more polls.
-        let last_newline_in_body = body
-            .iter()
-            .rposition(|&c| c == b'\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let parsed_all_lines = consumed >= last_newline_in_body;
-        b.blocked_on_partial_tail = reached_eof && parsed_all_lines && consumed < body.len();
+        b.blocked_on_partial_tail = blocked;
         self.offset += consumed as u64;
         b.partial_tail.clear();
         Ok(parsed)
     }
+}
+
+/// Shared post-fetch step for both backends: split the chunk into lines,
+/// parse them, and decide whether the reader is now blocked on a producer's
+/// mid-write tail. The only legitimate per-backend difference is *how* we
+/// got the chunk in the first place; everything afterwards is identical
+/// reasoning over `(chunk, reached_eof)`.
+///
+/// Returns `(parsed_values, bytes_consumed, blocked_on_partial_tail)`.
+/// `blocked_on_partial_tail` is true iff we reached EOF, parsed every
+/// complete line, and there are still bytes past the last newline waiting
+/// for the producer to terminate them. Critically, it is *not* set when
+/// we stopped early due to the `max_lines` cap — those are deferred
+/// complete lines, not a producer-mid-write tail, and treating them as a
+/// completion signal makes `loading_locked` flip false prematurely.
+fn process_chunk(
+    chunk: &[u8],
+    chunk_base_offset: u64,
+    source_display: &str,
+    reached_eof: bool,
+    allow_final_partial: bool,
+    max_lines: usize,
+) -> Result<(Vec<Value>, usize, bool)> {
+    let (parsed, consumed) = split_and_parse_chunk(
+        chunk,
+        chunk_base_offset,
+        source_display,
+        allow_final_partial,
+        max_lines,
+    )?;
+    let last_newline_in_chunk = chunk
+        .iter()
+        .rposition(|&c| c == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let parsed_all_lines = consumed >= last_newline_in_chunk;
+    let blocked = reached_eof && parsed_all_lines && consumed < chunk.len();
+    Ok((parsed, consumed, blocked))
 }
 
 fn parse_total_from_content_range(hdr: Option<&str>) -> Option<u64> {
