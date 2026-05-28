@@ -71,8 +71,13 @@ pub enum PeriodsFocus {
 
 #[derive(Debug, Clone)]
 struct LiveAnchor {
-    ts: f64,
-    type_id: String,
+    // Position in `model.events`. The stable, unique identifier for an event
+    // — `events` only appends, never reorders or deletes, so `event_idx`
+    // survives any cache rebuild. Previously anchored by `(ts, type_id)`,
+    // which collided when many events shared the same millisecond
+    // timestamp and type id and caused the cursor to snap to the first
+    // duplicate after a re-ingest cycle.
+    event_idx: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -3571,20 +3576,16 @@ impl App {
     }
 
     fn live_anchor_at(&self, index: usize) -> Option<LiveAnchor> {
-        self.live_event_at_visible_index(index).map(|e| LiveAnchor {
-            ts: e.ts,
-            type_id: e.type_id.clone(),
-        })
+        let event_idx = *self.live_visible_indices.get(index)?;
+        Some(LiveAnchor { event_idx })
     }
 
     fn find_live_index(&self, anchor: &LiveAnchor) -> Option<usize> {
-        self.live_visible_indices.iter().position(|&event_idx| {
-            self.model
-                .events
-                .get(event_idx)
-                .map(|e| e.ts == anchor.ts && e.type_id == anchor.type_id)
-                .unwrap_or(false)
-        })
+        // Match by absolute event_idx — unique even when many events
+        // share the same millisecond timestamp and type id.
+        self.live_visible_indices
+            .iter()
+            .position(|&event_idx| event_idx == anchor.event_idx)
     }
 
     pub fn set_live_window_rows(&mut self, rows: usize) {
