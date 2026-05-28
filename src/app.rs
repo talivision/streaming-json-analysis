@@ -381,7 +381,14 @@ impl App {
                 if !self.offline || !self.offline_loaded {
                     let mut should_poll = self.offline && !self.offline_loaded;
                     if !self.offline {
-                        let poll_interval = if self.reader.is_http() && self.initial_load_complete {
+                        // Burst-poll during initial bulk load so a 50 MB file isn't
+                        // capped at 20 polls/sec → ~1 s of wall just for the cadence.
+                        // Once initial_load_complete flips, fall back to the per-
+                        // backend throttle so steady-state mutations (e.g. pressing
+                        // `m`) don't fight a 100 Hz poll loop.
+                        let poll_interval = if !self.initial_load_complete {
+                            Duration::ZERO
+                        } else if self.reader.is_http() {
                             HTTP_IDLE_POLL_INTERVAL
                         } else {
                             FILE_POLL_INTERVAL

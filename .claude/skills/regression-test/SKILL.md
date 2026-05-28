@@ -125,6 +125,9 @@ Run in order — later tests assume earlier ones passed. Use `single.jsonl` unle
 | A19 | Export profile (`p`) | `p Enter` | `<stream>.profile.json` exists |
 | A20 | Select + merge types (use `multi.jsonl`) | `3 s Down s g A u t h Enter` | merged-group row appears with summed count |
 | A21 | Unmerge | navigate to merged row, `g y` | merged row gone, members reappear |
+| A22 | Values browser (`v`) round-trip | drill into a key in Live (`1 Enter`, navigate to a key row), press `v` | UI switches to a `Values` modal listing all observed values for that key with counts. `Esc` returns to Live; `Enter` applies the selected value as an exact filter and returns. Regression (df669da): the browser must not jump to Live when opened from Baseline / Periods. |
+| A23 | Whitelist mode cycle (`w`) | start with `--whitelist /tmp/regtest/wl.txt` (containing `login` on one line), then press `w`, `w`, `w` | status flips Off → AlwaysShow → OnlyWhitelist → Off; matching events show with orange bg highlight when whitelist is active. With no `--whitelist` arg, `w` is a no-op (status: "no whitelist loaded" or similar). |
+| A24 | `--escape-strings` CLI flag | run `cargo run --release -- --escape-strings /tmp/regtest/single.jsonl` and look at any string value containing a literal `\t` or newline in raw bytes | shown as escape sequence rather than the literal byte. Regression check only — verify the flag parses and the binary launches; full byte-escape semantics are unit-tested separately. |
 
 **For each of A8, A10, A11, A12, A13, A14, A20, A21: apply the stutter pattern.** Capture immediately and again 500ms later — assert no revert.
 
@@ -142,6 +145,8 @@ Run a session that performs A8, A10, A14, A20, then `q q`. Restart with no `--re
 | B6 | Filters/label restored | substring filter and action label still set |
 | B7 | **Rename-to-blank persists** | from prior session, rename type via `r BSpace BSpace... Enter` (empty). Restart. Type displays its default (`type-…`) name, NOT the prior name |
 | B8 | **Restart re-ingests events from byte 0** | After any session that consumed events (e.g., A8 + A10), `q q`, restart. Header still shows `objects 200` (the full fixture count), not `objects 0` or "N new since last session". `saved_len` + `prefix_hash_hex` are an identity checkpoint for rotation detection only — the reader stays at offset 0 on Clean so the in-memory model rebuilds from the stream. A restart that shows fewer objects than the on-disk file means `verify_resume` is incorrectly seeking the reader forward. |
+| B9 | **Canonical-path equivalence** | from `/tmp/regtest/`: run with `./single.jsonl` (relative), rename a type, `q q`. Re-run with `/tmp/regtest/single.jsonl` (absolute). | The rename is restored — relative and absolute forms resolve to the same `<sha>.state.json`. Regression (bd01bdd): previously the SHA was over the literal input string, so `./foo.jsonl` and `/abs/foo.jsonl` were different state files. The fix canonicalizes the path before hashing. |
+| B10 | **`q` inside an input buffer doesn't bail** | open any input prompt (e.g. `n` for the action label, or `/` for substring filter), then type `q a q b q Enter` | the buffer accepts the `q` characters; the session does NOT prompt to quit, and the resulting label is `qaqbq`. Regression (bd01bdd): the `q` quit-confirm dance used to run before the input-mode dispatcher, so any `q` keystroke inside an input prompt silently aborted the prompt instead of being captured. |
 
 ### C. CLI flags
 
@@ -168,6 +173,8 @@ These tests exist because the most damaging bugs we've seen this codebase hit we
 | D8 | Press `m` twice rapidly (within ~10ms, send_keys with both args) | `model.periods.len()` ends at 0; no open period; no degenerate closed period |
 | D9 | Apply a profile that renames type T, then rename T to "" by hand | Stays blank for the rest of the session (stutter capture). **No restart claim** — see note below. |
 | D10 | Toggle path override on (A9), restart, toggle it back to default | Override disappears in stutter capture. **The cycle is tri-state: None → ForcedOff → ForcedOn → None when the path is auto-considered, and None → ForcedOn → None when not. Press Space enough times to land back on None — for an auto-on path that's two Spaces from the restored ForcedOff.** |
+| D11 | **Live cursor unstuck after type filter + Home + Down** | start a feed where many events arrive within one millisecond (use the `examples/sources/high_volume_http` writer or just a synthetic 100k-event fixture with repeating `_timestamp` values). Filter to one type (`3 Enter t Enter`), return to Live (`1`), `Home`, then `Down`, `Down`, `Down`. | Cursor moves down by 3 rows in the visible-event list across captures. Regression (00841dc): `LiveAnchor` keyed by `(ts, type_id)` collapsed when many events shared a timestamp; `find_live_index` always returned the first match, so the post-poll cursor-restore pinned the row to index 0 every iteration. The fix keys the anchor by `event_idx` (a stable position in `model.events`). |
+| D12 | Mark / unmark period during sustained ingest | start a writer at ≥1000 ev/s, press `m` once, wait 2s, press `m` again. | No visible UI stutter or stall during either keypress. The whole mark/unmark cycle completes in <100 ms each. Regression (8c16a85): the file-backend poll cadence used to be 10 ms / 100 Hz and would saturate the UI thread with `refresh_live_anomaly_scores` recomputation, making single keystrokes visibly stall on busy streams. Cadence is now throttled to 50 ms (file) / 100 ms (HTTP idle). |
 
 **D1 specifically reproduces the `m`-flash bug.** D2/D3 cover rename-to-blank. D4/D5 cover the `i` blink. D8 covers the double-tap. All four were in the bug notes that opened the original session.
 
@@ -218,29 +225,77 @@ echo '{"pid":0,"hostname":"'$(hostname)'","stream_path":"/tmp/regtest/single.jso
 | F1 | Solo idle CPU over 60s | matches main-branch baseline within ±5% |
 | F2 | Mutation-to-render latency (keypress → next frame shows change) | median < 100ms (no watcher in the loop now; should be a tight render budget) |
 | F3 | Ingest 1000 ev/s with concurrent mutations | UI stays responsive, `objects` count keeps climbing without stalls |
+| F4 | **Malformed-final-line perf canary** | See script below. Build a 500k-event high-cardinality JSONL ending in an unterminated final line, run the binary against it with stdout/stderr captured, and `time` it through to clean exit. **Goal: confirm a recent build is NOT slower than its parent commit by more than ~10%.** This is the single best catch-all perf test — it exercises ingest, structural hashing, anomaly scoring, path stats, and shutdown-time tail scan in one shot. |
+| F5 | Large unterminated final line (>8 KB) emits warning at shutdown | Build a fixture whose last "line" is > 16 KB with no trailing newline (just one giant JSON-ish blob). Launch the binary, let it ingest, `q q`. Stderr must contain `incomplete JSON line remained at shutdown`. Regression: the old 8 KB tail-scan window (e0ee540) missed the warning when the unterminated tail was larger than the scan budget. |
+| F6 | High-cardinality ingest is linear, not quadratic | Same 500k fixture as F4 but with one field carrying a unique value per event (`{"_timestamp":..., "_type":"e", "seq": <unique-per-line>}`). Time `cargo run --release -- <fixture>` through to `q q`. **Should finish in seconds, not minutes.** Regression: pre-9da29e7 path-stats recomputation was O(n²) and hung the analyzer past ~100k events. |
+
+**F4 / F6 are the canaries for ingest-loop regressions.** They run in <5s on green builds; any commit that makes them take >2× the parent commit is suspicious.
+
+| F7 | **Stats parity across commits (bit-identical output)** | Build a deterministic mixed-shape fixture (timestamps + types fully fixed), run the binary against it on HEAD and on an older commit, capture the Types tab and the type-detail tab on each, `diff` the captures. | Captures are **byte-identical**. Sufficient validation that any perf-only refactor (e.g. 9da29e7's PathStats numeric-token cache) actually preserved scoring/counting behavior. Regression: any commit that changes path-stats math, anomaly scoring, or type-count rollup will surface as a diff line. See `## Stats parity` below for the helper. |
+
+```bash
+# F4 / F5 / F6 fixture generator
+python3 -c "
+import json, sys
+n = int(sys.argv[1])
+high_card = sys.argv[2] == 'high'
+trail_blob = sys.argv[3] == 'blob'
+with open('/tmp/regtest/perf.jsonl', 'w') as f:
+    for i in range(n):
+        rec = {'_timestamp': 1700000000000 + i, '_type': 'e', 'idx': i}
+        if high_card:
+            rec['seq'] = f'seq-{i}'
+            rec['metric'] = i * 1.0001
+        f.write(json.dumps(rec) + '\n')
+    if trail_blob:
+        # unterminated final blob > 16 KB, deliberately not valid JSON
+        f.write('{ \"incomplete\": \"' + ('x' * 17000) + '\"')
+    else:
+        # plain unterminated final line, valid-ish JSON but no newline
+        f.write('{\"_timestamp\":1700000999999,\"_type\":\"e\",\"idx\":' + str(n))
+" 500000 high blob
+
+# Time the binary cleanly: open, ingest, quit.
+# Pipe 'qq' on stdin via tmux so the app exits as soon as it's idle.
+SK=.claude/skills/drive-tui
+TUI_STREAM=/tmp/regtest/perf.jsonl $SK/start.sh perf
+sleep 0.2
+# wait for initial load to finish; poll the screen for 'objects 500000' (allow some slop on unterminated tail = -0 or -1)
+for _ in {1..120}; do
+  $SK/capture.py perf /tmp/regtest/perf.capture.json >/dev/null
+  grep -q 'objects 499999\\|objects 500000' /tmp/regtest/perf.capture.json && break
+  sleep 0.25
+done
+START=$(date +%s%N)
+$SK/send_keys.sh perf q q
+# Wait for tmux session to die
+for _ in {1..40}; do tmux has-session -t perf 2>/dev/null || break; sleep 0.1; done
+END=$(date +%s%N)
+echo "perf wall-clock: $(( (END-START) / 1000000 )) ms"
+grep -i 'incomplete JSON line remained at shutdown' /tmp/tui-stderr.log || \
+  echo "FAIL F5: no shutdown warning for unterminated final line"
+```
+
+To compare against an older commit, see the **Performance comparison vs older commit** section below.
 
 ### G. HTTP source
 
-The analyzer accepts `http://...` and `https://...` in place of a local path. The HTTP backend uses `Range: bytes=<saved_len>-` polling and tracks a prefix-CRC identity (`crc32:<hex>:<len>`) — **not** a whole-file ETag, since the file ETag changes on every append for a live stream and would always look like a rotation. The bundled stream servers (Python in `examples/sources/http_stream/http_stream.py`, Rust in `src/bin/stream_server.rs`) expose `X-Content-CRC32` on 206 / HEAD responses so the client can verify the prefix without re-downloading it.
+The analyzer accepts `http://...` and `https://...` in place of a local path. The HTTP backend uses `Range: bytes=<saved_len>-` polling and tracks a prefix-CRC identity (`crc32:<hex>:<len>`) — **not** a whole-file ETag, since the file ETag changes on every append for a live stream and would always look like a rotation. `examples/sources/http_stream/file_server.py` is the canonical example server; it exposes `X-Content-CRC32` on 206 / HEAD responses so the client can verify the prefix without re-downloading it. `http_stream.py` bundles a writer + server in one process for one-shot smoke tests.
 
-Launch a server in a separate process for these tests:
+Launch the file server for these tests (writer is separate):
 
 ```bash
-# Python (stdlib only)
-python3 examples/sources/http_stream/http_stream.py &
-HS=$!
-# Wait for :8080 to be listening
+mkdir -p /tmp/json_demo
+: > /tmp/json_demo/stream.jsonl
+python3 examples/sources/http_stream/file_server.py /tmp/json_demo 8080 &
+FS=$!
 for _ in {1..40}; do nc -z 127.0.0.1 8080 2>/dev/null && break; sleep 0.05; done
-
-# Rust (deployable binary)
-target/release/stream_server /tmp/regtest 18080 &
-RS=$!
 ```
 
-Clean both servers and any prior swap/state at the end of the section:
+Clean up at end of section:
 
 ```bash
-kill $HS $RS 2>/dev/null
+kill $FS 2>/dev/null
 URL_SHA=$(python3 -c "import hashlib; print(hashlib.sha256(b'http://127.0.0.1:8080/stream.jsonl').hexdigest())")
 rm -f ~/.local/state/json-analyzer/${URL_SHA}.{state,swap}.json
 ```
@@ -354,6 +409,115 @@ seq 0 4999 > /tmp/drops/expected.txt
 diff /tmp/drops/expected.txt /tmp/drops/got.txt | head -20
 # A "<" line is a missed event (drop); a ">" line is a phantom (double-ingest).
 ```
+
+## Stats parity
+
+Verifies F7. A perf-only commit (e.g. caching, vectorisation, parallelism) should not change *what* the analyzer reports — only how fast. To prove that, capture the user-visible stats (Types tab + path-focus tab) from HEAD and from the older commit on the **same** fixture, and diff the captures.
+
+```bash
+# Build the older worktree
+PRE=60be13e   # or whichever baseline you're validating against
+WT=/tmp/regtest/wt-stats
+git worktree add "$WT" "$PRE" && ( cd "$WT" && cargo build --release ) || exit 1
+
+# Deterministic fixture — fixed timestamps, 4 shapes, 5000 events
+python3 -c "
+import json
+shapes = [
+    lambda i: {'_timestamp': 1700000000000 + i*100, '_type': 'login',    'user': f'u{i%5}'},
+    lambda i: {'_timestamp': 1700000000000 + i*100, '_type': 'logout',   'session': f's{i%5}'},
+    lambda i: {'_timestamp': 1700000000000 + i*100, '_type': 'purchase', 'amount': i*10},
+    lambda i: {'_timestamp': 1700000000000 + i*100, '_type': 'view',     'page': f'p{i%3}'},
+]
+with open('/tmp/regtest/stats.jsonl', 'w') as f:
+    for i in range(5000):
+        f.write(json.dumps(shapes[i%4](i)) + '\n')
+"
+
+run_stats_capture() {
+    local label="$1" bin="$2"
+    local sess="stats-${label}"
+    python3 -c "
+import hashlib, os
+sd = os.path.expanduser('~/.local/state/json-analyzer')
+abs_path = os.path.realpath('/tmp/regtest/stats.jsonl')
+h = hashlib.sha256(abs_path.encode()).hexdigest()
+for ext in ('state.json', 'swap.json'):
+    f = os.path.join(sd, f'{h}.{ext}')
+    if os.path.exists(f): os.remove(f)
+"
+    tmux kill-session -t "$sess" 2>/dev/null
+    tmux new-session -d -s "$sess" -x 160 -y 50 "$bin /tmp/regtest/stats.jsonl 2>/dev/null"
+    sleep 2
+    tmux send-keys -t "$sess" 3                                    # Types tab
+    sleep 0.5
+    tmux capture-pane -t "$sess" -p > /tmp/regtest/stats-${label}-types.txt
+    tmux send-keys -t "$sess" Enter                                # path-focus on first type
+    sleep 0.5
+    tmux capture-pane -t "$sess" -p > /tmp/regtest/stats-${label}-details.txt
+    tmux send-keys -t "$sess" q q
+    for _ in {1..40}; do tmux has-session -t "$sess" 2>/dev/null || break; sleep 0.1; done
+}
+
+run_stats_capture head "$(pwd)/target/release/json_analyzer"
+run_stats_capture old  "$WT/target/release/json_analyzer"
+diff /tmp/regtest/stats-head-types.txt   /tmp/regtest/stats-old-types.txt   || echo "FAIL F7 types diverged"
+diff /tmp/regtest/stats-head-details.txt /tmp/regtest/stats-old-details.txt || echo "FAIL F7 details diverged"
+
+git worktree remove --force "$WT"
+```
+
+Empty diff output = stats are byte-identical. Any line of `<` / `>` divergence is a regression worth investigating. Captures use raw `tmux capture-pane` text (not the structured JSON capture from drive-tui) because we want deterministic byte-level comparison of the actual on-screen output.
+
+## Performance comparison vs older commit
+
+When a perf bar like F4 / F6 trips, the question is "is this commit *introducing* slowness, or has it always been like this?". Use a git worktree to time the current HEAD against its parent (or any earlier baseline). The malformed-final-line fixture from F4 is ideal — a deterministic clean-exit perf test that exercises ingest, scoring, path stats, and shutdown tail-scan in one shot.
+
+```bash
+# Build the parent commit in a separate worktree (no pollution of HEAD's target/)
+PARENT=$(git rev-parse HEAD~1)
+WT=/tmp/regtest/wt-parent
+git worktree add "$WT" "$PARENT"
+( cd "$WT" && cargo build --release ) || { echo "parent build failed"; exit 1; }
+
+# Generate fixture once (same path for both runs)
+python3 -c "
+import json
+with open('/tmp/regtest/perf.jsonl', 'w') as f:
+    for i in range(500_000):
+        f.write(json.dumps({'_timestamp': 1700000000000 + i, '_type': 'e',
+                            'idx': i, 'seq': f'seq-{i}', 'metric': i * 1.0001}) + '\n')
+    f.write('{ \"incomplete\": \"' + ('x' * 17000) + '\"')   # large unterminated tail
+"
+
+# Time each binary. The drive-tui scripts make this reliable: launch in tmux,
+# poll for ingest completion, send 'q q', measure wall-clock.
+time_binary() {
+    local label="$1" bin="$2"
+    local sess="perf-${label}"
+    rm -f ~/.local/state/json-analyzer/*.swap.json
+    tmux new-session -d -s "$sess" -x 160 -y 50 \
+        "$bin /tmp/regtest/perf.jsonl 2>/tmp/tui-stderr-${label}.log"
+    # Wait for ingest to finish — header text 'objects 499999' or 'objects 500000'
+    for _ in {1..240}; do
+        tmux capture-pane -p -t "$sess" 2>/dev/null | \
+            grep -q 'objects 49999[0-9]\|objects 500000' && break
+        sleep 0.25
+    done
+    local t0=$(date +%s%N)
+    tmux send-keys -t "$sess" q q
+    for _ in {1..40}; do tmux has-session -t "$sess" 2>/dev/null || break; sleep 0.1; done
+    local t1=$(date +%s%N)
+    echo "$label: $(( (t1 - t0) / 1000000 )) ms (post-ingest q→exit)"
+}
+
+time_binary parent "$WT/target/release/json_analyzer"
+time_binary head   "$(pwd)/target/release/json_analyzer"
+
+git worktree remove --force "$WT"
+```
+
+Read the warning at shutdown out of `/tmp/tui-stderr-{parent,head}.log` — both should report `incomplete JSON line remained at shutdown`. A HEAD that is >10% slower than parent on this fixture is a regression; bisect from there.
 
 ## When something fails
 
