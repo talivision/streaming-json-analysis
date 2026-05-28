@@ -98,13 +98,12 @@ Offline mode is for read-once analysis of existing data. It does not tail for ne
 
 ### HTTP sources
 
-The first argument can also be an `http://` or `https://` URL. The analyzer tails the URL the same way it tails a file, using HTTP `Range` requests to fetch only the new bytes per poll:
-
+The first argument can also be an `http://` or `https://` URL. 
 ```bash
 ./target/release/json_analyzer http://logs.internal/stream.jsonl
 ```
 
-The remote server must support `Range`, `Content-Range`, `Accept-Ranges: bytes`, `ETag`, and (for cross-restart prefix validation) `X-Content-CRC32` on ranged responses. A reference implementation lives at `examples/sources/http_stream/file_server.py` — point it at any directory of JSONL files and it serves them with the right headers. The analyzer treats append-only growth as growth (not rotation) by validating the byte prefix via `X-Content-CRC32`, so a live stream that keeps growing under the same URL works without re-ingesting on every poll. Annotations (renames, periods, merge groups) persist for the URL and restore on next launch.
+The remote server must support `Range`, `Content-Range`, `Accept-Ranges: bytes`, `ETag`, and a custom `X-Content-CRC32` on ranged responses. A reference implementation lives at `examples/sources/http_stream/file_server.py`, you should probably just use this and point it at a `.jsonl` file that is being produced by something else. 
 
 ---
 
@@ -271,27 +270,6 @@ python3 examples/sources/demo_source/demo_source.py
 
 In the source terminal, press `l` (login), `p` (purchase), `s` (search), `c`/`t` (experiment variants) to fire actions. In the analyzer, press `m` to bracket a window around them and watch the anomaly scores appear.
 
-### High-volume demo
-
-For a more realistic load — a large initial backlog followed by a steady tail — use the high-volume writer:
-
-```bash
-# Terminal 1
-python3 examples/sources/high_volume/high_volume_writer.py \
-  --output /tmp/json_demo/stream.jsonl \
-  --initial-events 100000 --steady-rate 10 --truncate
-
-# Terminal 2: read the file directly
-./target/release/json_analyzer /tmp/json_demo/stream.jsonl
-
-# OR Terminal 2 alt: serve over HTTP and analyze the URL
-python3 examples/sources/http_stream/file_server.py /tmp/json_demo 8080 &
-./target/release/json_analyzer http://127.0.0.1:8080/stream.jsonl
-```
-
-The writer is transport-agnostic — it just appends to the file. The HTTP server is an independent piece you can use with any writer that produces JSONL.
-
----
 
 ## CLI reference
 
