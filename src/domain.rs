@@ -62,6 +62,35 @@ pub struct ActionPeriod {
 pub struct PathStats {
     pub total: u64,
     pub values: HashMap<String, u64>,
+    // Numeric-token summary maintained incrementally so `auto_consider_path`
+    // can be O(1) instead of scanning `values` per event. Updated whenever
+    // a numeric ("n:" prefix) token is added or incremented via `bump_token`.
+    pub numeric_distinct: u64,
+    pub numeric_total: u64,
+    pub numeric_top: u64,
+}
+
+impl PathStats {
+    /// Increment `token`'s count by `delta` and keep the numeric-token
+    /// summary in sync. This is the only path through which `values`
+    /// should be mutated — the summary fields are only correct as long
+    /// as every insert/increment goes through here.
+    pub fn bump_token(&mut self, token: &str, delta: u64) {
+        let is_numeric = token.starts_with("n:");
+        let entry = self.values.entry(token.to_string()).or_insert(0);
+        let was_zero = *entry == 0;
+        *entry += delta;
+        let new_count = *entry;
+        if is_numeric {
+            if was_zero {
+                self.numeric_distinct += 1;
+            }
+            self.numeric_total += delta;
+            if new_count > self.numeric_top {
+                self.numeric_top = new_count;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -831,14 +860,14 @@ impl AnalyzerModel {
                 let entry = merged.path_stats.entry(path.clone()).or_default();
                 entry.total += stats.total;
                 for (tok, cnt) in &stats.values {
-                    *entry.values.entry(tok.clone()).or_insert(0) += cnt;
+                    entry.bump_token(tok, *cnt);
                 }
             }
             for (path, stats) in &tp.baseline_path_stats {
                 let entry = merged.baseline_path_stats.entry(path.clone()).or_default();
                 entry.total += stats.total;
                 for (tok, cnt) in &stats.values {
-                    *entry.values.entry(tok.clone()).or_insert(0) += cnt;
+                    entry.bump_token(tok, *cnt);
                 }
             }
             for (path, mode) in &tp.path_overrides {
@@ -1412,11 +1441,11 @@ fn update_uniqueness(
         }
 
         stats.total += 1;
-        *stats.values.entry(token.clone()).or_insert(0) += 1;
+        stats.bump_token(token, 1);
         if !in_action_period {
             let baseline_stats = tp.baseline_path_stats.entry(path.clone()).or_default();
             baseline_stats.total += 1;
-            *baseline_stats.values.entry(token.clone()).or_insert(0) += 1;
+            baseline_stats.bump_token(token, 1);
         }
         // Fast path for very high uniqueness once enough support exists.
         if !tp.path_overrides.contains_key(path.as_str()) && total >= 12.0 {
@@ -1481,21 +1510,12 @@ fn auto_consider_path(path: &str, stats: &PathStats) -> bool {
         return false;
     }
 
-    // Numeric flat-ish heuristic: many distinct numeric values with no strong mode.
-    let mut numeric_distinct = 0usize;
-    let mut numeric_total = 0u64;
-    let mut numeric_top = 0u64;
-    for (k, c) in &stats.values {
-        if k.starts_with("n:") {
-            numeric_distinct += 1;
-            numeric_total += *c;
-            if *c > numeric_top {
-                numeric_top = *c;
-            }
-        }
-    }
-    if numeric_total >= 12 && numeric_distinct >= 10 {
-        let top_share = numeric_top as f64 / numeric_total as f64;
+    // Numeric flat-ish heuristic: many distinct numeric values with no strong
+    // mode. Cached on PathStats by `bump_token`, so this is O(1) instead of
+    // O(distinct values) — which matters for high-cardinality fields where
+    // values.len() grows ~linearly with ingest.
+    if stats.numeric_total >= 12 && stats.numeric_distinct >= 10 {
+        let top_share = stats.numeric_top as f64 / stats.numeric_total as f64;
         if top_share <= 0.12 {
             return false;
         }
