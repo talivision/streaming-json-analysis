@@ -1,6 +1,5 @@
 use crate::domain::{ActionPeriod, DataFilters, MergeGroup, PathOverride};
 use anyhow::{Context, Result};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -12,8 +11,11 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-const SHARED_VERSION: u32 = 1;
-const LOCAL_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
+
+// ---------------------------------------------------------------------------
+// Session / profile exports (offline bundles — unchanged shape)
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEvent {
@@ -77,72 +79,51 @@ pub struct NormalizedFieldOverride {
     pub mode: PathOverride,
 }
 
+// ---------------------------------------------------------------------------
+// Persisted state: one file per stream, single writer guaranteed by the
+// swapfile (see `Swapfile`). No locking, no merging — the running process is
+// the sole authority over its `<sha>.state.json` until it exits.
+// ---------------------------------------------------------------------------
 
-// ===========================================================================
-// Split persisted state: shared (multi-operator) and local (per-process view)
-// ===========================================================================
-
-/// State shared between operators against the same stream. Read-modify-write
-/// is guarded by an exclusive advisory lock on `<sha>.shared.lock`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SharedState {
-    pub version: u32,
-    pub stream_path: String,
-    pub periods: Vec<ActionPeriod>,
-    pub renames: Vec<(String, String)>,
-    pub normalized_field_overrides: Vec<NormalizedFieldOverride>,
-    /// Triaged events identified by (ts, type_id) — stable across processes.
-    /// Vec indices are *not* shared, so we serialize a value identity instead.
-    pub triaged_events: Vec<(f64, String)>,
-    /// User-curated structural type groupings (same shape as `renames`/etc.).
-    /// `#[serde(default)]` so older shared files without this field still load.
-    #[serde(default)]
-    pub merge_groups: Vec<MergeGroup>,
-}
-
-impl SharedState {
-    pub fn empty(stream_path: String) -> Self {
-        Self {
-            version: SHARED_VERSION,
-            stream_path,
-            periods: Vec::new(),
-            renames: Vec::new(),
-            normalized_field_overrides: Vec::new(),
-            triaged_events: Vec::new(),
-            merge_groups: Vec::new(),
-        }
-    }
-}
-
-/// Per-process state: the cursor into the stream file and the operator's
-/// personal UI view (filters, label, etc.). Never shared across operators.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocalState {
+pub struct PersistedState {
     pub version: u32,
     pub stream_path: String,
     pub saved_len: u64,
     pub prefix_hash_hex: String,
+    pub periods: Vec<ActionPeriod>,
+    pub renames: Vec<(String, String)>,
+    pub known_unrelated_types: Vec<String>,
+    pub normalized_field_overrides: Vec<NormalizedFieldOverride>,
+    /// Triaged events identified by (ts, type_id). Vec indices are not stable
+    /// across restarts, so we serialise a value identity instead.
+    pub triaged_events: Vec<(f64, String)>,
     pub current_label: String,
     pub event_filters: DataFilters,
     pub stashed_event_filters: Option<DataFilters>,
     pub types_filter: String,
-    /// Only populated by profile-import paths; no interactive key binding writes
-    /// to it. Kept local so each operator's import choices don't fight.
-    pub known_unrelated_types: Vec<String>,
+    /// User-curated structural type groupings.
+    #[serde(default)]
+    pub merge_groups: Vec<MergeGroup>,
 }
 
-impl LocalState {
+impl PersistedState {
     pub fn empty(stream_path: String) -> Self {
         Self {
-            version: LOCAL_VERSION,
+            version: STATE_VERSION,
             stream_path,
             saved_len: 0,
             prefix_hash_hex: String::new(),
+            periods: Vec::new(),
+            renames: Vec::new(),
+            known_unrelated_types: Vec::new(),
+            normalized_field_overrides: Vec::new(),
+            triaged_events: Vec::new(),
             current_label: String::new(),
             event_filters: DataFilters::default(),
             stashed_event_filters: None,
             types_filter: String::new(),
-            known_unrelated_types: Vec::new(),
+            merge_groups: Vec::new(),
         }
     }
 }
@@ -157,10 +138,7 @@ pub struct RestoredState {
     pub event_filters: DataFilters,
     pub stashed_event_filters: Option<DataFilters>,
     pub types_filter: String,
-    /// Materialized triage identifiers — converted back to Vec<usize> in App
-    /// by matching (ts, type_id) against the loaded EventRecord stream.
     pub triaged_events: Vec<(f64, String)>,
-    /// Type-merge groupings restored from shared state.
     pub merge_groups: Vec<MergeGroup>,
 }
 
@@ -168,10 +146,8 @@ pub struct RestoredState {
 pub enum StateLoadResult {
     /// File identity confirmed — full state can be restored.
     Clean(RestoredState),
-    /// Stream content changed since the last local checkpoint. Periods are
-    /// included so callers can display the count in the prompt, but they
-    /// reference timestamps from the previous file and shouldn't be applied
-    /// blindly.
+    /// Stream content changed since the last checkpoint. Periods reference
+    /// timestamps from the previous file and shouldn't be applied blindly.
     Changed(RestoredState),
 }
 
@@ -181,12 +157,10 @@ pub enum StateLoadResult {
 
 #[derive(Debug, Clone)]
 pub struct StatePaths {
-    pub shared: PathBuf,
-    pub local: PathBuf,
-    pub lock: PathBuf,
+    pub state: PathBuf,
+    pub swap: PathBuf,
     pub dir: PathBuf,
-    /// Stable per-stream prefix (the SHA-256 hex). Used by sibling files in
-    /// the same state directory (presence heartbeats, etc.).
+    /// Stable per-stream prefix (SHA-256 hex).
     pub id: String,
 }
 
@@ -203,21 +177,158 @@ fn canonical_for_hashing(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
+fn hash_path_string(s: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// One-time best-effort migration:
+/// - Pre-canonicalisation builds hashed the literal input string. The fix to
+///   canonicalise the path before hashing changes the SHA, which would
+///   orphan all pre-fix state. Rename across when the canonical-keyed file
+///   is missing.
+/// - Pre-split builds wrote a single `<sha>.state.json` (the format we're
+///   returning to). Pre-rewrite builds wrote a `<sha>.shared.json` plus a
+///   `<sha>.local.json`. If the new combined file is missing, fold them.
+pub fn migrate_legacy_state_paths(stream_path: &Path) -> Result<()> {
+    let canonical = canonical_for_hashing(stream_path);
+    let literal_id = hash_path_string(&stream_path.to_string_lossy());
+    let canonical_id = hash_path_string(&canonical.to_string_lossy());
+    let dir = base_state_dir()?;
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    // Step 1: bring literal-keyed files across to canonical-keyed names so
+    // the rest of the migration only has to consider one id.
+    if literal_id != canonical_id {
+        for ext in &[
+            "state.json",
+            "swap.json",
+            "shared.json",
+            "local.json",
+            "shared.lock",
+        ] {
+            let legacy = dir.join(format!("{}.{}", literal_id, ext));
+            let modern = dir.join(format!("{}.{}", canonical_id, ext));
+            if legacy.exists() && !modern.exists() {
+                let _ = std::fs::rename(&legacy, &modern);
+            }
+        }
+    }
+
+    // Step 2: fold shared.json + local.json into state.json if the new file
+    // is missing. Leaves the legacy files in place so a roll-back to an older
+    // build still has something to read.
+    let state_path = dir.join(format!("{}.state.json", canonical_id));
+    if !state_path.exists() {
+        let shared_path = dir.join(format!("{}.shared.json", canonical_id));
+        let local_path = dir.join(format!("{}.local.json", canonical_id));
+        if shared_path.exists() || local_path.exists() {
+            if let Ok(merged) = fold_split_state(&shared_path, &local_path, stream_path) {
+                let payload =
+                    serde_json::to_vec(&merged).context("failed to serialize migrated state")?;
+                let _ = atomic_write(&state_path, &payload);
+            }
+        }
+    }
+
+    // Best-effort cleanup of leftover lock / presence files from the old
+    // multi-client build. Failure is non-fatal.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let lock_name = format!("{}.shared.lock", canonical_id);
+        let presence_prefix = format!("{}.presence.", canonical_id);
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name == lock_name
+                || (name.starts_with(&presence_prefix) && name.ends_with(".json"))
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn fold_split_state(
+    shared: &Path,
+    local: &Path,
+    stream_path: &Path,
+) -> Result<PersistedState> {
+    let stream_path_str = stream_path.to_string_lossy().to_string();
+    let mut state = PersistedState::empty(stream_path_str);
+    if shared.exists() {
+        let bytes = std::fs::read(shared)?;
+        if !bytes.is_empty() {
+            // Old SharedState shape: same fields, no cursor / UI bits.
+            #[derive(Deserialize)]
+            struct LegacyShared {
+                #[serde(default)]
+                periods: Vec<ActionPeriod>,
+                #[serde(default)]
+                renames: Vec<(String, String)>,
+                #[serde(default)]
+                normalized_field_overrides: Vec<NormalizedFieldOverride>,
+                #[serde(default)]
+                triaged_events: Vec<(f64, String)>,
+                #[serde(default)]
+                merge_groups: Vec<MergeGroup>,
+            }
+            if let Ok(s) = serde_json::from_slice::<LegacyShared>(&bytes) {
+                state.periods = s.periods;
+                state.renames = s.renames;
+                state.normalized_field_overrides = s.normalized_field_overrides;
+                state.triaged_events = s.triaged_events;
+                state.merge_groups = s.merge_groups;
+            }
+        }
+    }
+    if local.exists() {
+        let bytes = std::fs::read(local)?;
+        if !bytes.is_empty() {
+            #[derive(Deserialize)]
+            struct LegacyLocal {
+                #[serde(default)]
+                saved_len: u64,
+                #[serde(default)]
+                prefix_hash_hex: String,
+                #[serde(default)]
+                current_label: String,
+                #[serde(default)]
+                event_filters: DataFilters,
+                #[serde(default)]
+                stashed_event_filters: Option<DataFilters>,
+                #[serde(default)]
+                types_filter: String,
+                #[serde(default)]
+                known_unrelated_types: Vec<String>,
+            }
+            if let Ok(l) = serde_json::from_slice::<LegacyLocal>(&bytes) {
+                state.saved_len = l.saved_len;
+                state.prefix_hash_hex = l.prefix_hash_hex;
+                state.current_label = l.current_label;
+                state.event_filters = l.event_filters;
+                state.stashed_event_filters = l.stashed_event_filters;
+                state.types_filter = l.types_filter;
+                state.known_unrelated_types = l.known_unrelated_types;
+            }
+        }
+    }
+    Ok(state)
+}
+
 pub fn state_paths_for_stream(stream_path: &Path) -> Result<StatePaths> {
-    // Hash the canonical absolute path so `./foo.jsonl` and `/full/path/foo.jsonl`
-    // (and any other relative form) resolve to the same state file. Falls back
-    // to an unresolved absolute path if `canonicalize` fails (e.g. the stream
-    // file doesn't exist yet) and to the original input if even that fails.
     let canonical = canonical_for_hashing(stream_path);
     let mut hasher = Sha256::new();
     hasher.update(canonical.to_string_lossy().as_bytes());
-    let digest = hasher.finalize();
-    let id = format!("{:x}", digest);
+    let id = format!("{:x}", hasher.finalize());
     let dir = base_state_dir()?;
     Ok(StatePaths {
-        shared: dir.join(format!("{}.shared.json", id)),
-        local: dir.join(format!("{}.local.json", id)),
-        lock: dir.join(format!("{}.shared.lock", id)),
+        state: dir.join(format!("{}.state.json", id)),
+        swap: dir.join(format!("{}.swap.json", id)),
         dir,
         id,
     })
@@ -255,16 +366,9 @@ fn base_state_dir() -> Result<PathBuf> {
 // Atomic write helper
 // ---------------------------------------------------------------------------
 
-/// Atomically replaces `target` with `payload`:
-///   1. write payload to <target>.tmp (mode 0600 on unix)
-///   2. fsync(.tmp)
-///   3. rename(.tmp, target)
-///   4. fsync(parent_dir)
-///
-/// The parent-dir fsync is load-bearing — without it, a crash after rename
-/// can leave the new (visible) file with zero content on ext4. Best-effort on
-/// platforms where opening a directory for write isn't supported (macOS
-/// happens to allow opening directories read-only and calling fsync on them).
+/// Atomically replaces `target` with `payload`. Writes payload to `.tmp`,
+/// fsyncs, renames over `target`, then best-effort fsyncs the parent dir so
+/// the rename survives a crash.
 pub fn atomic_write(target: &Path, payload: &[u8]) -> Result<()> {
     let parent = target
         .parent()
@@ -284,7 +388,6 @@ pub fn atomic_write(target: &Path, payload: &[u8]) -> Result<()> {
         t
     };
 
-    // Step 1: write payload to .tmp.
     {
         let mut opts = OpenOptions::new();
         opts.write(true).create(true).truncate(true);
@@ -297,21 +400,15 @@ pub fn atomic_write(target: &Path, payload: &[u8]) -> Result<()> {
             .with_context(|| format!("failed to open {}", tmp.display()))?;
         file.write_all(payload)
             .with_context(|| format!("failed to write {}", tmp.display()))?;
-        // Step 2: fsync(.tmp).
         file.sync_all()
             .with_context(|| format!("failed to fsync {}", tmp.display()))?;
     }
 
-    // Step 3: rename.
     std::fs::rename(&tmp, target).with_context(|| {
         format!("failed to rename {} -> {}", tmp.display(), target.display())
     })?;
 
-    // Step 4: fsync parent directory so the rename is durable.
     if let Ok(dir) = File::open(parent) {
-        // Best-effort: directory fsync isn't portable to Windows; failures here
-        // don't undo the rename, they just leave a tiny window where a power
-        // loss could revert it. We still want to know if it fails on dev boxes.
         let _ = dir.sync_all();
     }
 
@@ -319,212 +416,98 @@ pub fn atomic_write(target: &Path, payload: &[u8]) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Shared state IO (under advisory lock)
+// State IO
 // ---------------------------------------------------------------------------
 
-/// Acquires an exclusive advisory lock on `<sha>.shared.lock` for the duration
-/// of the returned guard. Always acquire before reading or writing the shared
-/// file when you intend to modify it.
-pub struct SharedLock {
-    file: File,
-}
-
-impl SharedLock {
-    pub fn acquire(paths: &StatePaths) -> Result<Self> {
-        create_dir_all(&paths.dir)
-            .with_context(|| format!("failed to create {}", paths.dir.display()))?;
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            opts.mode(0o600);
-        }
-        let file = opts
-            .open(&paths.lock)
-            .with_context(|| format!("failed to open lock {}", paths.lock.display()))?;
-        FileExt::lock_exclusive(&file)
-            .with_context(|| format!("failed to lock {}", paths.lock.display()))?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for SharedLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-    }
-}
-
-/// Read the shared state without taking the lock. Safe for the watcher reload
-/// path; the on-disk file is the result of a locked write so it's consistent.
-pub fn read_shared_state_unlocked(paths: &StatePaths) -> Result<Option<SharedState>> {
-    if !paths.shared.exists() {
+pub fn read_state(stream_path: &Path) -> Result<Option<PersistedState>> {
+    let paths = state_paths_for_stream(stream_path)?;
+    if !paths.state.exists() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&paths.shared).with_context(|| {
-        format!("failed to read shared state {}", paths.shared.display())
-    })?;
+    let bytes = std::fs::read(&paths.state)
+        .with_context(|| format!("failed to read state {}", paths.state.display()))?;
     if bytes.is_empty() {
-        // Mid-rename observation on a path that doesn't atomic-rename. We never
-        // produce empty files, so treat this as transient and skip.
         return Ok(None);
     }
-    let state: SharedState =
-        serde_json::from_slice(&bytes).context("invalid shared state payload")?;
-    if state.version != SHARED_VERSION {
+    let state: PersistedState =
+        serde_json::from_slice(&bytes).context("invalid state payload")?;
+    if state.version != STATE_VERSION {
         return Ok(None);
     }
     Ok(Some(state))
 }
 
-/// Read-modify-write of the shared file under exclusive lock. The closure
-/// receives the on-disk state (or a fresh empty one) and returns the new
-/// state to persist.
-pub fn update_shared_state<F>(stream_path: &Path, f: F) -> Result<()>
-where
-    F: FnOnce(SharedState) -> SharedState,
-{
-    let paths = state_paths_for_stream(stream_path)?;
-    let _lock = SharedLock::acquire(&paths)?;
-    let current = read_shared_state_unlocked(&paths)?
-        .unwrap_or_else(|| SharedState::empty(stream_path.to_string_lossy().to_string()));
-    let mut next = f(current);
-    // Keep stream_path / version coherent regardless of what the caller did.
-    next.version = SHARED_VERSION;
-    if next.stream_path.is_empty() {
-        next.stream_path = stream_path.to_string_lossy().to_string();
-    }
-    let payload = serde_json::to_vec(&next).context("failed to serialize shared state")?;
-    atomic_write(&paths.shared, &payload)?;
-    Ok(())
-}
-
-/// Convenience for the common "I already have the desired state in memory"
-/// case (autosave / shutdown). Still locks to prevent torn writes.
-pub fn save_shared_state(stream_path: &Path, state: &SharedState) -> Result<()> {
-    update_shared_state(stream_path, |_| state.clone())
-}
-
-// ---------------------------------------------------------------------------
-// Local state IO (single process, no lock needed)
-// ---------------------------------------------------------------------------
-
-pub fn read_local_state(stream_path: &Path) -> Result<Option<LocalState>> {
-    let paths = state_paths_for_stream(stream_path)?;
-    if !paths.local.exists() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(&paths.local).with_context(|| {
-        format!("failed to read local state {}", paths.local.display())
-    })?;
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    let state: LocalState =
-        serde_json::from_slice(&bytes).context("invalid local state payload")?;
-    if state.version != LOCAL_VERSION {
-        return Ok(None);
-    }
-    if state.stream_path != stream_path.to_string_lossy() {
-        return Ok(None);
-    }
-    Ok(Some(state))
-}
-
-pub fn save_local_state(stream_path: &Path, state: &LocalState) -> Result<()> {
+pub fn save_state(stream_path: &Path, state: &PersistedState) -> Result<()> {
     let paths = state_paths_for_stream(stream_path)?;
     let mut adjusted = state.clone();
-    adjusted.version = LOCAL_VERSION;
+    adjusted.version = STATE_VERSION;
     if adjusted.stream_path.is_empty() {
         adjusted.stream_path = stream_path.to_string_lossy().to_string();
     }
-    let payload = serde_json::to_vec(&adjusted).context("failed to serialize local state")?;
-    atomic_write(&paths.local, &payload)
+    let payload = serde_json::to_vec(&adjusted).context("failed to serialize state")?;
+    atomic_write(&paths.state, &payload)
 }
 
-/// Marks the local file so that the next `load_full_state` will treat the
-/// stream as gone (saved_len=0, sentinel hash) — used when the stream file
-/// disappears mid-session. Shared state is left untouched: other operators
-/// may still want their periods/renames.
-pub fn invalidate_local_state(stream_path: &Path) -> Result<()> {
+/// Marks the state so that the next `load_full_state` will treat the stream
+/// as gone (saved_len=0, sentinel hash) — used when the stream file
+/// disappears mid-session.
+pub fn invalidate_state(stream_path: &Path) -> Result<()> {
     let paths = state_paths_for_stream(stream_path)?;
-    if !paths.local.exists() {
+    if !paths.state.exists() {
         return Ok(());
     }
-    let mut state = LocalState::empty(stream_path.to_string_lossy().to_string());
-    // Reuse fields if we can, so the operator's filters survive the next start.
-    if let Ok(Some(prev)) = read_local_state(stream_path) {
+    let mut state = PersistedState::empty(stream_path.to_string_lossy().to_string());
+    if let Ok(Some(prev)) = read_state(stream_path) {
         state.current_label = prev.current_label;
         state.event_filters = prev.event_filters;
         state.stashed_event_filters = prev.stashed_event_filters;
         state.types_filter = prev.types_filter;
         state.known_unrelated_types = prev.known_unrelated_types;
+        state.renames = prev.renames;
+        state.normalized_field_overrides = prev.normalized_field_overrides;
+        state.merge_groups = prev.merge_groups;
+        state.triaged_events = prev.triaged_events;
     }
     state.saved_len = 0;
-    state.prefix_hash_hex = String::new(); // sentinel: never matches a real SHA-256
-    save_local_state(stream_path, &state)
+    state.prefix_hash_hex = String::new();
+    save_state(stream_path, &state)
 }
 
-// ---------------------------------------------------------------------------
-// Combined load (called on startup): combines local + shared into one result
-// and re-derives the Clean/Changed verdict from the stream-file identity.
-// ---------------------------------------------------------------------------
-
 pub fn load_full_state(stream_path: &Path) -> Result<Option<StateLoadResult>> {
-    let local = read_local_state(stream_path)?;
-    let shared = {
-        // Take the lock briefly: we may be observing mid-write from another op.
-        let paths = state_paths_for_stream(stream_path)?;
-        if paths.shared.exists() {
-            let _lock = SharedLock::acquire(&paths)?;
-            read_shared_state_unlocked(&paths)?
-        } else {
-            None
-        }
-    };
-    if local.is_none() && shared.is_none() {
+    let Some(state) = read_state(stream_path)? else {
         return Ok(None);
-    }
-
-    // Whether this process has its own file-identity record. When it doesn't
-    // (first time on this stream from this machine) we skip the prefix-hash
-    // check entirely — there's no prior claim to compare the file against, so
-    // a "file changed" prompt would be meaningless. Shared state still
-    // restores cleanly so a new operator joining mid-session gets the team's
-    // renames, periods, overrides, and triage.
-    let local_known = local.is_some();
-    let local = local.unwrap_or_else(|| LocalState::empty(stream_path.to_string_lossy().to_string()));
-    let shared = shared.unwrap_or_else(|| SharedState::empty(stream_path.to_string_lossy().to_string()));
+    };
 
     let restored = RestoredState {
-        periods: shared.periods.clone(),
-        renames: shared.renames.clone(),
-        known_unrelated_types: local.known_unrelated_types.clone(),
-        normalized_field_overrides: shared.normalized_field_overrides.clone(),
-        current_label: local.current_label.clone(),
-        event_filters: local.event_filters.clone(),
-        stashed_event_filters: local.stashed_event_filters.clone(),
-        types_filter: local.types_filter.clone(),
-        triaged_events: shared.triaged_events.clone(),
-        merge_groups: shared.merge_groups.clone(),
+        periods: state.periods.clone(),
+        renames: state.renames.clone(),
+        known_unrelated_types: state.known_unrelated_types.clone(),
+        normalized_field_overrides: state.normalized_field_overrides.clone(),
+        current_label: state.current_label.clone(),
+        event_filters: state.event_filters.clone(),
+        stashed_event_filters: state.stashed_event_filters.clone(),
+        types_filter: state.types_filter.clone(),
+        triaged_events: state.triaged_events.clone(),
+        merge_groups: state.merge_groups.clone(),
     };
 
-    if !local_known {
+    // If we never advanced the cursor, treat as clean restore so we can still
+    // apply renames/filters to a brand-new file at the same path.
+    if state.saved_len == 0 {
         return Ok(Some(StateLoadResult::Clean(restored)));
     }
 
     if !stream_path.exists() {
-        // If we never advanced the cursor, treat as clean restore so we can
-        // still apply renames/filters to a brand-new file at the same path.
-        return Ok((local.saved_len == 0).then_some(StateLoadResult::Clean(restored)));
-    }
-
-    let len = std::fs::metadata(stream_path)?.len();
-    if len < local.saved_len {
         return Ok(Some(StateLoadResult::Changed(restored)));
     }
 
-    let current_prefix_hash = hash_prefix(stream_path, local.saved_len)?;
-    if current_prefix_hash != local.prefix_hash_hex {
+    let len = std::fs::metadata(stream_path)?.len();
+    if len < state.saved_len {
+        return Ok(Some(StateLoadResult::Changed(restored)));
+    }
+
+    let current_prefix_hash = hash_prefix(stream_path, state.saved_len)?;
+    if current_prefix_hash != state.prefix_hash_hex {
         return Ok(Some(StateLoadResult::Changed(restored)));
     }
 
@@ -532,7 +515,213 @@ pub fn load_full_state(stream_path: &Path) -> Result<Option<StateLoadResult>> {
 }
 
 // ---------------------------------------------------------------------------
-// File identity helpers (unchanged from the old single-file format)
+// Swapfile: kernel-arbitrated "another instance is editing this" guard.
+//
+// We open `<sha>.swap.json`, take an exclusive advisory lock on the
+// underlying file via `File::try_lock` (flock(2) on Unix, LockFileEx on
+// Windows), and keep the handle alive for the lifetime of the process.
+// The kernel drops the lock when our File is closed — clean exit, panic,
+// OOM, SIGKILL, BSOD — so there's no "stale swap" concept and no PID
+// liveness check to do ourselves. The bytes inside the file are purely
+// informational, used only to populate the user-facing conflict message.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapfileRecord {
+    pub pid: u32,
+    pub hostname: String,
+    pub stream_path: String,
+    pub created_at_secs: u64,
+}
+
+#[derive(Debug)]
+pub struct SwapfileConflict {
+    pub swap_path: PathBuf,
+    pub record: SwapfileRecord,
+}
+
+#[derive(Debug)]
+pub enum SwapfileError {
+    Held(SwapfileConflict),
+    Io(anyhow::Error),
+}
+
+impl std::fmt::Display for SwapfileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SwapfileError::Held(c) => write!(
+                f,
+                "swapfile {} held by pid {} on {}",
+                c.swap_path.display(),
+                c.record.pid,
+                c.record.hostname
+            ),
+            SwapfileError::Io(e) => write!(f, "swapfile io error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SwapfileError {}
+
+/// Owns the swapfile lock for the lifetime of the process. Drop releases
+/// the lock (kernel-side) and removes the file.
+#[derive(Debug)]
+pub struct Swapfile {
+    path: PathBuf,
+    // Held to keep the kernel-side advisory lock alive. Dropped automatically
+    // when the Swapfile is dropped; never read directly.
+    _file: File,
+}
+
+impl Swapfile {
+    /// Try to acquire the swapfile for `stream_path`. If another live
+    /// process already holds the lock, returns `SwapfileError::Held`.
+    /// `force = true` orphans the existing lock (unlinks the file so we
+    /// get a fresh inode) and proceeds anyway; use only when you really
+    /// do intend to run a second instance alongside the first.
+    pub fn acquire(stream_path: &Path, force: bool) -> std::result::Result<Self, SwapfileError> {
+        let paths = state_paths_for_stream(stream_path).map_err(SwapfileError::Io)?;
+        create_dir_all(&paths.dir)
+            .with_context(|| format!("failed to create {}", paths.dir.display()))
+            .map_err(SwapfileError::Io)?;
+
+        if force {
+            // Unlink the existing swap so our open() lands on a fresh
+            // inode. The original holder keeps its fd and its lock on the
+            // now-orphaned inode; both processes then proceed
+            // independently (which is what `--force` is for).
+            let _ = std::fs::remove_file(&paths.swap);
+        }
+
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+        }
+        let file = opts
+            .open(&paths.swap)
+            .with_context(|| format!("failed to open {}", paths.swap.display()))
+            .map_err(SwapfileError::Io)?;
+
+        match file.try_lock() {
+            Ok(()) => {
+                // We own the lock. Replace whatever bytes a previously
+                // crashed holder left in the file with our own record.
+                let record = SwapfileRecord {
+                    pid: std::process::id(),
+                    hostname: current_hostname(),
+                    stream_path: stream_path.to_string_lossy().to_string(),
+                    created_at_secs: now_secs(),
+                };
+                let payload = serde_json::to_vec(&record)
+                    .context("failed to serialize swapfile record")
+                    .map_err(SwapfileError::Io)?;
+                file.set_len(0)
+                    .with_context(|| format!("failed to truncate {}", paths.swap.display()))
+                    .map_err(SwapfileError::Io)?;
+                {
+                    let mut writer = &file;
+                    writer
+                        .write_all(&payload)
+                        .with_context(|| format!("failed to write {}", paths.swap.display()))
+                        .map_err(SwapfileError::Io)?;
+                }
+                file.sync_all()
+                    .with_context(|| format!("failed to fsync {}", paths.swap.display()))
+                    .map_err(SwapfileError::Io)?;
+                Ok(Self {
+                    path: paths.swap,
+                    _file: file,
+                })
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                // Another live process owns the lock. Read the file
+                // contents best-effort for the user-facing message; if
+                // the read fails we still know the lock is held, we just
+                // can't say who by.
+                drop(file);
+                let record = read_swapfile(&paths.swap).unwrap_or_else(|| SwapfileRecord {
+                    pid: 0,
+                    hostname: "unknown".to_string(),
+                    stream_path: stream_path.to_string_lossy().to_string(),
+                    created_at_secs: 0,
+                });
+                Err(SwapfileError::Held(SwapfileConflict {
+                    swap_path: paths.swap,
+                    record,
+                }))
+            }
+            Err(std::fs::TryLockError::Error(e)) => Err(SwapfileError::Io(
+                anyhow::Error::from(e).context("failed to lock swapfile"),
+            )),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Swapfile {
+    fn drop(&mut self) {
+        // Dropping `_file` releases the kernel-side lock automatically.
+        // Unlink so a clean exit doesn't leave the (now unlocked) file
+        // around with a stale PID record inside. If someone raced to
+        // re-acquire between our unlock and our unlink they got a fresh
+        // inode; our remove targets a path we no longer hold — harmless.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn read_swapfile(path: &Path) -> Option<SwapfileRecord> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn current_hostname() -> String {
+    if let Ok(h) = env::var("HOSTNAME") {
+        if !h.is_empty() {
+            return h;
+        }
+    }
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: gethostname writes up to len bytes into buf and
+        // NUL-terminates on success; we then read up to the NUL.
+        let rc = unsafe { libc_gethostname(buf.as_mut_ptr() as *mut _, buf.len()) };
+        if rc == 0 {
+            if let Some(nul) = buf.iter().position(|&b| b == 0) {
+                if let Ok(s) = std::str::from_utf8(&buf[..nul]) {
+                    if !s.is_empty() {
+                        return s.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "gethostname"]
+    fn libc_gethostname(name: *mut std::os::raw::c_char, len: usize) -> i32;
+}
+
+// ---------------------------------------------------------------------------
+// File identity helpers
 // ---------------------------------------------------------------------------
 
 pub fn hash_stream_prefix(path: &Path, prefix_len: u64) -> Result<String> {
@@ -567,11 +756,10 @@ fn hash_prefix(path: &Path, prefix_len: u64) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-// SHA-256 of empty input
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 // ---------------------------------------------------------------------------
-// Session/profile export — unchanged, written via atomic_write for safety.
+// Session / profile export (offline bundles — written via atomic_write).
 // ---------------------------------------------------------------------------
 
 pub fn export_session(path: &Path, session: &SessionExport) -> Result<()> {
@@ -608,7 +796,6 @@ pub fn save_profile(path: &Path, profile: &SourceProfile) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     fn tmp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -653,147 +840,179 @@ mod tests {
         let _ = std::fs::remove_file(&target);
     }
 
-    /// Kill a child mid-write and verify the visible file is either the old
-    /// content or fully present new content — never empty / partial.
-    ///
-    /// We exercise the helper by spawning a child that opens the .tmp file,
-    /// writes a marker, then sleeps. We SIGKILL the child before it gets to
-    /// the rename. The visible file should still hold the original content.
     #[test]
-    fn atomic_write_visible_file_never_torn() {
-        let target = tmp_path("torn.bin");
-        let original = b"ORIGINAL_CONTENT_AAAAA";
-        std::fs::write(&target, original).unwrap();
-
-        // Spawn a sh that writes a different value to <target>.tmp and sleeps
-        // — simulating a writer killed before it renames. The visible file is
-        // untouched.
-        let tmp = {
-            let mut t = target.clone();
-            let mut name = t.file_name().unwrap().to_owned();
-            name.push(".tmp");
-            t.set_file_name(name);
-            t
-        };
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "printf 'PARTIAL_NEW_CONTENT' > '{}' && sleep 5",
-                tmp.display()
-            ))
-            .spawn()
-            .expect("spawn child");
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let _ = child.kill();
-        let _ = child.wait();
-
-        // Visible file is still the original. Tmp file may or may not be present.
-        let read_back = std::fs::read(&target).unwrap();
-        assert_eq!(
-            read_back, original,
-            "visible file was clobbered before rename"
-        );
-        assert!(!read_back.is_empty(), "visible file became empty");
-
-        // Now actually call our atomic_write helper to install new content and
-        // confirm post-condition: visible file matches new content exactly.
-        let new_payload = b"FULLY_NEW_CONTENT_XYZ".to_vec();
-        atomic_write(&target, &new_payload).unwrap();
-        let read_back = std::fs::read(&target).unwrap();
-        assert_eq!(read_back, new_payload);
-
-        let _ = std::fs::remove_file(&target);
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn shared_state_round_trips_via_lock() {
-        let stream = tmp_path("stream-shared.jsonl");
+    fn state_round_trips() {
+        let stream = tmp_path("stream-state.jsonl");
         std::fs::write(&stream, b"").unwrap();
-        update_shared_state(&stream, |mut s| {
-            s.renames.push(("abc".to_string(), "Login".to_string()));
-            s.triaged_events.push((1700000000.0, "abc".to_string()));
-            s.merge_groups.push(crate::domain::MergeGroup {
-                group_id: "g:deadbeef00".to_string(),
-                label: "Auth".to_string(),
-                members: vec!["aaa".to_string(), "bbb".to_string()],
-                members_prior_name: vec![None, Some("LoginV1".to_string())],
-            });
-            s
-        })
-        .unwrap();
-        let paths = state_paths_for_stream(&stream).unwrap();
-        let loaded = read_shared_state_unlocked(&paths).unwrap().unwrap();
-        assert_eq!(loaded.renames, vec![("abc".to_string(), "Login".to_string())]);
-        assert_eq!(
-            loaded.triaged_events,
-            vec![(1700000000.0, "abc".to_string())]
-        );
-        assert_eq!(loaded.merge_groups.len(), 1);
-        assert_eq!(loaded.merge_groups[0].group_id, "g:deadbeef00");
-        assert_eq!(loaded.merge_groups[0].label, "Auth");
-        assert_eq!(
-            loaded.merge_groups[0].members_prior_name,
-            vec![None, Some("LoginV1".to_string())]
-        );
-        let _ = std::fs::remove_file(&stream);
-        let _ = std::fs::remove_file(&paths.shared);
-        let _ = std::fs::remove_file(&paths.local);
-        let _ = std::fs::remove_file(&paths.lock);
-    }
-
-    #[test]
-    fn local_state_round_trips() {
-        let stream = tmp_path("stream-local.jsonl");
-        std::fs::write(&stream, b"").unwrap();
-        let mut local = LocalState::empty(stream.to_string_lossy().to_string());
-        local.current_label = "myop".to_string();
-        local.types_filter = "http".to_string();
-        save_local_state(&stream, &local).unwrap();
-        let loaded = read_local_state(&stream).unwrap().unwrap();
+        let mut state = PersistedState::empty(stream.to_string_lossy().to_string());
+        state.current_label = "myop".to_string();
+        state.types_filter = "http".to_string();
+        state.renames.push(("abc".to_string(), "Login".to_string()));
+        save_state(&stream, &state).unwrap();
+        let loaded = read_state(&stream).unwrap().unwrap();
         assert_eq!(loaded.current_label, "myop");
         assert_eq!(loaded.types_filter, "http");
+        assert_eq!(loaded.renames, vec![("abc".to_string(), "Login".to_string())]);
         let paths = state_paths_for_stream(&stream).unwrap();
         let _ = std::fs::remove_file(&stream);
-        let _ = std::fs::remove_file(&paths.shared);
-        let _ = std::fs::remove_file(&paths.local);
-        let _ = std::fs::remove_file(&paths.lock);
+        let _ = std::fs::remove_file(&paths.state);
+        let _ = std::fs::remove_file(&paths.swap);
+    }
+
+    /// Two acquires firing in parallel against the same fresh path must
+    /// produce exactly one winner. Demonstrates / regresses the TOCTOU
+    /// race in the naive read-then-write implementation.
+    #[test]
+    fn swapfile_simultaneous_acquires_have_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+        let stream = tmp_path("stream-swap-race.jsonl");
+        std::fs::write(&stream, b"").unwrap();
+        let paths = state_paths_for_stream(&stream).unwrap();
+        let _ = std::fs::remove_file(&paths.swap);
+
+        let trials = 50;
+        let mut total_winners: usize = 0;
+        let mut total_held: usize = 0;
+        let mut total_other_err: usize = 0;
+        for _ in 0..trials {
+            let _ = std::fs::remove_file(&paths.swap);
+            let barrier = Arc::new(Barrier::new(2));
+            let s1 = stream.clone();
+            let s2 = stream.clone();
+            let b1 = barrier.clone();
+            let b2 = barrier.clone();
+            let h1 = std::thread::spawn(move || {
+                b1.wait();
+                Swapfile::acquire(&s1, false)
+            });
+            let h2 = std::thread::spawn(move || {
+                b2.wait();
+                Swapfile::acquire(&s2, false)
+            });
+            let r1 = h1.join().unwrap();
+            let r2 = h2.join().unwrap();
+            let (ok1, ok2) = (r1.is_ok(), r2.is_ok());
+            let winners = (ok1 as usize) + (ok2 as usize);
+            total_winners += winners;
+            for r in [&r1, &r2] {
+                match r {
+                    Err(SwapfileError::Held(_)) => total_held += 1,
+                    Err(SwapfileError::Io(_)) => total_other_err += 1,
+                    Ok(_) => {}
+                }
+            }
+            assert_eq!(
+                winners, 1,
+                "race produced {winners} winners (expected 1): r1.ok={ok1} r2.ok={ok2}"
+            );
+            drop(r1);
+            drop(r2);
+        }
+        // Sanity: every losing attempt should have been a Held conflict,
+        // not an IO error.
+        assert_eq!(total_winners, trials, "{trials} trials, {total_winners} winners");
+        assert_eq!(total_held, trials, "every loser should be Held");
+        assert_eq!(total_other_err, 0);
+
+        let _ = std::fs::remove_file(&stream);
+        let _ = std::fs::remove_file(&paths.state);
     }
 
     #[test]
-    fn update_shared_state_serializes_concurrent_writers() {
-        // Two concurrent updaters each appending one rename; both must survive.
-        let stream = tmp_path("stream-concurrent.jsonl");
+    fn swapfile_releases_on_drop() {
+        let stream = tmp_path("stream-swap.jsonl");
         std::fs::write(&stream, b"").unwrap();
-        let stream2 = stream.clone();
-        let h1 = std::thread::spawn(move || {
-            for i in 0..20 {
-                update_shared_state(&stream2, |mut s| {
-                    s.renames.push((format!("a{i}"), format!("A{i}")));
-                    s
-                })
-                .unwrap();
-            }
-        });
-        let stream3 = stream.clone();
-        let h2 = std::thread::spawn(move || {
-            for i in 0..20 {
-                update_shared_state(&stream3, |mut s| {
-                    s.renames.push((format!("b{i}"), format!("B{i}")));
-                    s
-                })
-                .unwrap();
-            }
-        });
-        h1.join().unwrap();
-        h2.join().unwrap();
         let paths = state_paths_for_stream(&stream).unwrap();
-        let loaded = read_shared_state_unlocked(&paths).unwrap().unwrap();
-        assert_eq!(loaded.renames.len(), 40);
+        let _ = std::fs::remove_file(&paths.swap);
+
+        let swap = Swapfile::acquire(&stream, false).expect("first acquire");
+        assert!(swap.path().exists(), "swapfile should be created");
+        drop(swap);
+        assert!(!paths.swap.exists(), "swapfile should be removed on drop");
+
         let _ = std::fs::remove_file(&stream);
-        let _ = std::fs::remove_file(&paths.shared);
-        let _ = std::fs::remove_file(&paths.local);
-        let _ = std::fs::remove_file(&paths.lock);
+        let _ = std::fs::remove_file(&paths.state);
+    }
+
+    #[test]
+    fn swapfile_detects_live_holder() {
+        let stream = tmp_path("stream-swap-live.jsonl");
+        std::fs::write(&stream, b"").unwrap();
+        let paths = state_paths_for_stream(&stream).unwrap();
+        let _ = std::fs::remove_file(&paths.swap);
+
+        let _first = Swapfile::acquire(&stream, false).expect("first acquire");
+        match Swapfile::acquire(&stream, false) {
+            Err(SwapfileError::Held(c)) => {
+                assert_eq!(c.record.pid, std::process::id());
+                assert_eq!(c.record.hostname, current_hostname());
+            }
+            other => panic!("expected Held conflict, got {other:?}"),
+        }
+        drop(_first);
+        // After the first guard drops, the kernel releases the lock and
+        // the file is unlinked — a second acquire must now succeed.
+        let _second = Swapfile::acquire(&stream, false).expect("post-drop acquire");
+        drop(_second);
+        let _ = std::fs::remove_file(&stream);
+        let _ = std::fs::remove_file(&paths.state);
+    }
+
+    #[test]
+    fn swapfile_force_overrides_live_holder() {
+        // With std-locking semantics the only way to be "held" is by a live
+        // process. `--force` must still succeed against that: it unlinks
+        // the swap so we get a fresh inode whose lock is independent of the
+        // original holder's. Both processes then run concurrently — which
+        // is the documented meaning of `--force`.
+        let stream = tmp_path("stream-swap-force.jsonl");
+        std::fs::write(&stream, b"").unwrap();
+        let paths = state_paths_for_stream(&stream).unwrap();
+        let _ = std::fs::remove_file(&paths.swap);
+
+        let first = Swapfile::acquire(&stream, false).expect("first acquire");
+        // Without force, the second must be rejected.
+        assert!(matches!(
+            Swapfile::acquire(&stream, false),
+            Err(SwapfileError::Held(_))
+        ));
+        // With force, the second succeeds — it operates on a fresh inode
+        // independent of `first`'s lock.
+        let forced = Swapfile::acquire(&stream, true).expect("force acquire");
+        let after = read_swapfile(&paths.swap).expect("record must exist");
+        assert_eq!(after.pid, std::process::id());
+        drop(forced);
+        drop(first);
+        let _ = std::fs::remove_file(&stream);
+        let _ = std::fs::remove_file(&paths.state);
+    }
+
+    #[test]
+    fn swapfile_unlocked_file_is_reclaimed() {
+        // After a crash the swap file may still exist on disk (we couldn't
+        // run Drop) but no process holds the lock. A fresh acquire must
+        // pick up that file, lock it, and overwrite the stale record.
+        let stream = tmp_path("stream-swap-stale.jsonl");
+        std::fs::write(&stream, b"").unwrap();
+        let paths = state_paths_for_stream(&stream).unwrap();
+        let _ = std::fs::remove_file(&paths.swap);
+
+        // Write a leftover record without taking the lock — same effect as
+        // a previous instance that died without running Drop.
+        let stale = SwapfileRecord {
+            pid: 999_999,
+            hostname: "ghost".to_string(),
+            stream_path: stream.to_string_lossy().to_string(),
+            created_at_secs: 0,
+        };
+        std::fs::write(&paths.swap, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        let swap = Swapfile::acquire(&stream, false).expect("unlocked file reclaims cleanly");
+        let after = read_swapfile(&paths.swap).expect("record must exist");
+        assert_eq!(after.pid, std::process::id());
+        assert_eq!(after.hostname, current_hostname());
+        drop(swap);
+        let _ = std::fs::remove_file(&stream);
+        let _ = std::fs::remove_file(&paths.state);
     }
 }
-

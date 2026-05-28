@@ -10,13 +10,10 @@ use crate::domain::{
 };
 use crate::io::StreamReader;
 use crate::persistence::{
-    export_session, hash_stream_prefix, invalidate_local_state, load_full_state,
-    read_shared_state_unlocked, save_local_state, save_profile, state_paths_for_stream,
-    update_shared_state, LocalState, NormalizedFieldOverride, RestoredState, SessionEvent,
-    SessionExport, SharedState, SourceProfile, StateLoadResult,
+    export_session, hash_stream_prefix, invalidate_state, load_full_state,
+    migrate_legacy_state_paths, save_profile, save_state, NormalizedFieldOverride,
+    PersistedState, RestoredState, SessionEvent, SessionExport, SourceProfile, StateLoadResult,
 };
-use crate::presence::{start_heartbeat, PresenceHandle};
-use crate::state_watcher::{spawn_shared_state_watcher, WatchMessage, WatcherHandle};
 use crate::tui::{draw_file_changed_prompt, draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
 use crossterm::event::{
@@ -172,31 +169,12 @@ pub struct App {
     user_toggled_paths: HashSet<String>,
     type_preview_open: bool,
     pub triaged_event_indices: HashSet<usize>,
-    /// Period ids this process intentionally deleted via the `d` confirmation.
-    /// Used by `persist_shared_state` to subtract them from the on-disk union;
-    /// without this, a concurrent operator's older snapshot would re-add the
-    /// deleted period on its next write.
-    user_deleted_period_ids: HashSet<u64>,
-    /// (ts_bits, type_id) of events whose triage state this process has
-    /// explicitly toggled. Local triage state wins for these during the
-    /// shared-state merge; everything else is taken from disk. Keyed by
-    /// `f64::to_bits` because f64 has no `Hash`.
-    user_toggled_triage_identities: HashSet<(u64, String)>,
-    /// Triaged identifiers loaded from `<sha>.shared.json` that we couldn't yet
-    /// map to a Vec index (the events hadn't been ingested when the watcher
-    /// fired). Drained by `apply_persisted_overrides_if_ready`.
+    /// Triaged identifiers loaded from the persisted state that we couldn't
+    /// yet map to a Vec index (events hadn't ingested when restore ran).
+    /// Drained by `apply_persisted_overrides_if_ready`.
     pending_triaged_identities: Vec<(f64, String)>,
-    /// Merge group ids this process explicitly created/removed locally.
-    /// Local state wins for these during the shared-state merge; rest from disk.
-    user_modified_merge_groups: HashSet<String>,
-    /// Merge group ids this process intentionally unmerged. Subtracted from the
-    /// on-disk union during merge so a stale concurrent writer can't re-add.
-    user_removed_merge_groups: HashSet<String>,
-    shared_dirty: bool,
-    local_dirty: bool,
-    state_reload_rx: Option<Receiver<WatchMessage>>,
-    _state_watcher: Option<WatcherHandle>,
-    presence: Option<PresenceHandle>,
+    state_dirty: bool,
+    swapfile: Option<crate::persistence::Swapfile>,
     collapsed_paths: HashMap<String, HashSet<String>>,
     pub selected_type_ids: HashSet<String>,
     pub pending_unmerge_group_id: Option<String>,
@@ -305,16 +283,9 @@ impl App {
             user_toggled_paths: HashSet::new(),
             type_preview_open: false,
             triaged_event_indices: HashSet::new(),
-            user_deleted_period_ids: HashSet::new(),
-            user_toggled_triage_identities: HashSet::new(),
             pending_triaged_identities: Vec::new(),
-            user_modified_merge_groups: HashSet::new(),
-            user_removed_merge_groups: HashSet::new(),
-            shared_dirty: false,
-            local_dirty: false,
-            state_reload_rx: None,
-            _state_watcher: None,
-            presence: None,
+            state_dirty: false,
+            swapfile: None,
             collapsed_paths: HashMap::new(),
             selected_type_ids: HashSet::new(),
             pending_unmerge_group_id: None,
@@ -356,27 +327,6 @@ impl App {
             }
         }
 
-        // Start watching <sha>.shared.json for cross-operator updates.
-        if self.state_reload_rx.is_none() {
-            if let Err(err) = self.start_state_watcher() {
-                eprintln!(
-                    "{WARNING_PREFIX_ORANGE} state-sync watcher disabled: {err}"
-                );
-            }
-        }
-
-        // Announce ourselves so peers know we're connected. Dropped at the
-        // end of run() via the App's own drop semantics (or earlier if
-        // start_heartbeat returns Err).
-        if self.presence.is_none() {
-            match start_heartbeat(self.reader.path()) {
-                Ok(handle) => self.presence = Some(handle),
-                Err(err) => eprintln!(
-                    "{WARNING_PREFIX_ORANGE} presence heartbeat disabled: {err}"
-                ),
-            }
-        }
-
         terminal.draw(|f| draw_ui(f, self))?;
 
         let mut last_poll = Instant::now() - LIVE_FALLBACK_POLL_INTERVAL;
@@ -391,7 +341,6 @@ impl App {
                     self.ingest_baseline_corpus()?;
                 }
                 self.drain_control_commands();
-                self.drain_state_reloads();
 
                 let mut ingested_any = false;
                 if !self.offline || !self.offline_loaded {
@@ -442,10 +391,8 @@ impl App {
                     break;
                 }
 
-                if (self.shared_dirty || self.local_dirty)
-                    && last_autosave.elapsed() >= AUTOSAVE_INTERVAL
-                {
-                    self.autosave_dirty_states();
+                if self.state_dirty && last_autosave.elapsed() >= AUTOSAVE_INTERVAL {
+                    self.autosave_dirty_state();
                     last_autosave = Instant::now();
                 }
 
@@ -502,13 +449,11 @@ impl App {
             }
         }
         self.model.close_open_period(unix_ts());
-        // Ensure both files are written at shutdown, regardless of dirty flags
-        // — the close_open_period above may have closed a period without going
-        // through a dirty-marking helper, and we'd rather write twice than miss
-        // an in-flight change.
-        self.shared_dirty = true;
-        self.local_dirty = true;
-        self.autosave_dirty_states();
+        // Ensure the state file is written at shutdown, regardless of dirty
+        // flag — close_open_period above may have closed a period without
+        // going through a dirty-marking helper.
+        self.state_dirty = true;
+        self.autosave_dirty_state();
         if let Err(err) = self.export_session_if_configured() {
             eprintln!("{WARNING_PREFIX_ORANGE} failed to export session: {err}");
         }
@@ -596,7 +541,7 @@ impl App {
             let trimmed = next_label.trim();
             if !trimmed.is_empty() {
                 self.model.current_label = trimmed.to_string();
-                self.mark_local_dirty();
+                self.mark_dirty();
             }
         }
         if !self.do_toggle_period("HTTP") {
@@ -648,7 +593,7 @@ impl App {
             return false;
         }
         self.pending_live_recompute = true;
-        self.mark_shared_dirty();
+        self.mark_dirty();
         self.status = if let Some(period) = self.model.active_period() {
             format!(
                 "Action started: {} #{} ({})",
@@ -696,8 +641,7 @@ impl App {
         // the local known_unrelated_types list. apply_profile_filters already
         // marks local; bump shared too so other operators see the imported
         // renames/overrides and merge groups.
-        self.mark_shared_dirty();
-        self.mark_local_dirty();
+        self.mark_dirty();
     }
 
     fn apply_profile_forced(&mut self, profile: SourceProfile) {
@@ -737,8 +681,7 @@ impl App {
         self.event_filters = negative_filters;
         let applied_merges = self.apply_profile_merge_groups(&merge_groups);
         self.mark_live_cache_dirty();
-        self.mark_shared_dirty();
-        self.mark_local_dirty();
+        self.mark_dirty();
         self.refresh_live_position();
         if applied_merges {
             self.pending_live_recompute = true;
@@ -1220,7 +1163,7 @@ impl App {
                 .to_string();
         self.status = msg.clone();
         self.startup_hint = Some(msg);
-        self.mark_state_dirty();
+        self.mark_dirty();
     }
 
     fn apply_persisted_overrides_if_ready(&mut self) {
@@ -1355,50 +1298,37 @@ impl App {
         }
     }
 
-    fn autosave_dirty_states(&mut self) {
+    fn autosave_dirty_state(&mut self) {
         if !self.reader.path().exists() {
             // The stream file was deleted while we were running. The reader
             // resets its offset to 0 on detecting a missing file, so saved_len
             // would be 0 and any new file at the same path would pass the
-            // hash check. Invalidate the local state file so nothing is
-            // restored next session; shared state is left in place so other
-            // operators against (a new file at) the same path keep their renames.
-            if self.local_dirty {
-                if let Err(err) = invalidate_local_state(self.reader.path()) {
+            // hash check. Invalidate the state file so nothing is restored
+            // next session.
+            if self.state_dirty {
+                if let Err(err) = invalidate_state(self.reader.path()) {
                     eprintln!(
-                        "{WARNING_PREFIX_ORANGE} failed to invalidate local state: {err}"
+                        "{WARNING_PREFIX_ORANGE} failed to invalidate state: {err}"
                     );
                 } else {
-                    self.local_dirty = false;
+                    self.state_dirty = false;
                 }
             }
             return;
         }
-        if self.shared_dirty {
-            match self.persist_shared_state() {
-                Ok(()) => self.shared_dirty = false,
+        if self.state_dirty {
+            match self.persist_state() {
+                Ok(()) => self.state_dirty = false,
                 Err(err) => {
-                    eprintln!(
-                        "{WARNING_PREFIX_ORANGE} failed to persist shared state: {err}"
-                    );
-                }
-            }
-        }
-        if self.local_dirty {
-            match self.persist_local_state() {
-                Ok(()) => self.local_dirty = false,
-                Err(err) => {
-                    eprintln!(
-                        "{WARNING_PREFIX_ORANGE} failed to persist local state: {err}"
-                    );
+                    eprintln!("{WARNING_PREFIX_ORANGE} failed to persist state: {err}");
                 }
             }
         }
     }
 
-    fn build_shared_state_for_save(&self) -> SharedState {
-        // Merge model renames (applied) with session renames (may be unmatched
-        // if the file changed and some type IDs haven't appeared yet). Model
+    fn build_state_for_save(&self) -> Result<PersistedState> {
+        // Combine in-memory renames with session_renames (renames that survive
+        // a file-changed restore but reference types not yet ingested). Model
         // renames win for any type_id present in both.
         let mut all_renames = self.model.renamed_types();
         {
@@ -1410,8 +1340,6 @@ impl App {
                 }
             }
         }
-        // Triage: store (ts, type_id) so the identity is stable across
-        // processes — Vec<EventRecord> indices aren't shared.
         let triaged_events: Vec<(f64, String)> = self
             .triaged_event_indices
             .iter()
@@ -1425,387 +1353,36 @@ impl App {
             .collect();
         let merge_groups: Vec<MergeGroup> =
             self.model.merge_groups.values().cloned().collect();
-        SharedState {
-            version: 1,
-            stream_path: self.reader.path().to_string_lossy().to_string(),
-            periods: self.model.periods.clone(),
-            renames: all_renames,
-            normalized_field_overrides: self.current_normalized_field_overrides(),
-            triaged_events,
-            merge_groups,
-        }
-    }
-
-    fn build_local_state_for_save(&self) -> Result<LocalState> {
-        Ok(LocalState {
-            version: 1,
+        Ok(PersistedState {
+            version: 2,
             stream_path: self.reader.path().to_string_lossy().to_string(),
             saved_len: self.reader.offset(),
             prefix_hash_hex: hash_stream_prefix(self.reader.path(), self.reader.offset())?,
-            current_label: self.model.current_label.clone(),
-            event_filters: self.event_filters.clone(),
-            stashed_event_filters: self.stashed_event_filters.clone(),
-            types_filter: self.types_filter.clone(),
+            periods: self.model.periods.clone(),
+            renames: all_renames,
             known_unrelated_types: self
                 .model
                 .types
                 .iter()
                 .filter_map(|(type_id, tp)| tp.known_unrelated.then_some(type_id.clone()))
                 .collect(),
-        })
-    }
-
-    fn persist_shared_state(&self) -> Result<()> {
-        let next = self.build_shared_state_for_save();
-        // Per-field three-way merge against whatever's on disk RIGHT NOW
-        // (inside the lock), so concurrent writes from other operators don't
-        // get clobbered. The previous "|_| next.clone()" implementation lost
-        // any update made between our last reload and this write — see
-        // tests/sync_lost_update for the regression case.
-        //
-        // Merge policy:
-        //   - renames: type_ids we explicitly renamed locally (user_renamed_types)
-        //     win; everything else is taken from disk.
-        //   - normalized_field_overrides: (type_id, path) pairs we explicitly
-        //     toggled (user_toggled_paths) win; everything else from disk.
-        //   - periods: union by id, minus any ids this process intentionally
-        //     deleted (user_deleted_period_ids). For ids in both, our copy
-        //     wins (covers rename/edit).
-        //   - triaged_events: identities this process toggled this session
-        //     (user_toggled_triage_identities) take their state from our local
-        //     set — present locally → present in merge, absent locally → absent.
-        //     Everything else is taken from disk. This makes un-triage durable
-        //     across operators: a concurrent writer's stale snapshot can't
-        //     re-add an event we just un-triaged.
-        let user_renamed: std::collections::HashSet<&str> = self
-            .user_renamed_types
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        let user_toggled: std::collections::HashSet<&str> = self
-            .user_toggled_paths
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        let user_deleted: std::collections::HashSet<u64> =
-            self.user_deleted_period_ids.iter().copied().collect();
-        let user_toggled_triage: std::collections::HashSet<(u64, String)> = self
-            .user_toggled_triage_identities
-            .iter()
-            .cloned()
-            .collect();
-        let user_modified_groups: std::collections::HashSet<String> = self
-            .user_modified_merge_groups
-            .iter()
-            .cloned()
-            .collect();
-        let user_removed_groups: std::collections::HashSet<String> = self
-            .user_removed_merge_groups
-            .iter()
-            .cloned()
-            .collect();
-        update_shared_state(self.reader.path(), move |disk| {
-            // --- renames ---
-            let local_by_id: std::collections::HashMap<String, String> = next
-                .renames
-                .iter()
-                .filter(|(id, _)| user_renamed.contains(id.as_str()))
-                .map(|(id, n)| (id.clone(), n.clone()))
-                .collect();
-            let mut merged_renames: Vec<(String, String)> = disk
-                .renames
-                .iter()
-                .filter(|(id, _)| !local_by_id.contains_key(id))
-                .cloned()
-                .collect();
-            for (id, name) in local_by_id {
-                merged_renames.push((id, name));
-            }
-            // Sort for deterministic output regardless of process.
-            merged_renames.sort_by(|a, b| a.0.cmp(&b.0));
-
-            // --- normalized field overrides ---
-            // Key format must match `path_override_key` exactly, otherwise
-            // user_toggled lookups silently miss and the override is dropped.
-            let local_key = |o: &NormalizedFieldOverride| path_override_key(&o.type_id, &o.path);
-            let local_by_key: std::collections::HashMap<String, NormalizedFieldOverride> = next
-                .normalized_field_overrides
-                .iter()
-                .filter(|o| user_toggled.contains(local_key(o).as_str()))
-                .map(|o| (local_key(o), o.clone()))
-                .collect();
-            let mut merged_overrides: Vec<NormalizedFieldOverride> = disk
-                .normalized_field_overrides
-                .iter()
-                .filter(|o| !local_by_key.contains_key(&local_key(o)))
-                .cloned()
-                .collect();
-            for (_, v) in local_by_key {
-                merged_overrides.push(v);
-            }
-            merged_overrides.sort_by(|a, b| (a.type_id.as_str(), a.path.as_str())
-                .cmp(&(b.type_id.as_str(), b.path.as_str())));
-
-            // --- periods: union by id, minus deletions, prefer our copy ---
-            let local_periods_by_id: std::collections::HashMap<u64, ActionPeriod> = next
-                .periods
-                .iter()
-                .map(|p| (p.id, p.clone()))
-                .collect();
-            let mut merged_periods: Vec<ActionPeriod> = disk
-                .periods
-                .iter()
-                .filter(|p| {
-                    !user_deleted.contains(&p.id) && !local_periods_by_id.contains_key(&p.id)
-                })
-                .cloned()
-                .collect();
-            for (_, p) in local_periods_by_id {
-                if !user_deleted.contains(&p.id) {
-                    merged_periods.push(p);
-                }
-            }
-            merged_periods.sort_by(|a, b| a.id.cmp(&b.id));
-
-            // --- triaged events ---
-            // Local set is authoritative for identities we toggled this session.
-            // Disk entries for those identities are dropped (covers un-triage).
-            // Disk entries for untouched identities pass through as-is.
-            let local_triage_keys: std::collections::HashSet<(u64, String)> = next
-                .triaged_events
-                .iter()
-                .map(|(ts, tid)| (ts.to_bits(), tid.clone()))
-                .collect();
-            let mut seen: std::collections::HashSet<(u64, String)> =
-                std::collections::HashSet::new();
-            let mut merged_triage: Vec<(f64, String)> = Vec::new();
-            for (ts, tid) in disk.triaged_events.iter() {
-                let key = (ts.to_bits(), tid.clone());
-                if user_toggled_triage.contains(&key) && !local_triage_keys.contains(&key) {
-                    // We explicitly un-triaged this; drop the stale disk entry.
-                    continue;
-                }
-                if seen.insert(key) {
-                    merged_triage.push((*ts, tid.clone()));
-                }
-            }
-            for (ts, tid) in next.triaged_events.iter() {
-                if seen.insert((ts.to_bits(), tid.clone())) {
-                    merged_triage.push((*ts, tid.clone()));
-                }
-            }
-            merged_triage.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-
-            // --- merge groups ---
-            // Same shape as renames: groups we explicitly modified locally win;
-            // groups we explicitly removed are subtracted from the disk union;
-            // everything else passes through from disk. Keyed by group_id.
-            let local_groups_by_id: std::collections::HashMap<String, MergeGroup> = next
-                .merge_groups
-                .iter()
-                .filter(|g| user_modified_groups.contains(&g.group_id))
-                .map(|g| (g.group_id.clone(), g.clone()))
-                .collect();
-            let mut merged_groups: Vec<MergeGroup> = disk
-                .merge_groups
-                .iter()
-                .filter(|g| {
-                    !user_removed_groups.contains(&g.group_id)
-                        && !local_groups_by_id.contains_key(&g.group_id)
-                })
-                .cloned()
-                .collect();
-            for (_, g) in local_groups_by_id {
-                if !user_removed_groups.contains(&g.group_id) {
-                    merged_groups.push(g);
-                }
-            }
-            merged_groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
-
-            SharedState {
-                version: disk.version,
-                stream_path: next.stream_path.clone(),
-                periods: merged_periods,
-                renames: merged_renames,
-                normalized_field_overrides: merged_overrides,
-                triaged_events: merged_triage,
-                merge_groups: merged_groups,
-            }
-        })
-    }
-
-    fn persist_local_state(&self) -> Result<()> {
-        let state = self.build_local_state_for_save()?;
-        save_local_state(self.reader.path(), &state)
-    }
-
-    fn start_state_watcher(&mut self) -> Result<()> {
-        let paths = state_paths_for_stream(self.reader.path())?;
-        let (tx, rx) = std::sync::mpsc::channel::<WatchMessage>();
-        let handle = spawn_shared_state_watcher(paths, tx)?;
-        if handle.is_some() {
-            self.state_reload_rx = Some(rx);
-            self._state_watcher = handle;
-        }
-        Ok(())
-    }
-
-    /// Pull all queued reload signals from the watcher; coalesce them into a
-    /// single re-read of the shared file. Called once per main-loop tick, in
-    /// the same phase as `drain_control_commands` — never mid-ingest.
-    fn drain_state_reloads(&mut self) {
-        let mut any = false;
-        if let Some(rx) = self.state_reload_rx.as_ref() {
-            loop {
-                match rx.try_recv() {
-                    Ok(WatchMessage::Reload) => any = true,
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        self.state_reload_rx = None;
-                        break;
-                    }
-                }
-            }
-        }
-        if !any {
-            return;
-        }
-        if let Err(err) = self.reload_shared_state_from_disk() {
-            eprintln!(
-                "{WARNING_PREFIX_ORANGE} failed to reload shared state from disk: {err}"
-            );
-        }
-    }
-
-    /// Reads `<sha>.shared.json` and replaces the in-memory shared fields with
-    /// the on-disk version. The disk file is itself the result of a locked
-    /// read-modify-write, so it's authoritative; cell-by-cell merging would
-    /// just reintroduce lost-update problems.
-    ///
-    /// Local fields (input buffer, filter UI, cursor) are untouched.
-    fn reload_shared_state_from_disk(&mut self) -> Result<()> {
-        let paths = state_paths_for_stream(self.reader.path())?;
-        let Some(shared) = read_shared_state_unlocked(&paths)? else {
-            return Ok(());
-        };
-        // Build a fresh RestoredState carrying only the shared fields and pump
-        // it through the same code path that applied them on startup. This
-        // keeps the apply_persisted_overrides_if_ready semantics identical
-        // (in particular: re-applying once enough types have ingested).
-        let staged = RestoredState {
-            periods: shared.periods.clone(),
-            renames: shared.renames.clone(),
-            known_unrelated_types: Vec::new(), // shared file doesn't own this list
-            normalized_field_overrides: shared.normalized_field_overrides.clone(),
-            current_label: String::new(),       // local-only, leave in place
-            event_filters: self.event_filters.clone(), // local-only, leave in place
+            normalized_field_overrides: self.current_normalized_field_overrides(),
+            triaged_events,
+            current_label: self.model.current_label.clone(),
+            event_filters: self.event_filters.clone(),
             stashed_event_filters: self.stashed_event_filters.clone(),
             types_filter: self.types_filter.clone(),
-            triaged_events: shared.triaged_events.clone(),
-            merge_groups: shared.merge_groups.clone(),
-        };
+            merge_groups,
+        })
+    }
 
-        // Replace periods immediately (they may have changed from another op).
-        self.model.set_periods(staged.periods.clone());
-        self.pending_live_recompute = true;
-        self.mark_live_cache_dirty();
+    fn persist_state(&self) -> Result<()> {
+        let state = self.build_state_for_save()?;
+        save_state(self.reader.path(), &state)
+    }
 
-        // Reconcile merge_groups with disk:
-        // - For groups present locally but absent on disk, unmerge them so
-        //   another op's `g` -> unmerge propagates here.
-        // - For groups present on disk but not locally, fold them in. When the
-        //   members are all materialised we use `merge_types` (rewrites
-        //   existing events and rolls up stats — same effect as if the local
-        //   user had pressed `g`). Otherwise fall back to `apply_merge_groups`
-        //   which sets up the alias hook for future ingest.
-        let disk_group_ids: HashSet<String> = staged
-            .merge_groups
-            .iter()
-            .map(|g| g.group_id.clone())
-            .collect();
-        let local_only: Vec<String> = self
-            .model
-            .merge_groups
-            .keys()
-            .filter(|gid| !disk_group_ids.contains(gid.as_str()))
-            .cloned()
-            .collect();
-        for gid in local_only {
-            // Don't unmerge groups this process is in the middle of creating
-            // (their shared write may not have landed yet).
-            if self.user_modified_merge_groups.contains(&gid) {
-                continue;
-            }
-            self.model.unmerge_group(&gid);
-        }
-        for g in &staged.merge_groups {
-            if self.model.merge_groups.contains_key(&g.group_id) {
-                continue;
-            }
-            let all_present = g
-                .members
-                .iter()
-                .all(|m| self.model.types.contains_key(m));
-            if all_present {
-                let _ = self.model.merge_types(&g.members, g.label.clone());
-            } else {
-                self.model.apply_merge_groups(std::slice::from_ref(g));
-            }
-        }
-
-        // Replace triage set wholesale — the on-disk identity list is the
-        // authority. Stash any unresolved identities for retry as new events
-        // ingest.
-        self.triaged_event_indices.clear();
-        self.pending_triaged_identities.clear();
-        self.apply_triaged_identities(&staged.triaged_events);
-
-        // Snapshot display names BEFORE applying the staged renames so that we
-        // can detect which type IDs changed name. We only care about IDs that
-        // already exist in the model — anything else can't be referenced by an
-        // active filter term yet.
-        let before_names: Vec<(String, String)> = staged
-            .renames
-            .iter()
-            .filter_map(|(type_id, _)| {
-                if self.model.types.contains_key(type_id) {
-                    Some((type_id.clone(), self.model.canonical_type_name(type_id)))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Apply renames + overrides via the same readiness gate the startup
-        // path uses. If the model has zero events ingested yet, this stashes
-        // them in pending_restore; otherwise it applies immediately.
-        self.pending_restore = Some(staged);
-        self.apply_persisted_overrides_if_ready();
-
-        // Build (old, new) pairs by re-reading display names after the apply.
-        let rename_pairs: Vec<(String, String)> = before_names
-            .into_iter()
-            .filter_map(|(type_id, old_name)| {
-                let new_name = self.model.canonical_type_name(&type_id);
-                (new_name != old_name).then_some((old_name, new_name))
-            })
-            .collect();
-        if !rename_pairs.is_empty() {
-            rewrite_filter_terms_for_renames(
-                &rename_pairs,
-                &mut self.event_filters.type_filter,
-                self.stashed_event_filters
-                    .as_mut()
-                    .map(|f| &mut f.type_filter),
-                &mut self.types_filter,
-            );
-            self.mark_live_cache_dirty();
-        }
-
-        // We just consumed the on-disk version; don't immediately write it
-        // back. Any further user edits will set shared_dirty again.
-        self.shared_dirty = false;
-        Ok(())
+    pub fn set_swapfile(&mut self, swap: crate::persistence::Swapfile) {
+        self.swapfile = Some(swap);
     }
 
     fn export_session_if_configured(&self) -> Result<()> {
@@ -2088,7 +1665,7 @@ impl App {
                 self.stashed_live_visible_indices = None;
                 self.stashed_baseline_visible_indices = None;
                 self.mark_live_cache_dirty();
-                self.mark_local_dirty();
+                self.mark_dirty();
                 self.refresh_live_position();
                 self.live_key_focus = false;
                 self.live_value_focus = false;
@@ -2350,7 +1927,7 @@ impl App {
                     InputMode::Label => {
                         if !self.input_buffer.trim().is_empty() {
                             self.model.current_label = self.input_buffer.trim().to_string();
-                            self.mark_local_dirty();
+                            self.mark_dirty();
                             self.status = format!("Current label: {}", self.model.current_label);
                         }
                     }
@@ -2383,7 +1960,7 @@ impl App {
                         self.type_index = 0;
                         self.path_index = 0;
                         self.types_path_focus = false;
-                        self.mark_local_dirty();
+                        self.mark_dirty();
                     }
                     InputMode::RenameType => {
                         let visible = self.visible_types();
@@ -2405,8 +1982,7 @@ impl App {
                             self.mark_live_cache_dirty();
                             // The rename itself is shared; the side-effect on
                             // event_filters/stashed_event_filters touches local fields.
-                            self.mark_shared_dirty();
-                            self.mark_local_dirty();
+                            self.mark_dirty();
                         }
                     }
                     InputMode::InsertPeriodRange => {
@@ -2504,7 +2080,7 @@ impl App {
         };
         if let Some(saved) = self.stashed_event_filters.take() {
             self.event_filters = saved;
-            self.mark_local_dirty();
+            self.mark_dirty();
             let live_count = self.model.events.len();
             let baseline_count = self.baseline_events.len();
             let restored = self
@@ -2549,7 +2125,7 @@ impl App {
         self.stashed_event_filters = Some(self.event_filters.clone());
         self.event_filters = DataFilters::default();
         self.mark_live_cache_dirty();
-        self.mark_local_dirty();
+        self.mark_dirty();
         self.after_filter_change(anchor);
         self.status = "Event filters suspended (press y to restore)".to_string();
     }
@@ -2561,7 +2137,7 @@ impl App {
             self.stashed_baseline_visible_indices = None;
             self.event_filters = filters;
             self.mark_live_cache_dirty();
-            self.mark_local_dirty();
+            self.mark_dirty();
             self.refresh_live_position();
         }
     }
@@ -3515,7 +3091,7 @@ impl App {
         self.stashed_live_visible_indices = None;
         self.stashed_baseline_visible_indices = None;
         // Filters live in local state.
-        self.mark_local_dirty();
+        self.mark_dirty();
         match origin {
             FilterOrigin::KeyShortcut { anchor } => {
                 self.mark_live_cache_dirty();
@@ -3671,7 +3247,7 @@ impl App {
         self.model.set_periods(periods);
         self.pending_live_recompute = true;
         self.mark_live_cache_dirty();
-        self.mark_shared_dirty();
+        self.mark_dirty();
         if self.mode == UiMode::Live {
             self.refresh_live_position();
         }
@@ -3755,10 +3331,6 @@ impl App {
         };
         let mut updated = self.model.periods.clone();
         updated.retain(|p| p.id != remove_id);
-        // Remember this id so the next persist_shared_state doesn't re-add it
-        // when merging with on-disk state written by other operators that
-        // still have the period.
-        self.user_deleted_period_ids.insert(remove_id);
         self.apply_periods_update(updated);
         let closed_after = self.model.closed_periods().len();
         if closed_after == 0 {
@@ -3862,37 +3434,21 @@ impl App {
     /// field overrides, triage set) as needing a write to `<sha>.shared.json`.
     ///
     /// Shared writes are flushed eagerly — they're tiny (sub-10 KB) and other
-    /// operators are waiting on them. We hold the lock for read→merge→atomic
-    /// write→release. Local state stays on the 30 s autosave cadence; nothing
-    /// else is racing for it.
-    fn mark_shared_dirty(&mut self) {
-        self.shared_dirty = true;
+    /// Single dirty mark. State is small, single-writer, and written
+    /// atomically, so we persist eagerly: instant durability without any
+    /// reload-from-disk feedback loop.
+    fn mark_dirty(&mut self) {
+        self.state_dirty = true;
         if !self.reader.path().exists() {
             return;
         }
-        match self.persist_shared_state() {
-            Ok(()) => self.shared_dirty = false,
+        match self.persist_state() {
+            Ok(()) => self.state_dirty = false,
             Err(err) => {
-                // Keep the dirty flag set so the autosave will retry.
-                eprintln!(
-                    "{WARNING_PREFIX_ORANGE} eager shared-state write failed: {err}"
-                );
+                // Keep the dirty flag set so the next autosave retries.
+                eprintln!("{WARNING_PREFIX_ORANGE} state write failed: {err}");
             }
         }
-    }
-
-    /// Marks fields persisted in the local file (cursor, filters, label,
-    /// types_filter, profile-imported unrelated types) as needing a write to
-    /// `<sha>.local.json`.
-    fn mark_local_dirty(&mut self) {
-        self.local_dirty = true;
-    }
-
-    /// Backwards-compatible shim for sites that mutate both shared and local
-    /// data (e.g. import_session). Marks both flags.
-    fn mark_state_dirty(&mut self) {
-        self.shared_dirty = true;
-        self.local_dirty = true;
     }
 
     fn rebuild_live_cache_if_needed(&mut self) {
@@ -4186,16 +3742,12 @@ impl App {
             .get(self.period_event_index)
             .map(|(idx, _)| *idx);
         if let Some(idx) = event_idx {
-            if let Some(event) = self.model.events.get(idx) {
-                self.user_toggled_triage_identities
-                    .insert((event.ts.to_bits(), event.type_id.clone()));
-            }
             if self.triaged_event_indices.contains(&idx) {
                 self.triaged_event_indices.remove(&idx);
             } else {
                 self.triaged_event_indices.insert(idx);
             }
-            self.mark_shared_dirty();
+            self.mark_dirty();
         }
     }
 
@@ -4223,16 +3775,6 @@ impl App {
 
     pub fn startup_hint(&self) -> Option<&str> {
         self.startup_hint.as_deref()
-    }
-
-    /// Sorted, deduplicated usernames of operators currently connected to the
-    /// same stream (includes self). Returns an empty Vec until the presence
-    /// heartbeat is initialised in `run()`.
-    pub fn connected_operators(&self) -> Vec<(String, usize)> {
-        self.presence
-            .as_ref()
-            .map(|p| p.current_peers())
-            .unwrap_or_default()
     }
 
     pub fn should_show_status_line(&self) -> bool {
@@ -4558,7 +4100,7 @@ impl App {
                     self.user_toggled_paths
                         .insert(path_override_key(&type_id, path));
                     self.pending_live_recompute = true;
-                    self.mark_shared_dirty();
+                    self.mark_dirty();
                 }
             }
         }
@@ -4792,12 +4334,7 @@ impl App {
         }
         self.commit_filter_change(FilterOrigin::TypeView);
         self.pending_live_recompute = true;
-        // Remember the removal so a stale concurrent writer can't re-add this
-        // group on its next merge pass.
-        self.user_removed_merge_groups.insert(group_id.clone());
-        self.user_modified_merge_groups.remove(&group_id);
-        self.mark_shared_dirty();
-        self.mark_local_dirty();
+        self.mark_dirty();
         self.status = format!("Unmerged '{label}' ({} members)", group.members.len());
     }
 
@@ -4853,12 +4390,7 @@ impl App {
         self.commit_filter_change(FilterOrigin::TypeView);
         self.selected_type_ids.clear();
         self.pending_live_recompute = true;
-        // Track that this process authored the new group so the shared merge
-        // keeps our copy as authoritative.
-        self.user_modified_merge_groups.insert(group_id.clone());
-        self.user_removed_merge_groups.remove(&group_id);
-        self.mark_shared_dirty();
-        self.mark_local_dirty();
+        self.mark_dirty();
         // Point the cursor at the newly created merged group so the user sees
         // the row they just acted on. Path-focus was over a now-gone member,
         // so reset it to the list pane.
@@ -5943,6 +5475,60 @@ mod tests {
         assert_eq!(app.event_filters, crate::domain::DataFilters::default());
         assert_eq!(app.period_event_index, 4);
         assert_eq!(app.data_index, 5);
+    }
+
+    #[test]
+    fn pressing_m_opens_period_and_persist_does_not_drop_it() {
+        // Regression for the post-delete `m` flash: in the old shared-state
+        // build, deleting a period kept its id in `user_deleted_period_ids`
+        // forever; `set_periods` then reset `next_period_id` to max+1 (i.e.
+        // the just-deleted id); pressing `m` opened a new period with that
+        // same id, and the persist merge dropped it because the id was on
+        // the deleted list. The eager-write + watcher-reload loop then
+        // observed the open period vanishing and flipped the indicator OFF.
+        // Walk through the same sequence and assert the new period
+        // survives the persist.
+        let mut app = test_app();
+        for i in 1..=5u64 {
+            app.model.ingest(
+                json!({"_timestamp": 1_700_000_000_000u64 + i * 1000}),
+                i as f64,
+            );
+        }
+        // Seed two closed periods so we have a non-trivial periods list.
+        app.handle_key(key(KeyCode::Char('m')));
+        app.model
+            .ingest(json!({"_timestamp": 1_700_000_010_000u64}), 10.0);
+        app.handle_key(key(KeyCode::Char('m')));
+        app.handle_key(key(KeyCode::Char('m')));
+        app.model
+            .ingest(json!({"_timestamp": 1_700_000_020_000u64}), 20.0);
+        app.handle_key(key(KeyCode::Char('m')));
+        assert!(app.model.active_period().is_none(), "setup: both periods closed");
+        let last_id = app.model.periods.iter().map(|p| p.id).max().unwrap();
+
+        // Delete the most recent period — the exact scenario that used to
+        // poison `user_deleted_period_ids` with the id that the next
+        // toggle would reuse.
+        app.delete_period_by_id(last_id).expect("delete succeeds");
+
+        // Now press `m`. The new period gets `next_period_id = last_id`,
+        // matching the just-deleted id.
+        app.handle_key(key(KeyCode::Char('m')));
+        assert!(
+            app.model.active_period().is_some(),
+            "after pressing m post-delete the period should be active"
+        );
+        let opened_id = app.model.active_period().unwrap().id;
+        // Trigger several extra persists to be sure none of them drop it.
+        for _ in 0..5 {
+            app.mark_dirty();
+        }
+        assert!(
+            app.model.active_period().is_some(),
+            "open period must survive repeated persists after a prior delete"
+        );
+        assert_eq!(app.model.active_period().unwrap().id, opened_id);
     }
 
     #[test]

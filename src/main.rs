@@ -6,7 +6,9 @@ use json_analyzer::app::App;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use json_analyzer::control_http::spawn_control_http_server;
-use json_analyzer::persistence::{import_session, load_profile};
+use json_analyzer::persistence::{
+    import_session, load_profile, Swapfile, SwapfileError,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -57,11 +59,18 @@ struct Args {
     /// bind address for optional control HTTP API (e.g. 127.0.0.1:8080)
     #[argh(option)]
     control_http: Option<String>,
+
+    /// switch, take over the swapfile even if another live process holds it
+    /// (vim-style `-r` recovery — use only if you're certain the other
+    /// process is dead)
+    #[argh(switch)]
+    force: bool,
 }
 
 fn main() -> Result<()> {
     let args: Args = argh::from_env();
     let control_http = args.control_http.clone();
+    let force = args.force;
     if let Some(path) = args.path.as_ref() {
         ensure_input_path("<path>", path)?;
     }
@@ -89,6 +98,7 @@ fn main() -> Result<()> {
         }
         let session = import_session(import_path)?;
         let stream_path = PathBuf::from(&session.stream_path);
+        let swapfile = acquire_swapfile_or_exit(&stream_path, force)?;
         // Session import is self-contained; do not load persisted local state.
         let mut app = App::new(
             stream_path,
@@ -98,6 +108,7 @@ fn main() -> Result<()> {
             true,
             args.escape_strings,
         );
+        app.set_swapfile(swapfile);
         if let Some(whitelist_path) = args.whitelist.as_ref() {
             let terms = read_whitelist_terms(whitelist_path)?;
             app.add_whitelist_terms(terms);
@@ -130,6 +141,7 @@ fn main() -> Result<()> {
     if input_path.is_dir() {
         bail!("directory input is no longer supported");
     }
+    let swapfile = acquire_swapfile_or_exit(&input_path, force)?;
     let mut app = App::new(
         input_path,
         args.baseline,
@@ -138,6 +150,7 @@ fn main() -> Result<()> {
         args.reset,
         args.escape_strings,
     );
+    app.set_swapfile(swapfile);
     if let Some(whitelist_path) = args.whitelist.as_ref() {
         let terms = read_whitelist_terms(whitelist_path)?;
         app.add_whitelist_terms(terms);
@@ -153,6 +166,34 @@ fn main() -> Result<()> {
         app.set_control_receiver(control_rx);
     }
     app.run()
+}
+
+fn acquire_swapfile_or_exit(stream_path: &Path, force: bool) -> Result<Swapfile> {
+    match Swapfile::acquire(stream_path, force) {
+        Ok(swap) => Ok(swap),
+        Err(SwapfileError::Held(conflict)) => {
+            // The kernel holds the lock for us, so being "held" means
+            // another instance is genuinely alive (a crashed process
+            // would have released the lock).
+            eprintln!(
+                "\x1b[1;33mE325: ATTENTION\x1b[0m\n\
+                 Another instance of json-analyzer is currently editing this stream:\n\
+                   swapfile: {}\n\
+                   pid:      {}\n\
+                   host:     {}\n\
+                   stream:   {}\n\
+                 \n\
+                 Attach to that terminal instead — two writers will race and corrupt your\n\
+                 annotations. If you really do intend to run both, pass --force.",
+                conflict.swap_path.display(),
+                conflict.record.pid,
+                conflict.record.hostname,
+                conflict.record.stream_path,
+            );
+            std::process::exit(1);
+        }
+        Err(SwapfileError::Io(err)) => Err(err.context("failed to acquire swapfile")),
+    }
 }
 
 fn ensure_input_path(flag: &str, path: &Path) -> Result<()> {

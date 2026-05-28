@@ -1219,27 +1219,7 @@ fn draw_data(frame: &mut Frame<'_>, area: Rect, app: &mut App, max_type_count: f
 fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut text = Vec::new();
     let inner_width = area.width.saturating_sub(2) as usize;
-    // "Connected: tali (×3), alice" — only rendered when more than one
-    // process is connected (a single TUI shouldn't see its own name). Same
-    // username with multiple processes collapses to a single entry with a
-    // count suffix.
-    let peers = app.connected_operators();
-    let total: usize = peers.iter().map(|(_, n)| *n).sum();
-    let connected_str = if total <= 1 {
-        String::new()
-    } else {
-        let entries: Vec<String> = peers
-            .iter()
-            .map(|(name, n)| {
-                if *n > 1 {
-                    format!("{} (×{})", name, n)
-                } else {
-                    name.clone()
-                }
-            })
-            .collect();
-        format!("Connected: {}", entries.join(", "))
-    };
+    let connected_str = String::new();
     if app.input_mode != InputMode::None {
         let title: String = match app.input_mode {
             InputMode::None => String::new(),

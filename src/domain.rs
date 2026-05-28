@@ -314,6 +314,17 @@ impl AnalyzerModel {
         self.account_rate_elapsed(boundary_ts);
         if let Some(last) = self.periods.last_mut() {
             if last.end.is_none() {
+                // Rapid double-tap on `m`: the user opened a period and then
+                // closed it before any new event arrived, so start (= old ts
+                // + EPS) is already past the would-be end. Treat as a no-op
+                // and drop the empty period rather than leaving a degenerate
+                // negative-duration span around.
+                if boundary_ts < last.start {
+                    let drop_id = last.id;
+                    self.periods.pop();
+                    self.period_rate_states.remove(&drop_id);
+                    return true;
+                }
                 last.end = Some(boundary_ts);
                 return true;
             }
@@ -2334,6 +2345,30 @@ mod tests {
         assert!(model.toggle_period());
         assert!(model.active_period().is_none());
         assert_eq!(model.periods[0].end, Some(101.0));
+    }
+
+    #[test]
+    fn period_double_tap_with_no_intervening_event_drops_empty_period() {
+        // Rapid `m m` opens a period at `T+EPS` and tries to close at the
+        // same `T`. The would-be close is before the start, so the toggle
+        // should erase the period instead of leaving a negative-duration
+        // span behind.
+        let mut model = AnalyzerModel::new();
+        model.ingest(json!({"event": "anchor"}), 50.0);
+        assert!(model.toggle_period(), "first tap should open");
+        assert_eq!(model.periods.len(), 1);
+        assert!(model.toggle_period(), "second tap should be a no-op close");
+        assert!(
+            model.periods.is_empty(),
+            "double-tap should remove the empty period; got {:?}",
+            model.periods
+        );
+        assert!(model.active_period().is_none());
+        // Subsequent open should still work and use the original anchor ts.
+        assert!(model.toggle_period());
+        assert_eq!(model.periods.len(), 1);
+        let p = model.active_period().expect("re-opened period");
+        assert!(p.start > 50.0);
     }
 
     #[test]
