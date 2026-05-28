@@ -262,6 +262,99 @@ rm -f ~/.local/state/json-analyzer/${URL_SHA}.{state,swap}.json
 
 **G4 catches `mark_dirty` short-circuits.** If `source_exists()` returns false for HTTP whenever `pending_rotation` is transiently set (e.g., during a 416 at EOF before G6 was fixed), saves get skipped silently. The fix is to make HTTP `source_exists()` always return true — annotation persistence does not depend on whether the remote endpoint is reachable right this instant.
 
+### H. Drop verification (ground-truth)
+
+The fixture is ground truth. The analyzer's session export (`x`, default path) writes `model.events` to disk as a JSON array — counting that array's length gives an exact ingest count, with order and content checkable for free. Same recipe for file and HTTP backends.
+
+Pre-build a deterministic fixture so each event is self-identifying:
+
+```bash
+mkdir -p /tmp/drops
+python3 -c "
+import json, time
+n = 5000
+base = int(time.time()*1000)
+with open('/tmp/drops/stream.jsonl', 'w') as f:
+    for i in range(n):
+        f.write(json.dumps({'_timestamp': base + i, '_type': 'e', 'idx': i}) + '\n')
+"
+EXPECTED=$(wc -l < /tmp/drops/stream.jsonl | tr -d ' ')
+```
+
+Helper:
+
+```bash
+# usage: run_export <session_name> <stream_arg>
+#   stream_arg is either a local path or http://... URL
+run_export() {
+    local sess="$1" src="$2"
+    local SK=.claude/skills/drive-tui
+    rm -f ~/.local/state/json-analyzer/*.swap.json
+    tmux new-session -d -s "$sess" -x 160 -y 50 \
+        "target/release/json_analyzer $src 2>/tmp/${sess}-stderr.log"
+    sleep 2   # ingest settle
+    $SK/send_keys.sh "$sess" x Enter
+    sleep 0.5
+    $SK/send_keys.sh "$sess" q q
+    sleep 1
+    tmux kill-session -t "$sess" 2>/dev/null
+    # Default export path is "<stream>.session.json" for file backend.
+    # For HTTP backend it's "<url>.session.json" — sanitise to a local
+    # filename in the working dir before passing to jq.
+}
+```
+
+| ID | What | How | Pass criterion |
+|---|---|---|---|
+| H1 | **File backend, no drops** | `run_export drops_file /tmp/drops/stream.jsonl`, then `jq '.events | length' /tmp/drops/stream.jsonl.session.json` | Count == `$EXPECTED` (5000) |
+| H2 | File backend, strict ordering | `jq '[.events[].obj.idx] == [range(0; (.events|length))]' ...session.json` | Returns `true` — every event's `idx` matches its position (no out-of-order ingest, no skipped indices) |
+| H3 | File backend, timestamp monotonicity | `jq '[.events[].ts] | (. == sort)' ...session.json` | Returns `true` |
+| H4 | **HTTP backend, no drops** | Start a server (Python or Rust per Section G) against `/tmp/drops/`, run `run_export drops_http http://127.0.0.1:8080/stream.jsonl`, jq the count. **Static fixture — do not use http_stream.py's bundled writer, we need a fixed count.** | Count == `$EXPECTED` |
+| H5 | HTTP backend, ordering + monotonicity | Same `jq` checks as H2, H3 against the HTTP-derived export | Both return `true` |
+| H6 | No double-ingest on HTTP poll boundary | Spawn a live writer at 100 ev/s for 30s alongside the HTTP server. Run `run_export drops_http_live ...`. Compare jq count to `wc -l` of the file at quit time. | `events_count == wc -l` exactly. A count *greater* than line count means the partial-tail re-fetch glued lines twice — regression on the `HttpStreamReader` partial-line fix |
+| H7 | Drops on rotation are accounted for | Start session, ingest ~1000 events, truncate the file (`> /tmp/drops/stream.jsonl`), append 500 fresh events, accept the "stream changed" prompt with default (discard). Export. | `jq '.events | length'` matches the 500 post-rotation events, not 1500 (no carry-over double-count) |
+| H8 | **File / HTTP parity (small)** | With `/tmp/drops/stream.jsonl` (5000 events) static, run `run_export drops_file /tmp/drops/stream.jsonl` then `run_export drops_http http://127.0.0.1:8080/stream.jsonl`. Compare with `jq -S '[.events[] | .obj]' file.session.json > /tmp/drops/file.idx.json` and the same for http; `diff`. | The two `obj`-only projections are **byte-identical**. Both backends must ingest the same bytes into the same in-memory model. Any divergence — fewer events on one side, different ordering, content drift — is a backend-asymmetry bug |
+| H9 | **File / HTTP parity (at scale)** | Build a 100_000-event fixture (`n=100000` in the H1 generator), repeat H8 against it. Use the helper below to also report `min/max/missing idx` per side before diffing | Same parity: both exports have exactly 100k events, idx range 0..99999, no gaps. **This is the canary for the `max_lines` offset-skip bug.** With the bug, the HTTP side would tap out at ~180k–200k worth less than the file side (events skipped at every `MAX_LINES_PER_POLL` cap inside a single 16MB response body) |
+
+```bash
+# Helper for H8/H9 — surface where parity breaks
+diff_parity() {
+    local f="$1" h="$2"
+    local f_n=$(jq '.events | length' "$f")
+    local h_n=$(jq '.events | length' "$h")
+    echo "file: $f_n events    http: $h_n events"
+    if [ "$f_n" != "$h_n" ]; then
+        echo "  count mismatch — see missing idx:"
+        jq -r '.events[].obj.idx' "$f" | sort -n > /tmp/.file.idx
+        jq -r '.events[].obj.idx' "$h" | sort -n > /tmp/.http.idx
+        diff /tmp/.file.idx /tmp/.http.idx | head -20
+        return 1
+    fi
+    jq -S '[.events[] | .obj]' "$f" > /tmp/.file.obj
+    jq -S '[.events[] | .obj]' "$h" > /tmp/.http.obj
+    if ! diff -q /tmp/.file.obj /tmp/.http.obj > /dev/null; then
+        echo "  same count but content differs:"
+        diff /tmp/.file.obj /tmp/.http.obj | head -20
+        return 1
+    fi
+    echo "  parity OK"
+}
+```
+
+**H6 is the canary for the HTTP partial-line bug.** With the original `partial_tail` prepend-and-re-fetch implementation, this regression would produce duplicated or glued lines — `events_count > wc -l` or parse errors mid-stream. The fix is "commit only complete lines from the response body; the next request re-fetches the partial."
+
+**H9 is the canary for the `max_lines` offset-skip bug.** The HTTP `poll_http_chunk` once advanced `self.offset` by the body's last-newline position instead of by `split_and_parse_chunk`'s returned `consumed`. When `MAX_LINES_PER_POLL` (20k) capped parsing mid-body, every line between "last line we parsed" and "last newline in body" was silently skipped. Symptom: HTTP count plateaus far below the file count on the same fixture; file/HTTP exports diverge. The fix is "advance offset by what we *parsed*, not by what we *received*."
+
+**Diagnosing a failed count** — the `idx` field on every event lets you pinpoint exactly which one was dropped:
+
+```bash
+# Find missing / duplicated idx values
+jq -r '.events[].obj.idx' /tmp/drops/stream.jsonl.session.json | sort -n > /tmp/drops/got.txt
+seq 0 4999 > /tmp/drops/expected.txt
+diff /tmp/drops/expected.txt /tmp/drops/got.txt | head -20
+# A "<" line is a missed event (drop); a ">" line is a phantom (double-ingest).
+```
+
 ## When something fails
 
 1. **First, check `/tmp/tui-stderr.log`** for Rust panics or warnings.
@@ -287,4 +380,5 @@ If invoked with `$ARGUMENTS`, treat as a scope hint:
 - `swap` — section E only
 - `cli` — section C only
 - `http` — section G only (HTTP source)
-- empty — full sweep A → G
+- `drops` — section H only (ground-truth ingest count verification)
+- empty — full sweep A → H
