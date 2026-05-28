@@ -52,6 +52,7 @@ struct FileBackend {
     /// construction and kept in sync with the path field.
     source_id: String,
     last_known_len: u64,
+    blocked_on_partial_tail: bool,
 }
 
 /// HTTP backing state. `etag` reflects whatever the server last sent on a
@@ -65,6 +66,7 @@ struct HttpBackend {
     /// Bytes we received that weren't terminated by a newline. Prepended
     /// to the next poll's response before line-splitting.
     partial_tail: Vec<u8>,
+    blocked_on_partial_tail: bool,
     /// Counter for the periodic full-prefix verification.
     polls_since_verify: u32,
     /// True if the most recent poll observed a server-side rotation (200
@@ -91,6 +93,7 @@ impl StreamReader {
                 path,
                 source_id,
                 last_known_len: 0,
+                blocked_on_partial_tail: false,
             }),
             offset: 0,
         }
@@ -108,6 +111,7 @@ impl StreamReader {
                 last_known_len: 0,
                 etag: None,
                 partial_tail: Vec::new(),
+                blocked_on_partial_tail: false,
                 polls_since_verify: 0,
                 pending_rotation: false,
             }),
@@ -153,12 +157,17 @@ impl StreamReader {
     }
 
     pub fn progress(&self) -> StreamProgress {
-        let last_known_len = match &self.backend {
-            Backend::File(b) => b.last_known_len,
-            Backend::Http(b) => b.last_known_len,
+        let (last_known_len, blocked_on_partial_tail) = match &self.backend {
+            Backend::File(b) => (b.last_known_len, b.blocked_on_partial_tail),
+            Backend::Http(b) => (b.last_known_len, b.blocked_on_partial_tail),
+        };
+        let loaded_bytes = if blocked_on_partial_tail {
+            last_known_len
+        } else {
+            self.offset.min(last_known_len)
         };
         StreamProgress {
-            loaded_bytes: self.offset.min(last_known_len),
+            loaded_bytes,
             total_bytes: last_known_len,
         }
     }
@@ -298,14 +307,14 @@ impl StreamReader {
     pub fn has_incomplete_final_line(&self) -> bool {
         match &self.backend {
             Backend::File(b) => has_incomplete_final_line_local(&b.path),
-            Backend::Http(b) => !b.partial_tail.is_empty(),
+            Backend::Http(b) => b.blocked_on_partial_tail,
         }
     }
 
     pub fn poll(&mut self) -> Result<Vec<Value>> {
         match &mut self.backend {
-            Backend::File(_) => self.poll_file_chunk(),
-            Backend::Http(_) => self.poll_http_chunk(),
+            Backend::File(_) => self.poll_file_chunk(MAX_BYTES_PER_POLL, MAX_LINES_PER_POLL),
+            Backend::Http(_) => self.poll_http_chunk(MAX_BYTES_PER_POLL, MAX_LINES_PER_POLL),
         }
     }
 
@@ -313,13 +322,14 @@ impl StreamReader {
         self.poll()
     }
 
-    fn poll_file_chunk(&mut self) -> Result<Vec<Value>> {
+    fn poll_file_chunk(&mut self, max_bytes: usize, max_lines: usize) -> Result<Vec<Value>> {
         let Backend::File(b) = &mut self.backend else {
             unreachable!()
         };
         if !b.path.exists() {
             self.offset = 0;
             b.last_known_len = 0;
+            b.blocked_on_partial_tail = false;
             return Ok(Vec::new());
         }
 
@@ -328,20 +338,23 @@ impl StreamReader {
         b.last_known_len = len;
         if len < self.offset {
             self.offset = 0;
+            b.blocked_on_partial_tail = false;
         }
         let remaining = len.saturating_sub(self.offset) as usize;
         if remaining == 0 {
+            b.blocked_on_partial_tail = false;
             return Ok(Vec::new());
         }
 
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(self.offset))?;
 
-        let read_cap = remaining.min(MAX_BYTES_PER_POLL);
+        let read_cap = remaining.min(max_bytes);
         let mut chunk = vec![0_u8; read_cap];
         let bytes_read = reader.read(&mut chunk)?;
         chunk.truncate(bytes_read);
         if chunk.is_empty() {
+            b.blocked_on_partial_tail = false;
             return Ok(Vec::new());
         }
 
@@ -351,29 +364,33 @@ impl StreamReader {
             self.offset,
             &path_display,
             /* allow_final_partial */ self.offset + bytes_read as u64 >= len,
+            max_lines,
         )?;
-        if consumed == 0 && !chunk.is_empty() && chunk.len() >= MAX_BYTES_PER_POLL {
+        if consumed == 0 && !chunk.is_empty() && chunk.len() >= max_bytes {
             let line_number = self.current_line_number();
             return Err(anyhow!(
                 "JSON line in {} line {} exceeded {} bytes before a newline was seen; aborting read",
                 path_display,
                 line_number,
-                MAX_BYTES_PER_POLL
+                max_bytes
             ));
         }
+        let reached_eof = self.offset + bytes_read as u64 >= len;
+        let has_uncommitted_tail = consumed < chunk.len();
+        b.blocked_on_partial_tail = reached_eof && has_uncommitted_tail;
         self.offset += consumed as u64;
         Ok(parsed)
     }
 
-    fn poll_http_chunk(&mut self) -> Result<Vec<Value>> {
+    fn poll_http_chunk(&mut self, max_bytes: usize, max_lines: usize) -> Result<Vec<Value>> {
         let Backend::Http(b) = &mut self.backend else {
             unreachable!()
         };
 
-        // Request the tail. Cap at MAX_BYTES_PER_POLL so a freshly-rotated
+        // Request the tail. Cap bytes per poll so a freshly-rotated
         // 500MB file doesn't tar-pit one poll cycle.
         let start = self.offset;
-        let inclusive_end = start + (MAX_BYTES_PER_POLL as u64) - 1;
+        let inclusive_end = start + (max_bytes as u64) - 1;
         let range = format!("bytes={}-{}", start, inclusive_end);
 
         let resp_result = b.agent.get(&b.url).set("Range", &range).call();
@@ -383,6 +400,7 @@ impl StreamReader {
                 if let Some(total) = parse_total_from_content_range(r.header("Content-Range")) {
                     b.last_known_len = total;
                     if total == self.offset {
+                        b.blocked_on_partial_tail = false;
                         b.pending_rotation = false;
                         return Ok(Vec::new());
                     }
@@ -415,7 +433,7 @@ impl StreamReader {
 
         let mut body: Vec<u8> = Vec::new();
         resp.into_reader()
-            .take((MAX_BYTES_PER_POLL as u64) + 1)
+            .take((max_bytes as u64) + 1)
             .read_to_end(&mut body)
             .context("reading HTTP response body")?;
 
@@ -425,6 +443,7 @@ impl StreamReader {
             // with our own server but does happen with some caches.
             b.pending_rotation = true;
             b.partial_tail.clear();
+            b.blocked_on_partial_tail = false;
             self.offset = 0;
             b.etag = new_etag;
             if let Some(cl) = content_length {
@@ -468,15 +487,17 @@ impl StreamReader {
         }
 
         if body.is_empty() {
+            b.blocked_on_partial_tail = false;
             return Ok(Vec::new());
         }
 
-        // Find the last newline in the response body and commit up to
-        // (and including) it. Anything past that newline is a partial
-        // line still being written by the producer; we don't advance
-        // `self.offset` over those bytes, so the next poll's
-        // `Range: bytes=offset-` request re-fetches them. Costs one or
-        // two KB per poll on average — trivial.
+        // Parse up to max_lines complete lines from the response. We commit
+        // exactly the bytes covered by the lines we parsed — `consumed` from
+        // `split_and_parse_chunk` is the position past the last newline we
+        // accepted. Anything past it is either a partial line still being
+        // written by the producer (waiting for newline) OR more complete
+        // lines that the max_lines cap made us defer to the next poll. In
+        // both cases the next `Range: bytes=consumed-` re-fetches them.
         //
         // The earlier design also cached the trailing partial bytes in
         // `partial_tail` and prepended them to the next response. That
@@ -484,28 +505,38 @@ impl StreamReader {
         // and prepending+re-fetching glued two partial copies together
         // (yielding "object1{object2" parse errors). The single-source-
         // of-truth fix is "trust the wire; commit only complete lines."
-        let last_newline = body.iter().rposition(|&c| c == b'\n');
-        let consumed = match last_newline {
-            Some(i) => i + 1,
-            None => 0,
-        };
-        let complete = &body[..consumed];
-
         let path_display = b.url.clone();
-        let (parsed, _) = split_and_parse_chunk(
-            complete,
+        let (parsed, consumed) = split_and_parse_chunk(
+            &body,
             self.offset,
             &path_display,
             /* allow_final_partial */ false,
+            max_lines,
         )?;
-        if consumed == 0 && body.len() >= MAX_BYTES_PER_POLL {
+        if consumed == 0 && body.len() >= max_bytes {
             bail!(
                 "JSON line in {} at byte {} exceeded {} bytes before a newline was seen; aborting read",
                 b.url,
                 self.offset,
-                MAX_BYTES_PER_POLL
+                max_bytes
             );
         }
+        let reached_eof = b
+            .last_known_len
+            .checked_sub(start)
+            .map(|remaining| body.len() as u64 >= remaining)
+            .unwrap_or(false);
+        // Partial-tail-at-EOF: only flag if we parsed up to the body's last
+        // newline AND there are leftover non-newline bytes. If max_lines
+        // made us stop short, there are more complete lines pending — that's
+        // not a "partial tail waiting on newline", it's just more polls.
+        let last_newline_in_body = body
+            .iter()
+            .rposition(|&c| c == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let parsed_all_lines = consumed >= last_newline_in_body;
+        b.blocked_on_partial_tail = reached_eof && parsed_all_lines && consumed < body.len();
         self.offset += consumed as u64;
         b.partial_tail.clear();
         Ok(parsed)
@@ -550,6 +581,7 @@ fn split_and_parse_chunk(
     chunk_base_offset: u64,
     source_display: &str,
     allow_final_partial: bool,
+    max_lines: usize,
 ) -> Result<(Vec<Value>, usize)> {
     let mut line_spans: Vec<(usize, usize)> = Vec::with_capacity(64);
     let mut line_start = 0usize;
@@ -558,14 +590,14 @@ fn split_and_parse_chunk(
         if *byte != b'\n' {
             continue;
         }
-        if line_spans.len() >= MAX_LINES_PER_POLL {
+        if line_spans.len() >= max_lines {
             break;
         }
         line_spans.push((line_start, idx));
         line_start = idx + 1;
         consumed = line_start;
     }
-    if allow_final_partial && line_spans.len() < MAX_LINES_PER_POLL && line_start < chunk.len() {
+    if allow_final_partial && line_spans.len() < max_lines && line_start < chunk.len() {
         let tail = &chunk[line_start..];
         if tail.iter().all(|b| matches!(*b, b' ' | b'\t' | b'\r')) {
             line_spans.push((line_start, chunk.len()));

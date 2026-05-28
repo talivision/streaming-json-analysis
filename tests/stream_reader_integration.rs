@@ -126,6 +126,15 @@ fn stream_reader_waits_for_partial_jsonl_line_until_newline_arrives() {
         reader.has_incomplete_final_line(),
         "reader should retain the incomplete tail"
     );
+    let progress = reader.progress();
+    assert_eq!(
+        progress.loaded_bytes, progress.total_bytes,
+        "an incomplete EOF tail should not keep initial loading locked"
+    );
+    assert!(
+        reader.offset() < progress.total_bytes,
+        "partial tail bytes are not committed until a newline arrives"
+    );
 
     let mut f = OpenOptions::new()
         .append(true)
