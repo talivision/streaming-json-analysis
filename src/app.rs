@@ -952,7 +952,9 @@ impl App {
 
     fn ingest_new_events(&mut self) -> Result<bool> {
         self.rebuild_live_cache_if_needed();
-        let use_snapshot_parallel = self.offline || self.loading_locked();
+        let use_snapshot_parallel = self.offline
+            || self.loading_locked()
+            || (self.reader.is_http() && !self.initial_load_complete);
         let events = if use_snapshot_parallel {
             self.reader.poll_snapshot_parallel()
         } else {
@@ -3840,7 +3842,7 @@ impl App {
     }
 
     pub fn should_show_status_line(&self) -> bool {
-        self.show_status_debug || self.loading_locked()
+        self.show_status_debug || self.loading_locked() || !self.initial_load_complete
     }
 
     pub fn has_modal_confirmation(&self) -> bool {
@@ -4526,6 +4528,10 @@ impl App {
             }
         });
         let Some(target) = target else {
+            if self.reader.is_http() {
+                self.status = "Loading HTTP stream metadata...".to_string();
+                return;
+            }
             self.initial_load_complete = true;
             return;
         };
