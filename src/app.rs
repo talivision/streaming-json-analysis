@@ -10,9 +10,9 @@ use crate::domain::{
 };
 use crate::io::StreamReader;
 use crate::persistence::{
-    export_session, hash_stream_prefix, invalidate_state, load_full_state,
-    migrate_legacy_state_paths, save_profile, save_state, NormalizedFieldOverride,
-    PersistedState, RestoredState, SessionEvent, SessionExport, SourceProfile, StateLoadResult,
+    export_session, hash_stream_prefix, invalidate_state, load_full_state, save_profile,
+    save_state, NormalizedFieldOverride, PersistedState, RestoredState, SessionEvent,
+    SessionExport, SourceProfile, StateLoadResult,
 };
 use crate::tui::{draw_file_changed_prompt, draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
