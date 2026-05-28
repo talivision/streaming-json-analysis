@@ -85,13 +85,13 @@ cargo build --release --target x86_64-pc-windows-gnu
 Point the tool at any JSONL file and it starts reading immediately:
 
 ```bash
-./target/release/json-analyzer stream.jsonl
+./target/release/json_analyzer stream.jsonl
 ```
 
 For static archives where you want to read the whole file at once rather than tail it:
 
 ```bash
-./target/release/json-analyzer --offline archive.jsonl
+./target/release/json_analyzer --offline archive.jsonl
 ```
 
 Offline mode is for read-once analysis of existing data. It does not tail for new events and does not support marking action periods.
@@ -167,7 +167,7 @@ Events inside the period are scored against the baseline:
 The keyboard flow (`m`) is the default and works well in normal interactive use. If you need reproducible, script-driven period boundaries (especially in high-volume environments), you can enable an optional local HTTP control API:
 
 ```bash
-./target/release/json-analyzer stream.jsonl --control-http 127.0.0.1:8080
+./target/release/json_analyzer stream.jsonl --control-http 127.0.0.1:8080
 ```
 
 Endpoints:
@@ -202,7 +202,7 @@ sub:    "timeout" && !"connection reset"
 If you know certain event types or values will always be related to the activity you're investigating, load a whitelist so they're never accidentally filtered out. A whitelist is a text file with one search term per line:
 
 ```bash
-./target/release/json-analyzer stream.jsonl --whitelist terms.txt
+./target/release/json_analyzer stream.jsonl --whitelist terms.txt
 ```
 
 Events matching any term are treated as always-interesting regardless of active filters. Cycle modes with **`w`**:
@@ -218,13 +218,13 @@ Matches are highlighted in orange in the JSON preview.
 Press **`p`** to export a profile — your configuration (type renames, merge groups, excluded types, path overrides, whitelist terms) without the events. Reload it next time you open the same stream, or apply it to a different stream of the same kind:
 
 ```bash
-./target/release/json-analyzer stream.jsonl --profile stream.profile.json
+./target/release/json_analyzer stream.jsonl --profile stream.profile.json
 ```
 
 Press **`x`** to export a full session snapshot including all events, baseline, and periods. A colleague can open it directly without access to the original stream:
 
 ```bash
-./target/release/json-analyzer --import session.json
+./target/release/json_analyzer --import session.json
 ```
 
 Once you've used `x` in a session, the snapshot is re-written automatically on clean exit. If session state conflicts with a loaded profile, you'll be prompted to choose.
@@ -240,7 +240,7 @@ This means you don't need to do anything special to establish a baseline: run th
 If you already have a large corpus of known-good events, you can pre-load it to give the engine a better reference from the start:
 
 ```bash
-./target/release/json-analyzer stream.jsonl --baseline baseline.jsonl
+./target/release/json_analyzer stream.jsonl --baseline baseline.jsonl
 ```
 
 This is optional but improves scoring quality, especially for rate anomalies, when the stream is young and the implicit baseline is thin.
@@ -256,7 +256,7 @@ The bundled Python demo source writes background noise plus action-triggered eve
 python3 examples/sources/demo_source/demo_source.py
 
 # Terminal 2
-./target/release/json-analyzer /tmp/json_demo/stream.jsonl
+./target/release/json_analyzer /tmp/json_demo/stream.jsonl
 ```
 
 In the source terminal, press `l` (login), `p` (purchase), `s` (search), `c`/`t` (experiment variants) to fire actions. In the analyzer, press `m` to bracket a window around them and watch the anomaly scores appear.
