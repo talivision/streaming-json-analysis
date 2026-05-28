@@ -5,10 +5,10 @@ Demonstrates the analyzer reading a remote JSONL stream over HTTP. Runs
 both halves of the producer side in one process so the demo is single-
 command:
 
-  1. A tiny HTTP file server on http://127.0.0.1:8080/ exposing
-     /tmp/json_demo/. Range-request support and a CRC32 content-hash
-     ETag (cached by mtime+size) so the analyzer can do incremental
-     tail polls.
+  1. A tiny HTTP file server on http://0.0.0.0:8080/ exposing
+     /tmp/json_demo/. Range-request support, cheap file-identity ETags,
+     and per-range CRC headers so the analyzer can do incremental tail
+     polls.
   2. A continuous writer appending JSONL events to
      /tmp/json_demo/stream.jsonl at ~10 events/sec.
 
@@ -16,7 +16,7 @@ Usage:
   Terminal 1:
       python3 examples/sources/http_stream/http_stream.py
   Terminal 2:
-      ./target/release/json-analyzer http://127.0.0.1:8080/stream.jsonl
+      ./target/release/json_analyzer http://127.0.0.1:8080/stream.jsonl
 
 On exit (Ctrl-C or 'q'), the server stops and /tmp/json_demo/ is removed.
 """
@@ -38,7 +38,7 @@ from pathlib import Path
 # --- Configuration ---
 OUTPUT_DIR = "/tmp/json_demo"
 STREAM_FILE = os.path.join(OUTPUT_DIR, "stream.jsonl")
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"
 PORT = 8080
 RATE_PER_SEC = 10.0
 
@@ -125,32 +125,14 @@ def _make_event() -> dict:
 # HTTP server
 # ---------------------------------------------------------------------------
 
-# Cache key: (mtime_ns, size, inode). Nanosecond mtime catches
-# same-second overwrites; inode catches mv-style replacements where
-# mtime + size happen to match.
-_crc_cache: dict[Path, tuple[int, int, int, int]] = {}
-_crc_lock = threading.Lock()
-
-
-def _crc32_for(path: Path) -> tuple[int, int] | None:
-    """Return (crc32, size); cache invalidates on any mtime/size/inode change."""
+def _file_info(path: Path) -> tuple[int, str] | None:
     try:
         st = path.stat()
     except OSError:
         return None
-    key = (st.st_mtime_ns, st.st_size, st.st_ino)
-    with _crc_lock:
-        cached = _crc_cache.get(path)
-        if cached is not None and (cached[0], cached[1], cached[2]) == key:
-            return (cached[3], st.st_size)
-    try:
-        data = path.read_bytes()
-    except OSError:
-        return None
-    crc = zlib.crc32(data) & 0xFFFFFFFF
-    with _crc_lock:
-        _crc_cache[path] = (key[0], key[1], key[2], crc)
-    return (crc, st.st_size)
+    inode = getattr(st, "st_ino", 0)
+    etag = f'"stat:{inode:x}:{st.st_mtime_ns:x}:{st.st_size:x}"'
+    return st.st_size, etag
 
 
 def _crc32_range(path: Path, start: int, length: int) -> int | None:
@@ -218,10 +200,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         path = self._resolve()
         if path is None:
             self._send_error(404); return
-        info = _crc32_for(path)
+        info = _file_info(path)
         if info is None:
             self._send_error(404); return
-        crc, size = info
+        size, etag = info
         range_hdr = self.headers.get("Range")
         if range_hdr:
             r = _parse_range(range_hdr, size)
@@ -229,7 +211,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(416)
                 self.send_header("Content-Range", f"bytes */{size}")
                 self.send_header("Content-Length", "0")
-                self.send_header("ETag", f'"crc32:{crc:08x}"')
+                self.send_header("ETag", etag)
                 self.end_headers()
                 return
             start, end = r
@@ -242,7 +224,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
             self.send_header("Accept-Ranges", "bytes")
-            self.send_header("ETag", f'"crc32:{crc:08x}"')
+            self.send_header("ETag", etag)
             self.send_header("X-Content-CRC32", f"{range_crc:08x}")
             self.end_headers()
             return
@@ -250,18 +232,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(size))
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("ETag", f'"crc32:{crc:08x}"')
+        self.send_header("ETag", etag)
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
         path = self._resolve()
         if path is None:
             self._send_error(404); return
-        info = _crc32_for(path)
+        info = _file_info(path)
         if info is None:
             self._send_error(404); return
-        crc, size = info
-        etag = f'"crc32:{crc:08x}"'
+        size, etag = info
 
         range_hdr = self.headers.get("Range")
         if range_hdr:
@@ -316,10 +297,20 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 # Lifecycle
 # ---------------------------------------------------------------------------
 
+# Set to True only after _setup_output_dir() succeeds, so a failed startup
+# (e.g. port already bound by someone else's process) doesn't wipe a
+# directory that another process is serving from. Without this guard,
+# a port collision below would still hit `finally: _cleanup_output_dir()`
+# and shutil.rmtree someone else's data.
+_we_own_output_dir = False
+
+
 def _setup_output_dir() -> None:
+    global _we_own_output_dir
     if os.path.exists(OUTPUT_DIR):
         shutil.rmtree(OUTPUT_DIR)
     os.makedirs(OUTPUT_DIR)
+    _we_own_output_dir = True
     # Touch the file so the first poll has something to attach to.
     Path(STREAM_FILE).touch()
     print(f"Output directory: {OUTPUT_DIR}")
@@ -327,6 +318,8 @@ def _setup_output_dir() -> None:
 
 
 def _cleanup_output_dir() -> None:
+    if not _we_own_output_dir:
+        return
     if os.path.exists(OUTPUT_DIR):
         shutil.rmtree(OUTPUT_DIR)
         print(f"Cleaned up {OUTPUT_DIR}")
@@ -352,12 +345,12 @@ def main() -> None:
     writer_thread = threading.Thread(target=_writer_loop, args=(stop,), daemon=True)
     writer_thread.start()
 
-    url = f"http://{HOST}:{PORT}/stream.jsonl"
+    url = f"http://127.0.0.1:{PORT}/stream.jsonl"
     print(f"Serving on http://{HOST}:{PORT}/")
     print(f"Writing ~{RATE_PER_SEC:.0f} events/sec to stream.jsonl")
     print()
     print("Start the analyzer in another terminal:")
-    print(f"  ./target/release/json-analyzer {url}")
+    print(f"  ./target/release/json_analyzer {url}")
     print()
     print("Press Ctrl-C to stop.")
 
