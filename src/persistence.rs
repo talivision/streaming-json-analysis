@@ -91,6 +91,11 @@ pub struct PersistedState {
     pub stream_path: String,
     pub saved_len: u64,
     pub prefix_hash_hex: String,
+    /// For HTTP-backed sources, the most recent ETag we accepted. Used to
+    /// detect rotation cheaply on restart without a full prefix re-hash.
+    /// File-backed sources leave this `None`.
+    #[serde(default)]
+    pub source_etag: Option<String>,
     pub periods: Vec<ActionPeriod>,
     pub renames: Vec<(String, String)>,
     pub known_unrelated_types: Vec<String>,
@@ -114,6 +119,7 @@ impl PersistedState {
             stream_path,
             saved_len: 0,
             prefix_hash_hex: String::new(),
+            source_etag: None,
             periods: Vec::new(),
             renames: Vec::new(),
             known_unrelated_types: Vec::new(),
@@ -130,6 +136,9 @@ impl PersistedState {
 
 #[derive(Debug)]
 pub struct RestoredState {
+    pub saved_len: u64,
+    pub prefix_hash_hex: String,
+    pub source_etag: Option<String>,
     pub periods: Vec<ActionPeriod>,
     pub renames: Vec<(String, String)>,
     pub known_unrelated_types: Vec<String>,
@@ -177,10 +186,14 @@ fn canonical_for_hashing(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
-pub fn state_paths_for_stream(stream_path: &Path) -> Result<StatePaths> {
-    let canonical = canonical_for_hashing(stream_path);
+/// Compute the state paths for an opaque source identifier (canonicalised
+/// local path string, or URL string, etc.). The identifier is hashed
+/// verbatim — callers are responsible for any normalisation that should
+/// collapse equivalent sources to the same key (e.g. canonicalising local
+/// paths via [`state_paths_for_stream`]).
+pub fn state_paths_for_id(source_id: &str) -> Result<StatePaths> {
     let mut hasher = Sha256::new();
-    hasher.update(canonical.to_string_lossy().as_bytes());
+    hasher.update(source_id.as_bytes());
     let id = format!("{:x}", hasher.finalize());
     let dir = base_state_dir()?;
     Ok(StatePaths {
@@ -189,6 +202,23 @@ pub fn state_paths_for_stream(stream_path: &Path) -> Result<StatePaths> {
         dir,
         id,
     })
+}
+
+/// Local-path convenience: canonicalise (best-effort) and then derive paths
+/// from the resulting string. Keeps `./foo.jsonl` and `/abs/foo.jsonl`
+/// hashing to the same id.
+pub fn state_paths_for_stream(stream_path: &Path) -> Result<StatePaths> {
+    let canonical = canonical_for_hashing(stream_path);
+    state_paths_for_id(&canonical.to_string_lossy())
+}
+
+/// Canonicalised string form of a local stream path — the value that
+/// [`state_paths_for_stream`] would hash. Use when you need to pass the
+/// same identity to both `state_paths_for_id` and another consumer.
+pub fn canonical_source_id(stream_path: &Path) -> String {
+    canonical_for_hashing(stream_path)
+        .to_string_lossy()
+        .to_string()
 }
 
 fn base_state_dir() -> Result<PathBuf> {
@@ -230,8 +260,7 @@ pub fn atomic_write(target: &Path, payload: &[u8]) -> Result<()> {
     let parent = target
         .parent()
         .ok_or_else(|| anyhow::anyhow!("target {} has no parent", target.display()))?;
-    create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
+    create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
 
     let tmp = {
         let mut t = target.to_path_buf();
@@ -261,9 +290,8 @@ pub fn atomic_write(target: &Path, payload: &[u8]) -> Result<()> {
             .with_context(|| format!("failed to fsync {}", tmp.display()))?;
     }
 
-    std::fs::rename(&tmp, target).with_context(|| {
-        format!("failed to rename {} -> {}", tmp.display(), target.display())
-    })?;
+    std::fs::rename(&tmp, target)
+        .with_context(|| format!("failed to rename {} -> {}", tmp.display(), target.display()))?;
 
     if let Ok(dir) = File::open(parent) {
         let _ = dir.sync_all();
@@ -276,8 +304,8 @@ pub fn atomic_write(target: &Path, payload: &[u8]) -> Result<()> {
 // State IO
 // ---------------------------------------------------------------------------
 
-pub fn read_state(stream_path: &Path) -> Result<Option<PersistedState>> {
-    let paths = state_paths_for_stream(stream_path)?;
+pub fn read_state_for_id(source_id: &str) -> Result<Option<PersistedState>> {
+    let paths = state_paths_for_id(source_id)?;
     if !paths.state.exists() {
         return Ok(None);
     }
@@ -286,35 +314,43 @@ pub fn read_state(stream_path: &Path) -> Result<Option<PersistedState>> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    let state: PersistedState =
-        serde_json::from_slice(&bytes).context("invalid state payload")?;
+    let state: PersistedState = serde_json::from_slice(&bytes).context("invalid state payload")?;
     if state.version != STATE_VERSION {
         return Ok(None);
     }
     Ok(Some(state))
 }
 
-pub fn save_state(stream_path: &Path, state: &PersistedState) -> Result<()> {
-    let paths = state_paths_for_stream(stream_path)?;
+pub fn read_state(stream_path: &Path) -> Result<Option<PersistedState>> {
+    read_state_for_id(&canonical_source_id(stream_path))
+}
+
+pub fn save_state_for_id(source_id: &str, state: &PersistedState) -> Result<()> {
+    let paths = state_paths_for_id(source_id)?;
     let mut adjusted = state.clone();
     adjusted.version = STATE_VERSION;
     if adjusted.stream_path.is_empty() {
-        adjusted.stream_path = stream_path.to_string_lossy().to_string();
+        adjusted.stream_path = source_id.to_string();
     }
     let payload = serde_json::to_vec(&adjusted).context("failed to serialize state")?;
     atomic_write(&paths.state, &payload)
 }
 
-/// Marks the state so that the next `load_full_state` will treat the stream
-/// as gone (saved_len=0, sentinel hash) — used when the stream file
-/// disappears mid-session.
-pub fn invalidate_state(stream_path: &Path) -> Result<()> {
-    let paths = state_paths_for_stream(stream_path)?;
+pub fn save_state(stream_path: &Path, state: &PersistedState) -> Result<()> {
+    save_state_for_id(&canonical_source_id(stream_path), state)
+}
+
+/// Marks the state so that the next load will treat the stream as gone
+/// (saved_len=0, sentinel hash) — used when the stream disappears
+/// mid-session. UI / annotation state is preserved so a re-created stream
+/// at the same identity picks them up.
+pub fn invalidate_state_for_id(source_id: &str) -> Result<()> {
+    let paths = state_paths_for_id(source_id)?;
     if !paths.state.exists() {
         return Ok(());
     }
-    let mut state = PersistedState::empty(stream_path.to_string_lossy().to_string());
-    if let Ok(Some(prev)) = read_state(stream_path) {
+    let mut state = PersistedState::empty(source_id.to_string());
+    if let Ok(Some(prev)) = read_state_for_id(source_id) {
         state.current_label = prev.current_label;
         state.event_filters = prev.event_filters;
         state.stashed_event_filters = prev.stashed_event_filters;
@@ -327,26 +363,24 @@ pub fn invalidate_state(stream_path: &Path) -> Result<()> {
     }
     state.saved_len = 0;
     state.prefix_hash_hex = String::new();
-    save_state(stream_path, &state)
+    state.source_etag = None;
+    save_state_for_id(source_id, &state)
 }
 
+pub fn invalidate_state(stream_path: &Path) -> Result<()> {
+    invalidate_state_for_id(&canonical_source_id(stream_path))
+}
+
+/// Load the persisted state and apply the local-file rotation check.
+/// HTTP-backed sources should call `read_state_for_id` directly and use
+/// `StreamReader::verify_resume` to get the same Clean/Changed verdict
+/// with HTTP semantics.
 pub fn load_full_state(stream_path: &Path) -> Result<Option<StateLoadResult>> {
     let Some(state) = read_state(stream_path)? else {
         return Ok(None);
     };
 
-    let restored = RestoredState {
-        periods: state.periods.clone(),
-        renames: state.renames.clone(),
-        known_unrelated_types: state.known_unrelated_types.clone(),
-        normalized_field_overrides: state.normalized_field_overrides.clone(),
-        current_label: state.current_label.clone(),
-        event_filters: state.event_filters.clone(),
-        stashed_event_filters: state.stashed_event_filters.clone(),
-        types_filter: state.types_filter.clone(),
-        triaged_events: state.triaged_events.clone(),
-        merge_groups: state.merge_groups.clone(),
-    };
+    let restored = restored_from(&state);
 
     // If we never advanced the cursor, treat as clean restore so we can still
     // apply renames/filters to a brand-new file at the same path.
@@ -369,6 +403,27 @@ pub fn load_full_state(stream_path: &Path) -> Result<Option<StateLoadResult>> {
     }
 
     Ok(Some(StateLoadResult::Clean(restored)))
+}
+
+/// Build a `RestoredState` from a `PersistedState`, copying every field
+/// that the app cares about. Shared between the file-backed
+/// `load_full_state` and the HTTP-backed restore path.
+pub fn restored_from(state: &PersistedState) -> RestoredState {
+    RestoredState {
+        saved_len: state.saved_len,
+        prefix_hash_hex: state.prefix_hash_hex.clone(),
+        source_etag: state.source_etag.clone(),
+        periods: state.periods.clone(),
+        renames: state.renames.clone(),
+        known_unrelated_types: state.known_unrelated_types.clone(),
+        normalized_field_overrides: state.normalized_field_overrides.clone(),
+        current_label: state.current_label.clone(),
+        event_filters: state.event_filters.clone(),
+        stashed_event_filters: state.stashed_event_filters.clone(),
+        types_filter: state.types_filter.clone(),
+        triaged_events: state.triaged_events.clone(),
+        merge_groups: state.merge_groups.clone(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,8 +491,19 @@ impl Swapfile {
     /// `force = true` orphans the existing lock (unlinks the file so we
     /// get a fresh inode) and proceeds anyway; use only when you really
     /// do intend to run a second instance alongside the first.
+    /// Convenience: acquire the swap for a local stream path (canonicalises
+    /// the path for the state-file key so `./foo` and `/abs/foo` collide).
     pub fn acquire(stream_path: &Path, force: bool) -> std::result::Result<Self, SwapfileError> {
-        let paths = state_paths_for_stream(stream_path).map_err(SwapfileError::Io)?;
+        let id = canonical_source_id(stream_path);
+        Self::acquire_for_id(&id, force)
+    }
+
+    /// Acquire the swap for an opaque source identifier (URL, hash, etc.).
+    pub fn acquire_for_id(
+        source_id: &str,
+        force: bool,
+    ) -> std::result::Result<Self, SwapfileError> {
+        let paths = state_paths_for_id(source_id).map_err(SwapfileError::Io)?;
         create_dir_all(&paths.dir)
             .with_context(|| format!("failed to create {}", paths.dir.display()))
             .map_err(SwapfileError::Io)?;
@@ -468,7 +534,7 @@ impl Swapfile {
                 let record = SwapfileRecord {
                     pid: std::process::id(),
                     hostname: current_hostname(),
-                    stream_path: stream_path.to_string_lossy().to_string(),
+                    stream_path: source_id.to_string(),
                     created_at_secs: now_secs(),
                 };
                 let payload = serde_json::to_vec(&record)
@@ -501,7 +567,7 @@ impl Swapfile {
                 let record = read_swapfile(&paths.swap).unwrap_or_else(|| SwapfileRecord {
                     pid: 0,
                     hostname: "unknown".to_string(),
-                    stream_path: stream_path.to_string_lossy().to_string(),
+                    stream_path: source_id.to_string(),
                     created_at_secs: 0,
                 });
                 Err(SwapfileError::Held(SwapfileConflict {
@@ -709,7 +775,10 @@ mod tests {
         let loaded = read_state(&stream).unwrap().unwrap();
         assert_eq!(loaded.current_label, "myop");
         assert_eq!(loaded.types_filter, "http");
-        assert_eq!(loaded.renames, vec![("abc".to_string(), "Login".to_string())]);
+        assert_eq!(
+            loaded.renames,
+            vec![("abc".to_string(), "Login".to_string())]
+        );
         let paths = state_paths_for_stream(&stream).unwrap();
         let _ = std::fs::remove_file(&stream);
         let _ = std::fs::remove_file(&paths.state);
@@ -767,7 +836,10 @@ mod tests {
         }
         // Sanity: every losing attempt should have been a Held conflict,
         // not an IO error.
-        assert_eq!(total_winners, trials, "{trials} trials, {total_winners} winners");
+        assert_eq!(
+            total_winners, trials,
+            "{trials} trials, {total_winners} winners"
+        );
         assert_eq!(total_held, trials, "every loser should be Held");
         assert_eq!(total_other_err, 0);
 

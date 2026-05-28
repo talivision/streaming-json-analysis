@@ -141,6 +141,7 @@ Run a session that performs A8, A10, A14, A20, then `q q`. Restart with no `--re
 | B5 | Merge groups restored | merged row still shown with same count |
 | B6 | Filters/label restored | substring filter and action label still set |
 | B7 | **Rename-to-blank persists** | from prior session, rename type via `r BSpace BSpace... Enter` (empty). Restart. Type displays its default (`type-…`) name, NOT the prior name |
+| B8 | **Restart re-ingests events from byte 0** | After any session that consumed events (e.g., A8 + A10), `q q`, restart. Header still shows `objects 200` (the full fixture count), not `objects 0` or "N new since last session". `saved_len` + `prefix_hash_hex` are an identity checkpoint for rotation detection only — the reader stays at offset 0 on Clean so the in-memory model rebuilds from the stream. A restart that shows fewer objects than the on-disk file means `verify_resume` is incorrectly seeking the reader forward. |
 
 ### C. CLI flags
 
@@ -218,6 +219,49 @@ echo '{"pid":0,"hostname":"'$(hostname)'","stream_path":"/tmp/regtest/single.jso
 | F2 | Mutation-to-render latency (keypress → next frame shows change) | median < 100ms (no watcher in the loop now; should be a tight render budget) |
 | F3 | Ingest 1000 ev/s with concurrent mutations | UI stays responsive, `objects` count keeps climbing without stalls |
 
+### G. HTTP source
+
+The analyzer accepts `http://...` and `https://...` in place of a local path. The HTTP backend uses `Range: bytes=<saved_len>-` polling and tracks a prefix-CRC identity (`crc32:<hex>:<len>`) — **not** a whole-file ETag, since the file ETag changes on every append for a live stream and would always look like a rotation. The bundled stream servers (Python in `examples/sources/http_stream/http_stream.py`, Rust in `src/bin/stream_server.rs`) expose `X-Content-CRC32` on 206 / HEAD responses so the client can verify the prefix without re-downloading it.
+
+Launch a server in a separate process for these tests:
+
+```bash
+# Python (stdlib only)
+python3 examples/sources/http_stream/http_stream.py &
+HS=$!
+# Wait for :8080 to be listening
+for _ in {1..40}; do nc -z 127.0.0.1 8080 2>/dev/null && break; sleep 0.05; done
+
+# Rust (deployable binary)
+target/release/stream_server /tmp/regtest 18080 &
+RS=$!
+```
+
+Clean both servers and any prior swap/state at the end of the section:
+
+```bash
+kill $HS $RS 2>/dev/null
+URL_SHA=$(python3 -c "import hashlib; print(hashlib.sha256(b'http://127.0.0.1:8080/stream.jsonl').hexdigest())")
+rm -f ~/.local/state/json-analyzer/${URL_SHA}.{state,swap}.json
+```
+
+| ID | What | How | Pass criterion |
+|---|---|---|---|
+| G1 | Events flow over HTTP | `http_stream.py` running; `target/release/json_analyzer http://127.0.0.1:8080/stream.jsonl` | `objects` header > 0 and increases over time; types appear in `3` |
+| G2 | Append growth is **not** treated as rotation | While analyzer is running, write a new event to `/tmp/json_demo/stream.jsonl` (or rely on http_stream.py's built-in writer). | UI keeps ingesting smoothly; no "stream changed since last session" prompt appears; `pending_rotation` stays false. Regression: whole-file ETag mismatch on every append would trigger this prompt. |
+| G3 | HTTP restart re-ingests from byte 0 | `q q`, relaunch with same URL while server is still running. | Same behaviour as B8 — header shows current `objects` count == events on disk, not 0 and not "since last session". |
+| G4 | Annotations persist over HTTP | While running: A8 (rename), A10 (insert period), `q q`. Relaunch same URL. | Renames + periods restored exactly as B1 / B2. Regression: if `mark_dirty` short-circuits on `!source_exists()`, HTTP runs would silently never persist anything. HTTP `source_exists()` must return true regardless of `pending_rotation`. |
+| G5 | True rotation IS detected | While analyzer is running and server is serving, truncate the file (`> /tmp/json_demo/stream.jsonl`) then have the writer append new events. | "stream changed" prompt fires; user can choose to keep annotations or discard. |
+| G6 | 416 at exact EOF is a no-op, not rotation | Set up: poll catches up to EOF; server returns 416 (range starts past current end). | Analyzer treats it as "no new bytes this poll" and keeps polling. `pending_rotation` does NOT flip to true. Verify by capturing footer / status across several polls during a quiet period. |
+| G7 | 206 success clears prior `pending_rotation` | After G5 triggers a rotation flag, append more events so a 206 succeeds. | `pending_rotation` returns to false (observable indirectly: subsequent annotations save correctly per G4). |
+| G8 | `X-Content-CRC32` header round-trips | `curl -sI -H 'Range: bytes=0-100' http://127.0.0.1:8080/stream.jsonl` | Response includes `X-Content-CRC32: <8 hex chars>` matching `python3 -c "import zlib; print(format(zlib.crc32(open('/tmp/json_demo/stream.jsonl','rb').read()[:101]),'08x'))"`. Regression: identity verification on the client depends on this header. |
+
+**G2 is the canary for the prefix-vs-whole-file ETag bug.** With a whole-file ETag, every append changes the ETag, every `If-Range` returns 200 with the full body, and the analyzer would see continuous "rotation" while really it's just normal growth. The fix is the prefix CRC identity scheme; G2 catches any regression to whole-file ETag matching.
+
+**G3 is the HTTP analogue of B8.** Same expectation, same justification — saved offset is for identity check only, not seek.
+
+**G4 catches `mark_dirty` short-circuits.** If `source_exists()` returns false for HTTP whenever `pending_rotation` is transiently set (e.g., during a 416 at EOF before G6 was fixed), saves get skipped silently. The fix is to make HTTP `source_exists()` always return true — annotation persistence does not depend on whether the remote endpoint is reachable right this instant.
+
 ## When something fails
 
 1. **First, check `/tmp/tui-stderr.log`** for Rust panics or warnings.
@@ -242,4 +286,5 @@ If invoked with `$ARGUMENTS`, treat as a scope hint:
 - `interactions` — section D (bug-catcher; the highest-ROI section)
 - `swap` — section E only
 - `cli` — section C only
-- empty — full sweep A → F
+- `http` — section G only (HTTP source)
+- empty — full sweep A → G

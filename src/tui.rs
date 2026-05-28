@@ -5,11 +5,11 @@ use crate::domain::{
 use crate::persistence::RestoredState;
 use indexmap::IndexMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use std::collections::HashSet;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
+use std::collections::HashSet;
 
 struct JsonRender {
     lines: Vec<Line<'static>>,
@@ -1253,7 +1253,8 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(prefix.clone(), Style::default().fg(Color::Yellow)),
             Span::raw(truncate_left(&app.input_buffer, available)),
         ];
-        let left_width = prefix.chars().count() + truncate_left(&app.input_buffer, available).chars().count();
+        let left_width =
+            prefix.chars().count() + truncate_left(&app.input_buffer, available).chars().count();
         text.push(Line::from(append_connected_right(
             left_spans,
             left_width,
@@ -1982,7 +1983,9 @@ fn push_collapsed_placeholder(
         punctuation_override
     } else {
         apply_normalized_out_style(
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
             normalized_out,
         )
     };

@@ -1,4 +1,4 @@
-use json_analyzer::io::StreamReader;
+use json_analyzer::io::{ResumeVerdict, StreamReader};
 use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -29,7 +29,7 @@ fn stream_reader_fails_fast_on_invalid_json_line() {
     )
     .expect("write initial file");
 
-    let mut reader = StreamReader::new(path.clone());
+    let mut reader = StreamReader::from_path(path.clone());
     let result = reader.poll();
     assert!(result.is_err(), "poll must fail on invalid JSON line");
     let msg = format!("{}", result.unwrap_err());
@@ -46,7 +46,7 @@ fn stream_reader_polls_incrementally() {
     let path = temp_stream_path();
     fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\",\"n\":1}\n").expect("write initial file");
 
-    let mut reader = StreamReader::new(path.clone());
+    let mut reader = StreamReader::from_path(path.clone());
     let first = reader.poll().expect("first poll succeeds");
     assert_eq!(first.len(), 2);
     assert_eq!(first[0], json!({"event":"a"}));
@@ -69,11 +69,40 @@ fn stream_reader_polls_incrementally() {
 }
 
 #[test]
+fn stream_reader_verify_resume_validates_but_replays_from_start() {
+    let path = temp_stream_path();
+    fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\"}\n").expect("write initial file");
+
+    let mut first_reader = StreamReader::from_path(path.clone());
+    let first = first_reader.poll().expect("first poll succeeds");
+    assert_eq!(first.len(), 2);
+    let saved_offset = first_reader.offset();
+    let saved_identity = first_reader
+        .current_identity()
+        .expect("identity after first read");
+
+    let mut restarted = StreamReader::from_path(path.clone());
+    let verdict = restarted
+        .verify_resume(saved_offset, &saved_identity)
+        .expect("resume verifies");
+    assert_eq!(verdict, ResumeVerdict::Clean);
+    assert_eq!(
+        restarted.offset(),
+        0,
+        "resume verification must not skip persisted events; the app rebuilds its model by rereading"
+    );
+    let replayed = restarted.poll().expect("replay poll succeeds");
+    assert_eq!(replayed, vec![json!({"event":"a"}), json!({"event":"b"})]);
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn stream_reader_resets_offset_after_truncate() {
     let path = temp_stream_path();
     fs::write(&path, "{\"id\":1}\n{\"id\":2}\n").expect("write initial");
 
-    let mut reader = StreamReader::new(path.clone());
+    let mut reader = StreamReader::from_path(path.clone());
     let first = reader.poll().expect("first poll");
     assert_eq!(first.len(), 2);
 
@@ -90,7 +119,7 @@ fn stream_reader_waits_for_partial_jsonl_line_until_newline_arrives() {
     let path = temp_stream_path();
     fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"par").expect("write partial file");
 
-    let mut reader = StreamReader::new(path.clone());
+    let mut reader = StreamReader::from_path(path.clone());
     let first = reader.poll().expect("first poll succeeds");
     assert_eq!(first, vec![json!({"event":"a"})]);
     assert!(
@@ -121,7 +150,7 @@ fn stream_reader_does_not_report_incomplete_tail_for_unread_complete_jsonl_lines
     )
     .expect("write complete jsonl file");
 
-    let mut reader = StreamReader::new(path.clone());
+    let mut reader = StreamReader::from_path(path.clone());
     let first = reader.poll().expect("first poll succeeds");
     assert_eq!(
         first,
@@ -138,7 +167,7 @@ fn stream_reader_does_not_report_incomplete_tail_for_unread_complete_jsonl_lines
         "{\"event\":\"a\"}\n{\"event\":\"b\"}\n{\"event\":\"c\"}\n",
     )
     .expect("rewrite complete jsonl file");
-    let mut reader = StreamReader::new(path.clone());
+    let mut reader = StreamReader::from_path(path.clone());
     reader.poll().expect("poll succeeds");
     fs::write(
         &path,
@@ -158,7 +187,7 @@ fn stream_reader_reports_unterminated_final_json_object() {
     let path = temp_stream_path();
     fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\"}").expect("write unterminated file");
 
-    let mut reader = StreamReader::new(path.clone());
+    let mut reader = StreamReader::from_path(path.clone());
     let rows = reader.poll().expect("poll succeeds");
     assert_eq!(rows, vec![json!({"event":"a"}), json!({"event":"b"})]);
     assert!(!reader.has_incomplete_final_line());
@@ -179,7 +208,7 @@ fn stream_reader_handles_large_final_json_object_beyond_tail_scan_window() {
     )
     .expect("write large final object");
 
-    let mut reader = StreamReader::new(path.clone());
+    let mut reader = StreamReader::from_path(path.clone());
     let rows = reader.poll().expect("poll succeeds");
     assert_eq!(rows, vec![payload]);
     assert!(
@@ -206,7 +235,7 @@ fn stream_reader_does_not_flag_large_newline_terminated_final_line_as_incomplete
     )
     .expect("write large newline-terminated object");
 
-    let mut reader = StreamReader::new(path.clone());
+    let mut reader = StreamReader::from_path(path.clone());
     let rows = reader.poll().expect("poll succeeds");
     assert_eq!(rows, vec![payload]);
     assert!(
@@ -222,7 +251,7 @@ fn stream_reader_reports_unparseable_trailing_fragment() {
     let path = temp_stream_path();
     fs::write(&path, "{\"event\":\"a\"}\n{\"event\":\"b\"").expect("write partial final object");
 
-    let mut reader = StreamReader::new(path.clone());
+    let mut reader = StreamReader::from_path(path.clone());
     let rows = reader.poll().expect("poll succeeds");
     assert_eq!(rows, vec![json!({"event":"a"})]);
     assert!(reader.has_incomplete_final_line());
@@ -235,7 +264,7 @@ fn stream_reader_skips_whitespace_only_tail_at_eof() {
     let path = temp_stream_path();
     fs::write(&path, "{\"event\":\"a\"}\n   \t\r").expect("write whitespace tail");
 
-    let mut reader = StreamReader::new(path.clone());
+    let mut reader = StreamReader::from_path(path.clone());
     let rows = reader.poll().expect("poll succeeds");
     assert_eq!(rows, vec![json!({"event":"a"})]);
     assert!(!reader.has_incomplete_final_line());
@@ -250,7 +279,7 @@ fn stream_reader_fails_fast_on_oversized_line_without_newline() {
     let giant = format!("{{\"payload\":\"{}\"", "x".repeat(16 * 1024 * 1024));
     fs::write(&path, giant).expect("write oversized partial line");
 
-    let mut reader = StreamReader::new(path.clone());
+    let mut reader = StreamReader::from_path(path.clone());
     let err = reader.poll().expect_err("oversized line should fail fast");
     let msg = err.to_string();
     assert!(

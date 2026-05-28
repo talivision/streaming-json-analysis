@@ -864,10 +864,7 @@ impl AnalyzerModel {
             }
         }
         if sum_baseline > 0 {
-            *self
-                .baseline_counts
-                .entry(group_id.clone())
-                .or_insert(0) += sum_baseline;
+            *self.baseline_counts.entry(group_id.clone()).or_insert(0) += sum_baseline;
         }
 
         let mut max_baseline_ts: Option<f64> = None;
@@ -1706,7 +1703,13 @@ pub fn dedupe_filter_terms(filter: &str) -> String {
     expr.groups.retain(|g| {
         let key = g
             .iter()
-            .map(|t| format!("{}{}", if t.negated { "!" } else { "" }, t.value.to_lowercase()))
+            .map(|t| {
+                format!(
+                    "{}{}",
+                    if t.negated { "!" } else { "" },
+                    t.value.to_lowercase()
+                )
+            })
             .collect::<Vec<_>>()
             .join("\u{1f}");
         group_seen.insert(key)
@@ -1717,11 +1720,7 @@ pub fn dedupe_filter_terms(filter: &str) -> String {
 /// Expand a merged group's label into its member names. Positive references
 /// to the label fan a group out into one copy per member; negative references
 /// to the label stack !member terms within the group.
-pub fn expand_merged_label_in_filter(
-    filter: &str,
-    label: &str,
-    member_names: &[String],
-) -> String {
+pub fn expand_merged_label_in_filter(filter: &str, label: &str, member_names: &[String]) -> String {
     let label = label.trim();
     if label.is_empty() || member_names.is_empty() {
         return filter.trim().to_string();
@@ -2667,18 +2666,14 @@ mod tests {
     #[test]
     fn merge_two_types_sums_baseline_counts() {
         let mut model = AnalyzerModel::new();
-        let login_id =
-            structural_type_id(&json!({"event": "login", "user": "u0"}));
+        let login_id = structural_type_id(&json!({"event": "login", "user": "u0"}));
         let purchase_id = structural_type_id(&json!({"event": "purchase", "amount": 0}));
         // Baseline events of two distinct shapes.
         for i in 0..5 {
             model.ingest_baseline(json!({"event": "login", "user": format!("u{i}")}), i as f64);
         }
         for i in 0..3 {
-            model.ingest_baseline(
-                json!({"event": "purchase", "amount": i}),
-                (10 + i) as f64,
-            );
+            model.ingest_baseline(json!({"event": "purchase", "amount": i}), (10 + i) as f64);
         }
         assert_ne!(login_id, purchase_id);
 
@@ -2762,10 +2757,12 @@ mod tests {
         let b_id = type_id_of(&model, |v| v.get("y").is_some());
         // a forces 'k' OFF; b forces 'k' ON.
         if let Some(tp) = model.types.get_mut(&a_id) {
-            tp.path_overrides.insert("k".to_string(), PathOverride::ForcedOff);
+            tp.path_overrides
+                .insert("k".to_string(), PathOverride::ForcedOff);
         }
         if let Some(tp) = model.types.get_mut(&b_id) {
-            tp.path_overrides.insert("k".to_string(), PathOverride::ForcedOn);
+            tp.path_overrides
+                .insert("k".to_string(), PathOverride::ForcedOn);
         }
         let group_id = model
             .merge_types(&[a_id, b_id], "Mixed".to_string())
@@ -2804,11 +2801,8 @@ mod tests {
 
     #[test]
     fn expand_merged_label_in_filter_negative_stacks() {
-        let out = expand_merged_label_in_filter(
-            "!Merged",
-            "Merged",
-            &["A".to_string(), "B".to_string()],
-        );
+        let out =
+            expand_merged_label_in_filter("!Merged", "Merged", &["A".to_string(), "B".to_string()]);
         assert_eq!(out, "!A && !B");
     }
 

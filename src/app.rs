@@ -5,14 +5,13 @@ use crate::domain::{
     dedupe_filter_terms, default_type_label, expand_merged_label_in_filter, normalize_path,
     prepare_event, rename_type_terms_in_filter, replace_positive_type_filters,
     toggle_negated_type_in_filter, type_is_negated_in_filter, value_at_path, value_token,
-    values_at_path, ActionPeriod, AnalyzerModel, DataFilters, EventRecord, FilterField,
-    MergeGroup, PreparedEvent,
+    values_at_path, ActionPeriod, AnalyzerModel, DataFilters, EventRecord, FilterField, MergeGroup,
+    PreparedEvent,
 };
 use crate::io::StreamReader;
 use crate::persistence::{
-    export_session, hash_stream_prefix, invalidate_state, load_full_state, save_profile,
-    save_state, NormalizedFieldOverride, PersistedState, RestoredState, SessionEvent,
-    SessionExport, SourceProfile, StateLoadResult,
+    export_session, save_profile, NormalizedFieldOverride, PersistedState, RestoredState,
+    SessionEvent, SessionExport, SourceProfile,
 };
 use crate::tui::{draw_file_changed_prompt, draw_ui, InputMode, UiMode};
 use anyhow::{anyhow, bail, Result};
@@ -185,6 +184,8 @@ impl App {
         self.control_rx = Some(rx);
     }
 
+    /// Convenience for callers that have a local path. Equivalent to
+    /// `from_reader(StreamReader::from_path(stream_path), ...)`.
     pub fn new(
         stream_path: PathBuf,
         baseline_path: Option<PathBuf>,
@@ -193,12 +194,36 @@ impl App {
         reset_state: bool,
         escape_strings: bool,
     ) -> Self {
+        Self::from_reader(
+            StreamReader::from_path(stream_path),
+            baseline_path,
+            offline,
+            show_status_debug,
+            reset_state,
+            escape_strings,
+        )
+    }
+
+    pub fn from_reader(
+        reader: StreamReader,
+        baseline_path: Option<PathBuf>,
+        offline: bool,
+        show_status_debug: bool,
+        reset_state: bool,
+        escape_strings: bool,
+    ) -> Self {
         let baseline_enabled = baseline_path.is_some();
-        let initial_load_target_bytes = fs::metadata(&stream_path)
-            .ok()
+        // For local files we know the target byte size up-front (so the
+        // loading bar is meaningful). For HTTP we don't HEAD here —
+        // first poll will populate `last_known_len` and the bar
+        // recalibrates.
+        let initial_load_target_bytes = reader
+            .local_path()
+            .and_then(|p| fs::metadata(p).ok())
             .map(|m| m.len())
             .filter(|len| *len > 0);
-        let initial_load_complete = initial_load_target_bytes.is_none();
+        let initial_load_complete = initial_load_target_bytes.is_none() && !reader.is_http();
+        let source_display_for_status = reader.source_display();
         let mut app = Self {
             model: AnalyzerModel::new(),
             mode: UiMode::Live,
@@ -240,17 +265,17 @@ impl App {
             status: if offline {
                 format!(
                     "Offline mode: analyzing {} (no live tail)",
-                    stream_path.display()
+                    source_display_for_status
                 )
             } else {
-                format!("Watching {}", stream_path.display())
+                format!("Watching {}", source_display_for_status)
             },
             stashed_event_filters: None,
             stashed_live_visible_indices: None,
             stashed_baseline_visible_indices: None,
             pending_live_anchor: None,
-            reader: StreamReader::new(stream_path),
-            baseline_reader: baseline_path.map(StreamReader::new),
+            reader,
+            baseline_reader: baseline_path.map(StreamReader::from_path),
             baseline_events: Vec::new(),
             baseline_loaded: false,
             offline_loaded: false,
@@ -436,7 +461,7 @@ impl App {
             eprintln!(
                 "{} incomplete JSON line remained at shutdown in {}",
                 WARNING_PREFIX_ORANGE,
-                self.reader.path().display()
+                self.reader.source_display()
             );
         }
         if let Some(reader) = self.baseline_reader.as_ref() {
@@ -444,7 +469,7 @@ impl App {
                 eprintln!(
                     "{} incomplete JSON line remained at shutdown in {}",
                     WARNING_PREFIX_ORANGE,
-                    reader.path().display()
+                    reader.source_display()
                 );
             }
         }
@@ -1044,7 +1069,7 @@ impl App {
         }
         self.baseline_tab_enabled = !self.baseline_events.is_empty();
         let progress = reader.progress();
-        let baseline_path_display = reader.path().display().to_string();
+        let baseline_path_display = reader.source_display();
         self.baseline_loaded =
             progress.total_bytes == 0 || progress.loaded_bytes >= progress.total_bytes;
         self.pending_live_recompute = true;
@@ -1078,9 +1103,40 @@ impl App {
     }
 
     fn restore_persisted_state(&mut self) {
-        match load_full_state(self.reader.path()) {
-            Ok(Some(StateLoadResult::Clean(saved))) => {
-                let msg = format!(
+        // Unified file + HTTP restore: read by source_id, ask the reader
+        // to verify the stored offset/identity, then dispatch the same
+        // Clean/Changed branches as before.
+        let source_id = self.reader.source_id().to_string();
+        let state = match crate::persistence::read_state_for_id(&source_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => return,
+            Err(err) => {
+                self.status = format!("State restore skipped: {err}");
+                self.startup_hint = Some(self.status.clone());
+                return;
+            }
+        };
+        let saved_identity = crate::io::SourceIdentity {
+            prefix_hash_hex: state.prefix_hash_hex.clone(),
+            etag: state.source_etag.clone(),
+        };
+        let verdict = match self.reader.verify_resume(state.saved_len, &saved_identity) {
+            Ok(v) => v,
+            Err(err) => {
+                self.status = format!("State verify failed: {err}");
+                self.startup_hint = Some(self.status.clone());
+                return;
+            }
+        };
+        let saved = crate::persistence::restored_from(&state);
+        match verdict {
+            crate::io::ResumeVerdict::Clean => self.apply_clean_restore(saved),
+            crate::io::ResumeVerdict::Changed => self.file_changed_state = Some(saved),
+        }
+    }
+
+    fn apply_clean_restore(&mut self, saved: RestoredState) {
+        let msg = format!(
                     "Restored session: {} periods, {} renames, {} unrelated, {} normalized fields, {} merge groups, filters {}/5{}{}",
                     saved.periods.len(),
                     saved.renames.len(),
@@ -1099,38 +1155,24 @@ impl App {
                         ", type list filter set"
                     },
                 );
-                if !saved.current_label.trim().is_empty() {
-                    self.model.current_label = saved.current_label.clone();
-                }
-                self.event_filters = saved.event_filters.clone();
-                self.stashed_event_filters = saved.stashed_event_filters.clone();
-                self.types_filter = saved.types_filter.clone();
-                // Merges must be registered BEFORE the live event stream is
-                // ingested: the alias hook then redirects each member-event into
-                // its group naturally.
-                if !saved.merge_groups.is_empty() {
-                    self.model.apply_merge_groups(&saved.merge_groups);
-                }
-                self.mark_live_cache_dirty();
-                self.refresh_live_position();
-                if !saved.periods.is_empty() {
-                    self.model.set_periods(saved.periods.clone());
-                    self.pending_live_recompute = true;
-                }
-                self.pending_restore = Some(saved);
-                self.status = msg.clone();
-                self.startup_hint = Some(msg);
-            }
-            Ok(Some(StateLoadResult::Changed(saved))) => {
-                // Don't apply anything yet — prompt the user first in run().
-                self.file_changed_state = Some(saved);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                self.status = format!("State restore skipped: {err}");
-                self.startup_hint = Some(self.status.clone());
-            }
+        if !saved.current_label.trim().is_empty() {
+            self.model.current_label = saved.current_label.clone();
         }
+        self.event_filters = saved.event_filters.clone();
+        self.stashed_event_filters = saved.stashed_event_filters.clone();
+        self.types_filter = saved.types_filter.clone();
+        if !saved.merge_groups.is_empty() {
+            self.model.apply_merge_groups(&saved.merge_groups);
+        }
+        self.mark_live_cache_dirty();
+        self.refresh_live_position();
+        if !saved.periods.is_empty() {
+            self.model.set_periods(saved.periods.clone());
+            self.pending_live_recompute = true;
+        }
+        self.pending_restore = Some(saved);
+        self.status = msg.clone();
+        self.startup_hint = Some(msg);
     }
 
     /// Applies the transferable portion of a file-changed state: everything
@@ -1299,17 +1341,14 @@ impl App {
     }
 
     fn autosave_dirty_state(&mut self) {
-        if !self.reader.path().exists() {
-            // The stream file was deleted while we were running. The reader
-            // resets its offset to 0 on detecting a missing file, so saved_len
-            // would be 0 and any new file at the same path would pass the
-            // hash check. Invalidate the state file so nothing is restored
+        if !self.reader.source_exists() {
+            // The stream source was deleted / rotated while we were
+            // running. Invalidate the state file so nothing is restored
             // next session.
             if self.state_dirty {
-                if let Err(err) = invalidate_state(self.reader.path()) {
-                    eprintln!(
-                        "{WARNING_PREFIX_ORANGE} failed to invalidate state: {err}"
-                    );
+                let source_id = self.reader.source_id().to_string();
+                if let Err(err) = crate::persistence::invalidate_state_for_id(&source_id) {
+                    eprintln!("{WARNING_PREFIX_ORANGE} failed to invalidate state: {err}");
                 } else {
                     self.state_dirty = false;
                 }
@@ -1351,13 +1390,14 @@ impl App {
             })
             .chain(self.pending_triaged_identities.iter().cloned())
             .collect();
-        let merge_groups: Vec<MergeGroup> =
-            self.model.merge_groups.values().cloned().collect();
+        let merge_groups: Vec<MergeGroup> = self.model.merge_groups.values().cloned().collect();
+        let identity = self.reader.current_identity()?;
         Ok(PersistedState {
             version: 2,
-            stream_path: self.reader.path().to_string_lossy().to_string(),
+            stream_path: self.reader.source_id().to_string(),
             saved_len: self.reader.offset(),
-            prefix_hash_hex: hash_stream_prefix(self.reader.path(), self.reader.offset())?,
+            prefix_hash_hex: identity.prefix_hash_hex,
+            source_etag: identity.etag,
             periods: self.model.periods.clone(),
             renames: all_renames,
             known_unrelated_types: self
@@ -1378,7 +1418,8 @@ impl App {
 
     fn persist_state(&self) -> Result<()> {
         let state = self.build_state_for_save()?;
-        save_state(self.reader.path(), &state)
+        let source_id = self.reader.source_id().to_string();
+        crate::persistence::save_state_for_id(&source_id, &state)
     }
 
     pub fn set_swapfile(&mut self, swap: crate::persistence::Swapfile) {
@@ -1427,7 +1468,7 @@ impl App {
 
     fn build_session_export(&self) -> SessionExport {
         let merge_groups: Vec<_> = self.model.merge_groups.values().cloned().collect();
-        let mut snapshot = SessionExport::new(self.reader.path().display().to_string());
+        let mut snapshot = SessionExport::new(self.reader.source_display());
         snapshot.periods = self.model.periods.clone();
         snapshot.renames = self.model.renamed_types();
         snapshot.known_unrelated_types = self
@@ -1488,7 +1529,12 @@ impl App {
     }
 
     fn default_session_export_path(&self) -> PathBuf {
-        let mut p = self.reader.path().clone();
+        let base = self
+            .reader
+            .local_path()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("session-export"));
+        let mut p = base;
         let fname = p
             .file_name()
             .and_then(|n| n.to_str())
@@ -1499,7 +1545,12 @@ impl App {
     }
 
     fn default_profile_export_path(&self) -> PathBuf {
-        let mut p = self.reader.path().clone();
+        let base = self
+            .reader
+            .local_path()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("source-profile"));
+        let mut p = base;
         let fname = p
             .file_name()
             .and_then(|n| n.to_str())
@@ -3439,7 +3490,7 @@ impl App {
     /// reload-from-disk feedback loop.
     fn mark_dirty(&mut self) {
         self.state_dirty = true;
-        if !self.reader.path().exists() {
+        if !self.reader.source_exists() {
             return;
         }
         match self.persist_state() {
@@ -3896,10 +3947,7 @@ impl App {
         if path.is_empty() || !container {
             return;
         }
-        let set = self
-            .collapsed_paths
-            .entry(type_id.to_string())
-            .or_default();
+        let set = self.collapsed_paths.entry(type_id.to_string()).or_default();
         if !set.insert(path.to_string()) {
             set.remove(path);
             if set.is_empty() {
@@ -3914,8 +3962,7 @@ impl App {
         };
         let type_id = event.type_id.clone();
         let paths = collect_indexed_paths(&event.obj);
-        let visible =
-            filter_paths_by_collapsed(paths.clone(), self.collapsed_paths.get(&type_id));
+        let visible = filter_paths_by_collapsed(paths.clone(), self.collapsed_paths.get(&type_id));
         let Some(path) = visible.get(self.live_key_index).cloned() else {
             return;
         };
@@ -3932,8 +3979,7 @@ impl App {
         };
         let type_id = event.type_id.clone();
         let paths = collect_indexed_paths(&event.obj);
-        let visible =
-            filter_paths_by_collapsed(paths.clone(), self.collapsed_paths.get(&type_id));
+        let visible = filter_paths_by_collapsed(paths.clone(), self.collapsed_paths.get(&type_id));
         let Some(path) = visible.get(self.period_json_key_index).cloned() else {
             return;
         };
@@ -3950,8 +3996,7 @@ impl App {
         };
         let type_id = event.type_id.clone();
         let paths = collect_indexed_paths(&event.obj);
-        let visible =
-            filter_paths_by_collapsed(paths.clone(), self.collapsed_paths.get(&type_id));
+        let visible = filter_paths_by_collapsed(paths.clone(), self.collapsed_paths.get(&type_id));
         let Some(path) = visible.get(self.data_key_index).cloned() else {
             return;
         };
@@ -5504,7 +5549,10 @@ mod tests {
         app.model
             .ingest(json!({"_timestamp": 1_700_000_020_000u64}), 20.0);
         app.handle_key(key(KeyCode::Char('m')));
-        assert!(app.model.active_period().is_none(), "setup: both periods closed");
+        assert!(
+            app.model.active_period().is_none(),
+            "setup: both periods closed"
+        );
         let last_id = app.model.periods.iter().map(|p| p.id).max().unwrap();
 
         // Delete the most recent period — the exact scenario that used to
