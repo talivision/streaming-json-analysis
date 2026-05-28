@@ -96,6 +96,16 @@ For static archives where you want to read the whole file at once rather than ta
 
 Offline mode is for read-once analysis of existing data. It does not tail for new events and does not support marking action periods.
 
+### HTTP sources
+
+The first argument can also be an `http://` or `https://` URL. The analyzer tails the URL the same way it tails a file, using HTTP `Range` requests to fetch only the new bytes per poll:
+
+```bash
+./target/release/json_analyzer http://logs.internal/stream.jsonl
+```
+
+The remote server must support `Range`, `Content-Range`, `Accept-Ranges: bytes`, `ETag`, and (for cross-restart prefix validation) `X-Content-CRC32` on ranged responses. A reference implementation lives at `examples/sources/http_stream/file_server.py` — point it at any directory of JSONL files and it serves them with the right headers. The analyzer treats append-only growth as growth (not rotation) by validating the byte prefix via `X-Content-CRC32`, so a live stream that keeps growing under the same URL works without re-ingesting on every poll. Annotations (renames, periods, merge groups) persist for the URL and restore on next launch.
+
 ---
 
 ## Writing a source
@@ -261,16 +271,37 @@ python3 examples/sources/demo_source/demo_source.py
 
 In the source terminal, press `l` (login), `p` (purchase), `s` (search), `c`/`t` (experiment variants) to fire actions. In the analyzer, press `m` to bracket a window around them and watch the anomaly scores appear.
 
+### High-volume demo
+
+For a more realistic load — a large initial backlog followed by a steady tail — use the high-volume writer:
+
+```bash
+# Terminal 1
+python3 examples/sources/high_volume/high_volume_writer.py \
+  --output /tmp/json_demo/stream.jsonl \
+  --initial-events 100000 --steady-rate 10 --truncate
+
+# Terminal 2: read the file directly
+./target/release/json_analyzer /tmp/json_demo/stream.jsonl
+
+# OR Terminal 2 alt: serve over HTTP and analyze the URL
+python3 examples/sources/http_stream/file_server.py /tmp/json_demo 8080 &
+./target/release/json_analyzer http://127.0.0.1:8080/stream.jsonl
+```
+
+The writer is transport-agnostic — it just appends to the file. The HTTP server is an independent piece you can use with any writer that produces JSONL.
+
 ---
 
 ## CLI reference
 
 ```
-json_analyzer [<path>] [--jsonl <path>] [--baseline <path>]
+json_analyzer [<path|url>] [--jsonl <path|url>] [--baseline <path>]
               [--import <path>] [--profile <path>] [--whitelist <path>]
               [--offline] [--reset] [--debug-status] [--control-http <addr>]
+              [--force]
 
-  <path> / --jsonl    path to input JSONL file (live, tailed)
+  <path> / --jsonl    path to input JSONL file, or http(s):// URL
   --baseline          pre-load known-good events from a file
   --import            open a previously exported session snapshot
   --profile           apply a source profile on startup
@@ -279,9 +310,11 @@ json_analyzer [<path>] [--jsonl <path>] [--baseline <path>]
   --reset             start without loading persisted session state from disk
   --debug-status      show internal status line details continuously
   --control-http      optional control API bind address (e.g. 127.0.0.1:8080)
+  --force             take over the swapfile even if another instance holds it
+                      (vim -r style; only use if you know the other is dead)
 ```
 
-All input paths (`<path>`, `--jsonl`, `--baseline`, `--import`, `--profile`, `--whitelist`) are checked for existence at startup; a missing file aborts with a message naming the flag.
+Local input paths (`--baseline`, `--import`, `--profile`, `--whitelist`) are checked for existence at startup; a missing file aborts with a message naming the flag. `<path>` / `--jsonl` may be an `http://` or `https://` URL instead.
 
 ---
 
