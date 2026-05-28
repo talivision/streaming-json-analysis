@@ -96,6 +96,135 @@ $SK/diff_snapshots.py /tmp/regtest/t0.json /tmp/regtest/t1.json
 
 A diff between t0 and t1 that shows the mutation reverting is a regression. Apply this around every mutation in Section D especially.
 
+## Live writers and timing techniques
+
+Five test categories need more than just "press a key, capture, diff": streaming feeds (D7/D11/D12/H6/F3), profile inputs (D9), forced HTTP states (G6), and inline performance measurement (F1/F2/F7). Patterns:
+
+### Live writer for streaming tests
+
+```bash
+cat > /tmp/regtest/writer.py <<'PY'
+#!/usr/bin/env python3
+"""Live JSONL writer: writer.py <path> <rate> <duration> [--repeat-ts]"""
+import json, sys, time
+path, rate, duration = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+repeat_ts = "--repeat-ts" in sys.argv[4:]
+end = time.time() + duration
+i, base_ts = 0, int(time.time()*1000)
+with open(path, "a", buffering=1) as f:
+    while time.time() < end:
+        ts = base_ts if repeat_ts else int(time.time()*1000)
+        f.write(json.dumps({"_timestamp": ts, "_type": "live", "idx": i, "payload": f"v{i}"}) + "\n")
+        i += 1; time.sleep(1.0/rate)
+print(f"wrote {i}", file=sys.stderr)
+PY
+chmod +x /tmp/regtest/writer.py
+```
+
+For sustained-rate tests at ≥1000 ev/s the per-event `time.sleep` overhead floors actual throughput around ~80 ev/s. Use batched writes instead:
+
+```bash
+python3 -c "
+import json, time
+end = time.time() + 5.0; i = 0
+with open('/tmp/regtest/sustained.jsonl', 'a', buffering=1) as f:
+    while time.time() < end:
+        batch = '\n'.join(json.dumps({'_timestamp': int(time.time()*1000), '_type':'live','idx':i+k,'pad':'x'*20}) for k in range(200))
+        f.write(batch + '\n'); i += 200
+        time.sleep(0.1)   # 200 events / 100ms = 2000 ev/s
+" &
+```
+
+D11 specifically needs many events sharing the same `_timestamp`. Don't use the writer; pre-build a synthetic fixture in blocks:
+
+```bash
+python3 -c "
+import json
+with open('/tmp/regtest/hv.jsonl', 'w') as f:
+    for i in range(5000):
+        ts = 1700000000000 + (i // 100)  # 100 events share each ts
+        f.write(json.dumps({'_timestamp': ts, '_type': 'hv', 'idx': i}) + '\n')
+"
+```
+
+### Profile fixture for D9
+
+```bash
+# Type id is whatever the structural hash truncates to — read it from
+# state.json after a normal run, or copy it out of the Types tab (the
+# `id: <hex>` row in path-focus). For single.jsonl it's f8bdecca92ed.
+cat > /tmp/regtest/profile.json <<'EOF'
+{
+  "renames": [["f8bdecca92ed", "ProfileName"]],
+  "known_unrelated_types": [],
+  "normalized_field_overrides": [],
+  "negative_filters": {"key_filter":"","type_filter":"","fuzzy_filter":"","exact_filter":"","substring_filter":""},
+  "whitelist_terms": [],
+  "merge_groups": []
+}
+EOF
+target/release/json_analyzer --profile /tmp/regtest/profile.json /tmp/regtest/single.jsonl
+```
+
+### Forcing 416 at exact EOF (G6)
+
+The bundled `file_server.py` returns 416 whenever the requested `start >= total`. So the test is simply: let the analyzer catch up to EOF, then *do nothing* — the polling loop will request `Range: bytes=<saved_offset>-` against a file whose size equals `saved_offset`, get 416 back, and must not bail. Verify with `curl -sI -H "Range: bytes=$(wc -c < file)-" http://127.0.0.1:PORT/file` — should print `HTTP/1.0 416 Range Not Satisfiable` with `Content-Range: bytes */<size>`.
+
+### Idle CPU sampling (F1)
+
+```bash
+PID=$(pgrep -f 'target/release/json_analyzer.*single.jsonl' | head -1)
+for i in $(seq 1 6); do
+  ps -p $PID -o %cpu= | tr -d ' '
+  sleep 5
+done   # average the 6 samples → ~30s window, less wall-clock than the catalogue's 60s
+```
+
+### Mutation→render latency (F2)
+
+`capture.py` is slow (~150 ms per call with pyte) — use `tmux capture-pane -p` directly for tight polling. The pattern: snapshot before, time-stamp, send key, poll captures looking for a known string that appears after the change, time-stamp on first hit, subtract.
+
+```python
+import subprocess, time, statistics
+SESS = "claude-f2"
+def grab():
+    return subprocess.run(["tmux","capture-pane","-p","-t",SESS], capture_output=True, text=True).stdout
+
+samples = []
+for _ in range(10):
+    subprocess.run(["tmux","send-keys","-t",SESS,"1",""])   # reset to Live
+    time.sleep(0.2)
+    t0 = time.time()
+    subprocess.run(["tmux","send-keys","-t",SESS,"2",""])   # mutate: switch to Periods
+    deadline = t0 + 0.5
+    while time.time() < deadline:
+        if "Periods (i add" in grab():
+            samples.append((time.time() - t0) * 1000.0); break
+        time.sleep(0.005)
+print("median ms:", statistics.median(samples), "max:", max(samples))
+```
+
+The 5 ms poll interval is short enough that capture jitter dominates the measurement noise, not the polling cadence. Expect ~30 ms median on a green build.
+
+### Ingest + concurrent mutation (F3)
+
+Start a batched writer in the background, then in a Python loop: sample `objects N` from `tmux capture-pane -p` every 500 ms, interleave `send-keys` for tab switches. Pass criteria: counts increase monotonically (no plateau), all tab-switch keystrokes still take effect (visible header changes).
+
+### Cross-commit measurement (F4 timing comparison, F7 stats parity)
+
+Use a git worktree of the baseline commit so HEAD's `target/` stays untouched:
+
+```bash
+PRE=9da29e7        # pick a perf-only commit, or HEAD~N
+WT=/tmp/regtest/wt-stats
+git worktree add "$WT" "$PRE"
+( cd "$WT" && cargo build --release )
+# … run both binaries against the same fixture …
+git worktree remove --force "$WT"
+```
+
+For F7, capture with raw `tmux capture-pane -p` (not `capture.py`) — byte-level diffing of the rendered screen is what we want, and pyte's parsing can introduce normalisation noise.
+
 ## Test catalogue
 
 Run in order — later tests assume earlier ones passed. Use `single.jsonl` unless noted.
@@ -169,12 +298,12 @@ These tests exist because the most damaging bugs we've seen this codebase hit we
 | D4 | Insert period (A10), no further action | Period still present after 500ms stutter capture |
 | D5 | Insert period, delete it, insert a different range with `i` | New period present in stutter capture |
 | D6 | Merge types (A20), unmerge (A21), merge the same set again | Second merge sticks across stutter capture |
-| D7 | Mark period (`m`), wait for one new event to arrive, mark again | Closed period has end > start; no degenerate span |
+| D7 | Mark period (`m`), wait for one new event to arrive, mark again | Closed period has end > start; no degenerate span. Use the live writer pattern (see *Live writers and timing techniques*): seed a static file, launch, `m`, then append one event with `_timestamp` ~5s in the future, sleep 1s, `m`. Inspect `state.json`'s `periods[0].end - periods[0].start` to confirm a non-zero span. |
 | D8 | Press `m` twice rapidly (within ~10ms, send_keys with both args) | `model.periods.len()` ends at 0; no open period; no degenerate closed period |
-| D9 | Apply a profile that renames type T, then rename T to "" by hand | Stays blank for the rest of the session (stutter capture). **No restart claim** — see note below. |
+| D9 | Apply a profile that renames type T, then rename T to "" by hand | Stays blank for the rest of the session (stutter capture). **No restart claim** — see note below. Profile JSON shape and launch in *Live writers and timing techniques → Profile fixture for D9*. After the blank-rename, capture at t0, t+0.6s, AND t+2.6s to be sure the profile doesn't re-apply on a later autosave / refresh tick. |
 | D10 | Toggle path override on (A9), restart, toggle it back to default | Override disappears in stutter capture. **The cycle is tri-state: None → ForcedOff → ForcedOn → None when the path is auto-considered, and None → ForcedOn → None when not. Press Space enough times to land back on None — for an auto-on path that's two Spaces from the restored ForcedOff.** |
-| D11 | **Live cursor unstuck after type filter + Home + Down** | start a feed where many events arrive within one millisecond (use the `examples/sources/high_volume_http` writer or just a synthetic 100k-event fixture with repeating `_timestamp` values). Filter to one type (`3 Enter t Enter`), return to Live (`1`), `Home`, then `Down`, `Down`, `Down`. | Cursor moves down by 3 rows in the visible-event list across captures. Regression (00841dc): `LiveAnchor` keyed by `(ts, type_id)` collapsed when many events shared a timestamp; `find_live_index` always returned the first match, so the post-poll cursor-restore pinned the row to index 0 every iteration. The fix keys the anchor by `event_idx` (a stable position in `model.events`). |
-| D12 | Mark / unmark period during sustained ingest | start a writer at ≥1000 ev/s, press `m` once, wait 2s, press `m` again. | No visible UI stutter or stall during either keypress. The whole mark/unmark cycle completes in <100 ms each. Regression (8c16a85): the file-backend poll cadence used to be 10 ms / 100 Hz and would saturate the UI thread with `refresh_live_anomaly_scores` recomputation, making single keystrokes visibly stall on busy streams. Cadence is now throttled to 50 ms (file) / 100 ms (HTTP idle). |
+| D11 | **Live cursor unstuck after type filter + Home + Down** | Build the repeating-`_timestamp` fixture from *Live writers and timing techniques* (5000 events, 100 sharing each ts works). Filter to one type (`3 Enter t Enter`), return to Live (`1`), `Home`, then `Down`, `Down`, `Down`. Verify cursor index from the snapshot's `selections` (the `->` arrow row). | Cursor advances by 3 in the visible-event list across captures (e.g. idx 1 → idx 4). Regression (00841dc): `LiveAnchor` keyed by `(ts, type_id)` collapsed when many events shared a timestamp; `find_live_index` always returned the first match, so the post-poll cursor-restore pinned the row to index 0 every iteration. The fix keys the anchor by `event_idx` (a stable position in `model.events`). |
+| D12 | Mark / unmark period during sustained ingest | Use the *batched-writes* writer from *Live writers and timing techniques* (per-event `time.sleep` floors throughput at ~80 ev/s; batch 200 events per 100 ms to hit ~2000 ev/s). Pre-seed a few events so the model has a timestamp before `m`. `m`, wait 2s, `m` again. Time each keystroke with `date +%s%N` around `send_keys`. | No visible UI stutter or stall during either keypress. Each mark/unmark cycle completes in ~100 ms (allow ~120 ms in measurements that include `send_keys.sh`'s 50 ms inter-key sleep). Regression (8c16a85): the file-backend poll cadence used to be 10 ms / 100 Hz and would saturate the UI thread with `refresh_live_anomaly_scores` recomputation, making single keystrokes visibly stall on busy streams. Cadence is now throttled to 50 ms (file) / 100 ms (HTTP idle). |
 
 **D1 specifically reproduces the `m`-flash bug.** D2/D3 cover rename-to-blank. D4/D5 cover the `i` blink. D8 covers the double-tap. All four were in the bug notes that opened the original session.
 
@@ -222,9 +351,9 @@ echo '{"pid":0,"hostname":"'$(hostname)'","stream_path":"/tmp/regtest/single.jso
 
 | ID | What | Pass bar |
 |---|---|---|
-| F1 | Solo idle CPU over 60s | matches main-branch baseline within ±5% |
-| F2 | Mutation-to-render latency (keypress → next frame shows change) | median < 100ms (no watcher in the loop now; should be a tight render budget) |
-| F3 | Ingest 1000 ev/s with concurrent mutations | UI stays responsive, `objects` count keeps climbing without stalls |
+| F1 | Solo idle CPU over 60s | matches main-branch baseline within ±5%. Use the `ps -o %cpu` sampling loop from *Live writers and timing techniques → Idle CPU sampling (F1)*. ~6–8% on a quiet laptop is normal; double-digit is suspicious. |
+| F2 | Mutation-to-render latency (keypress → next frame shows change) | median < 100 ms. Measure with the `tmux capture-pane` polling loop in *Live writers and timing techniques → Mutation→render latency (F2)*. Typical green build: median ~30 ms, max ~40 ms. Do NOT use `capture.py` here — its pyte parse alone is ~150 ms and would dominate the signal. |
+| F3 | Ingest 1000 ev/s with concurrent mutations | UI stays responsive, `objects` count keeps climbing without stalls. Pattern in *Live writers and timing techniques → Ingest + concurrent mutation (F3)*: batched writer + Python sampling loop that grabs `objects N` via `tmux capture-pane -p` every 500 ms and interleaves `send-keys`. Assert counts strictly non-decreasing across samples (~2000 ev/s in green build). |
 | F4 | **Malformed-final-line perf canary** | See script below. Build a 500k-event high-cardinality JSONL ending in an unterminated final line, run the binary against it with stdout/stderr captured, and `time` it through to clean exit. **Goal: confirm a recent build is NOT slower than its parent commit by more than ~10%.** This is the single best catch-all perf test — it exercises ingest, structural hashing, anomaly scoring, path stats, and shutdown-time tail scan in one shot. |
 | F5 | Large unterminated final line (>8 KB) emits warning at shutdown | Build a fixture whose last "line" is > 16 KB with no trailing newline (just one giant JSON-ish blob). Launch the binary, let it ingest, `q q`. Stderr must contain `incomplete JSON line remained at shutdown`. Regression: the old 8 KB tail-scan window (e0ee540) missed the warning when the unterminated tail was larger than the scan budget. |
 | F6 | High-cardinality ingest is linear, not quadratic | Same 500k fixture as F4 but with one field carrying a unique value per event (`{"_timestamp":..., "_type":"e", "seq": <unique-per-line>}`). Time `cargo run --release -- <fixture>` through to `q q`. **Should finish in seconds, not minutes.** Regression: pre-9da29e7 path-stats recomputation was O(n²) and hung the analyzer past ~100k events. |
@@ -307,7 +436,7 @@ rm -f ~/.local/state/json-analyzer/${URL_SHA}.{state,swap}.json
 | G3 | HTTP restart re-ingests from byte 0 | `q q`, relaunch with same URL while server is still running. | Same behaviour as B8 — header shows current `objects` count == events on disk, not 0 and not "since last session". |
 | G4 | Annotations persist over HTTP | While running: A8 (rename), A10 (insert period), `q q`. Relaunch same URL. | Renames + periods restored exactly as B1 / B2. Regression: if `mark_dirty` short-circuits on `!source_exists()`, HTTP runs would silently never persist anything. HTTP `source_exists()` must return true regardless of transient 404 / 416. |
 | G5 | True rotation **fails fast** mid-session | While analyzer is running and server is serving, truncate the file (`> /tmp/json_demo/stream.jsonl`) then have the writer append fewer/different events so the size shrinks. | Analyzer exits with non-zero. Stderr contains `HTTP source ... shrank from N to M bytes mid-session (truncated or rotated). Restart the analyzer; startup verify_resume will detect the rotation and prompt to keep or discard annotations.` Restart triggers the existing startup file-changed prompt where the user picks keep/discard. **Symmetric on file backend** — `: > /tmp/regtest/single.jsonl` then append-different produces the same fail-fast message. |
-| G6 | 416 at exact EOF is a no-op | Set up: poll catches up to EOF; server returns 416 with `Content-Range: bytes */N` where `N == saved_offset`. | Analyzer treats it as "no new bytes this poll" and keeps polling. Does NOT bail. |
+| G6 | 416 at exact EOF is a no-op | The bundled `file_server.py` already returns 416 with `Content-Range: bytes */N` when the requested range starts ≥ EOF. So the test is: seed a static file, launch the analyzer, let it catch up, then sit idle for 5 s while the polling loop hammers 416s. Then append a few more events and confirm the analyzer ingests them — proves the 416 path is a soft no-op and the next valid 206 still works. See *Live writers and timing techniques → Forcing 416 at exact EOF*. | Analyzer alive after 5 s of 416 polling, ingests the post-pause append, stderr empty. |
 | G7 | Recovery after rotation goes through startup prompt | After G5 bail, relaunch the analyzer against the same source. | The startup `run_file_changed_prompt` fires (already-tested path); accepting keeps renames/filters and discards periods. Annotations save correctly after recovery per G4. |
 | G8 | `X-Content-CRC32` header round-trips | `curl -sI -H 'Range: bytes=0-100' http://127.0.0.1:8080/stream.jsonl` | Response includes `X-Content-CRC32: <8 hex chars>` matching `python3 -c "import zlib; print(format(zlib.crc32(open('/tmp/json_demo/stream.jsonl','rb').read()[:101]),'08x'))"`. Regression: identity verification on the client depends on this header. |
 
@@ -366,7 +495,7 @@ run_export() {
 | H3 | File backend, timestamp monotonicity | `jq '[.events[].ts] | (. == sort)' ...session.json` | Returns `true` |
 | H4 | **HTTP backend, no drops** | Start a server (Python or Rust per Section G) against `/tmp/drops/`, run `run_export drops_http http://127.0.0.1:8080/stream.jsonl`, jq the count. **Static fixture — do not use http_stream.py's bundled writer, we need a fixed count.** | Count == `$EXPECTED` |
 | H5 | HTTP backend, ordering + monotonicity | Same `jq` checks as H2, H3 against the HTTP-derived export | Both return `true` |
-| H6 | No double-ingest on HTTP poll boundary | Spawn a live writer at 100 ev/s for 30s alongside the HTTP server. Run `run_export drops_http_live ...`. Compare jq count to `wc -l` of the file at quit time. | `events_count == wc -l` exactly. A count *greater* than line count means the partial-tail re-fetch glued lines twice — regression on the `HttpStreamReader` partial-line fix |
+| H6 | No double-ingest on HTTP poll boundary | Spawn the live writer (*Live writers and timing techniques*) at ~100 ev/s for 15–30 s alongside the HTTP server. Run `run_export drops_http_live ...`. Compare jq count to `wc -l` of the file at quit time. | `events_count == wc -l` exactly. A count *greater* than line count means the partial-tail re-fetch glued lines twice — regression on the `HttpStreamReader` partial-line fix |
 | H7 | Drops on rotation are accounted for | Start session, ingest ~1000 events, truncate the file (`> /tmp/drops/stream.jsonl`), append 500 fresh events, accept the "stream changed" prompt with default (discard). Export. | `jq '.events | length'` matches the 500 post-rotation events, not 1500 (no carry-over double-count) |
 | H8 | **File / HTTP parity (small)** | With `/tmp/drops/stream.jsonl` (5000 events) static, run `run_export drops_file /tmp/drops/stream.jsonl` then `run_export drops_http http://127.0.0.1:8080/stream.jsonl`. Compare with `jq -S '[.events[] | .obj]' file.session.json > /tmp/drops/file.idx.json` and the same for http; `diff`. | The two `obj`-only projections are **byte-identical**. Both backends must ingest the same bytes into the same in-memory model. Any divergence — fewer events on one side, different ordering, content drift — is a backend-asymmetry bug |
 | H9 | **File / HTTP parity (at scale)** | Build a 100_000-event fixture (`n=100000` in the H1 generator), repeat H8 against it. Use the helper below to also report `min/max/missing idx` per side before diffing | Same parity: both exports have exactly 100k events, idx range 0..99999, no gaps. **This is the canary for the `max_lines` offset-skip bug.** With the bug, the HTTP side would tap out at ~180k–200k worth less than the file side (events skipped at every `MAX_LINES_PER_POLL` cap inside a single 16MB response body) |
@@ -531,6 +660,9 @@ Read the warning at shutdown out of `/tmp/tui-stderr-{parent,head}.log` — both
 
 ```bash
 .claude/skills/drive-tui/stop.sh solo 2>/dev/null
+# Kill any background writers/servers spawned during streaming tests
+pkill -f 'examples/sources/http_stream/file_server.py' 2>/dev/null
+pkill -f '/tmp/regtest/writer.py' 2>/dev/null
 rm -rf /tmp/regtest
 # State files are small; clear them per-fixture rather than blast the whole dir
 ```
